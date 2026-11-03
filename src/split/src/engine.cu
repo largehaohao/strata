@@ -78,6 +78,23 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
     if (fused_dn < 0 || fused_dn > 256 ||
         (fused_dn && (!static_slots || env_int("FNX_IQ_REUSE", 0) != 1 || env_int("FNX_IQ_GROUP", 32) != 16)))
         throw std::runtime_error("FNX_STATIC_CACHE_FUSED_DN: 0..256 blocks, needs static cache and IQ reuse group 16");
+    const long long replay = env_int("FNX_GDN_REPLAY", 0);
+    if (replay != 0 && replay != 1) throw std::runtime_error("FNX_GDN_REPLAY: expected 0 or 1");
+    if (replay) {
+#if FNX_HIP && !FNX_27B
+        if (lanes != 1 || batch_drafts() != BatchDrafts::off)
+            throw std::runtime_error("FNX_GDN_REPLAY requires one lane and FNX_BATCH_DRAFTS=0");
+        for (const CardW& card : m.cards) {
+            hipDeviceProp_t prop{};
+            ck(hipGetDeviceProperties(&prop, card.dev), "GDN replay device");
+            if (std::string(prop.gcnArchName).rfind("gfx1100", 0) != 0)
+                throw std::runtime_error("FNX_GDN_REPLAY is validated only on gfx1100");
+        }
+        gdn_replay_ = true;
+#else
+        throw std::runtime_error("FNX_GDN_REPLAY requires the Flash-Next HIP build");
+#endif
+    }
     hc1_rows();   // FNX_HC1 checked now, not at the first hc read (inside a graph capture)
     pf_jobs_ = pf_c_ * TOPK / PF_JOB + NEXP;   // jobs of up to PF_JOB pairs per expert, at most
     set_prompt_rows(pf_c_);
@@ -250,6 +267,7 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         b->chist.assign(NL, nullptr);
         b->snap.assign(NL, nullptr);
         b->hsnap.assign(NL, nullptr);
+        b->gdn_updates.assign(NL, nullptr);
         b->kc.assign(NL, nullptr);
         b->vc.assign(NL, nullptr);
         b->qsa_ring.assign(NL, nullptr);
@@ -259,20 +277,33 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         b->qsa_scores = dalloc<float>((size_t) MAXT * (max_ctx / 4));
         b->qsa_cells = dalloc<int>((size_t) MAXT * qsa_maxsel());
         b->qsa_ncells = dalloc<int>(MAXT);
-        const size_t snap_floats = (size_t) (MAXT - 1) * w.nv() * HS * HS;
+        const size_t snap_floats = (size_t) (gdn_replay_ ? 1 : MAXT - 1) * w.nv() * HS * HS;
+        const size_t update_floats = gdn_replay_ ? (size_t) (MAXT - 2) * w.nv() * GDN_REPLAY_STRIDE : 0;
         int n_rec = 0;
         for (int l = 0; l < NL; ++l) n_rec += is_attn(l) ? 0 : 1;
-        b->snap_block = dalloc<float>(snap_floats * n_rec);
-        b->snap_block_bytes = snap_floats * n_rec * sizeof(float);
+        b->snap_block = dalloc<float>((snap_floats + update_floats) * n_rec);
+        b->snap_block_bytes = (snap_floats + update_floats) * n_rec * sizeof(float);
         for (int l = 0, k = 0; l < NL; ++l) {
             if (is_attn(l)) {
                 b->qsa_ring[l] = dalloc<uint16_t>((size_t) qsa_ring_rows() * 128);
             } else {
                 b->S[l] = dalloc<float>((size_t) w.nv() * HS * HS);
                 b->chist[l] = dalloc<float>((size_t) 2 * 3 * w.conv_ch());
-                b->snap[l] = b->snap_block + snap_floats * k++;
+                b->snap[l] = b->snap_block + snap_floats * k;
+                if (gdn_replay_) b->gdn_updates[l] = b->snap_block + snap_floats * n_rec + update_floats * k;
+                ++k;
                 b->hsnap[l] = dalloc<float>((size_t) MAXT * 3 * w.conv_ch());
             }
+        }
+        if (gdn_replay_) {
+            std::vector<GdnReplayJob> jobs;
+            for (int l = 0; l < NL; ++l)
+                if (!is_attn(l)) jobs.push_back({b->S[l], b->snap[l], b->gdn_updates[l]});
+            b->gdn_replay_layers = (int) jobs.size();
+            b->gdn_replay_jobs = dalloc<GdnReplayJob>(jobs.size());
+            ck(cudaMemcpy(b->gdn_replay_jobs, jobs.data(), jobs.size() * sizeof(GdnReplayJob), cudaMemcpyHostToDevice), "GDN replay jobs");
+            std::fprintf(stderr, "fnx: card %d: GDN first-state/update log %zu MiB; prefill may need additional scratch\n",
+                         c, b->snap_block_bytes >> 20);
         }
         b->ple_hist = dalloc<float>((size_t) 9 * D);
         b->ple_hsnap = dalloc<float>((size_t) MAXT * 9 * D);
@@ -1041,7 +1072,7 @@ void Engine::enqueue(int T, bool dumps) {
                     ck(cudaStreamWaitEvent(b.st, b.join, 0), "join wait");
                 }
                 gdn_core(b.qkvz, b.ab, b.chist[l], L.conv, L.dt_bias, L.ssm_a, L.ssm_norm, b.S[l], b.xq, b.ctl, b.gdn_scratch, b.snap[l],
-                         b.hsnap[l], w.nk, nv, w.vmap, T, eps, b.st);
+                         b.hsnap[l], w.nk, nv, w.vmap, T, eps, b.st, nullptr, b.gdn_updates[l]);
                 dense(L.ssm_out, b.xq, b.bo_a, b, T);
             } else {
                 attention(T, b, w, L, b.kc[l], b.vc[l], b.ctl, b.qsa_ring[l], b.qsa_pooled[l], 128 + l);

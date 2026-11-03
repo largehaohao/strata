@@ -1,0 +1,283 @@
+```python
+import threading
+import time
+from collections import OrderedDict
+
+
+class Cache:
+    """
+    A thread-safe LRU cache with TTL (Time-To-Live) support.
+    
+    Each entry has an expiration time. Expired entries are lazily cleaned up
+    on access. The cache is thread-safe using a reentrant lock.
+    """
+    
+    def __init__(self, capacity, ttl=None):
+        """
+        Initialize the cache.
+        
+        Args:
+            capacity: Maximum number of items in the cache.
+            ttl: Time-to-live in seconds for each entry. If None, entries never expire.
+        """
+        self.capacity = capacity
+        self.ttl = ttl
+        self.data = OrderedDict()  # key -> (value, expiry_time)
+        self.lock = threading.RLock()
+    
+    def get(self, key):
+        """
+        Retrieve a value from the cache.
+        
+        Args:
+            key: The key to look up.
+            
+        Returns:
+            The cached value if present and not expired, None otherwise.
+        """
+        with self.lock:
+            if key not in self.data:
+                return None
+            
+            value, expiry = self.data[key]
+            
+            # Check if the entry has expired
+            if expiry is not None and time.time() > expiry:
+                # Remove expired entry
+                del self.data[key]
+                return None
+            
+            # Move to end to mark as recently used
+            self.data.move_to_end(key)
+            return value
+    
+    def put(self, key, value):
+        """
+        Insert or update a value in the cache.
+        
+        Args:
+            key: The key to store.
+            value: The value to store.
+        """
+        with self.lock:
+            # Calculate expiry time
+            if self.ttl is not None:
+                expiry = time.time() + self.ttl
+            else:
+                expiry = None
+            
+            # If key already exists, remove it first to update position
+            if key in self.data:
+                del self.data[key]
+            
+            self.data[key] = (value, expiry)
+            self.data.move_to_end(key)
+            
+            # Evict least recently used items if over capacity
+            while len(self.data) > self.capacity:
+                self.data.popitem(last=False)
+    
+    def delete(self, key):
+        """
+        Remove a key from the cache.
+        
+        Args:
+            key: The key to remove.
+            
+        Returns:
+            True if the key was present and removed, False otherwise.
+        """
+        with self.lock:
+            if key in self.data:
+                del self.data[key]
+                return True
+            return False
+    
+    def clear(self):
+        """Remove all items from the cache."""
+        with self.lock:
+            self.data.clear()
+    
+    def size(self):
+        """
+        Return the number of items currently in the cache.
+        
+        Returns:
+            The number of items in the cache.
+        """
+        with self.lock:
+            return len(self.data)
+    
+    def contains(self, key):
+        """
+        Check if a key exists in the cache and is not expired.
+        
+        Args:
+            key: The key to check.
+            
+        Returns:
+            True if the key exists and is not expired, False otherwise.
+        """
+        with self.lock:
+            if key not in self.data:
+                return False
+            
+            _, expiry = self.data[key]
+            if expiry is not None and time.time() > expiry:
+                del self.data[key]
+                return False
+            return True
+```
+
+```python
+import unittest
+import threading
+import time
+from cache import Cache
+
+
+class TestCacheBasic(unittest.TestCase):
+    """Test basic LRU cache functionality."""
+    
+    def test_put_and_get(self):
+        cache = Cache(capacity=3)
+        cache.put("a", 1)
+        cache.put("b", 2)
+        cache.put("c", 3)
+        self.assertEqual(cache.get("a"), 1)
+        self.assertEqual(cache.get("b"), 2)
+        self.assertEqual(cache.get("c"), 3)
+    
+    def test_get_nonexistent(self):
+        cache = Cache(capacity=3)
+        self.assertIsNone(cache.get("nonexistent"))
+    
+    def test_eviction_lru(self):
+        cache = Cache(capacity=2)
+        cache.put("a", 1)
+        cache.put("b", 2)
+        # Access 'a' to make it recently used
+        cache.get("a")
+        # Insert 'c', should evict 'b' (least recently used)
+        cache.put("c", 3)
+        self.assertIsNone(cache.get("b"))
+        self.assertEqual(cache.get("a"), 1)
+        self.assertEqual(cache.get("c"), 3)
+    
+    def test_update_existing_key(self):
+        cache = Cache(capacity=3)
+        cache.put("a", 1)
+        cache.put("a", 2)
+        self.assertEqual(cache.get("a"), 2)
+        self.assertEqual(cache.size(), 1)
+    
+    def test_capacity_one(self):
+        cache = Cache(capacity=1)
+        cache.put("a", 1)
+        cache.put("b", 2)
+        self.assertIsNone(cache.get("a"))
+        self.assertEqual(cache.get("b"), 2)
+    
+    def test_delete(self):
+        cache = Cache(capacity=3)
+        cache.put("a", 1)
+        self.assertTrue(cache.delete("a"))
+        self.assertIsNone(cache.get("a"))
+        self.assertFalse(cache.delete("a"))
+    
+    def test_clear(self):
+        cache = Cache(capacity=3)
+        cache.put("a", 1)
+        cache.put("b", 2)
+        cache.clear()
+        self.assertEqual(cache.size(), 0)
+        self.assertIsNone(cache.get("a"))
+    
+    def test_size(self):
+        cache = Cache(capacity=5)
+        self.assertEqual(cache.size(), 0)
+        cache.put("a", 1)
+        self.assertEqual(cache.size(), 1)
+        cache.put("b", 2)
+        self.assertEqual(cache.size(), 2)
+    
+    def test_contains(self):
+        cache = Cache(capacity=3)
+        cache.put("a", 1)
+        self.assertTrue(cache.contains("a"))
+        self.assertFalse(cache.contains("b"))
+
+
+class TestCacheTTL(unittest.TestCase):
+    """Test TTL (Time-To-Live) functionality."""
+    
+    def test_ttl_expiry(self):
+        cache = Cache(capacity=3, ttl=0.1)
+        cache.put("a", 1)
+        self.assertEqual(cache.get("a"), 1)
+        time.sleep(0.15)
+        self.assertIsNone(cache.get("a"))
+    
+    def test_ttl_not_expired(self):
+        cache = Cache(capacity=3, ttl=1.0)
+        cache.put("a", 1)
+        self.assertEqual(cache.get("a"), 1)
+    
+    def test_ttl_no_ttl(self):
+        cache = Cache(capacity=3, ttl=None)
+        cache.put("a", 1)
+        time.sleep(0.1)
+        self.assertEqual(cache.get("a"), 1)
+    
+    def test_ttl_contains_expired(self):
+        cache = Cache(capacity=3, ttl=0.1)
+        cache.put("a", 1)
+        self.assertTrue(cache.contains("a"))
+        time.sleep(0.15)
+        self.assertFalse(cache.contains("a"))
+    
+    def test_ttl_size_after_expiry(self):
+        cache = Cache(capacity=3, ttl=0.1)
+        cache.put("a", 1)
+        cache.put("b", 2)
+        self.assertEqual(cache.size(), 2)
+        time.sleep(0.15)
+        # Access to trigger lazy cleanup
+        cache.get("a")
+        self.assertEqual(cache.size(), 1)
+    
+    def test_ttl_update_resets_expiry(self):
+        cache = Cache(capacity=3, ttl=0.2)
+        cache.put("a", 1)
+        time.sleep(0.1)
+        cache.put("a", 2)  # Reset TTL
+        time.sleep(0.15)
+        # Should still be valid because TTL was reset
+        self.assertEqual(cache.get("a"), 2)
+
+
+class TestCacheThreadSafety(unittest.TestCase):
+    """Test thread safety of the cache."""
+    
+    def test_concurrent_put_get(self):
+        cache = Cache(capacity=100)
+        errors = []
+        
+        def writer(thread_id):
+            try:
+                for i in range(100):
+                    cache.put(f"key_{thread_id}_{i}", i)
+            except Exception as e:
+                errors.append(e)
+        
+        def reader(thread_id):
+            try:
+                for i in range(100):
+                    cache.get(f"key_{thread_id}_{i}")
+            except Exception as e:
+                errors.append(e)
+        
+        threads = []
+        for t in range(10):
+            threads.append(threading.Thread(target=writer, args=(t,)))
+            threads

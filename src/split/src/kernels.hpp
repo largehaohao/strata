@@ -93,9 +93,18 @@ void gdn_out_norm(const float* o, const float* z, const float* w, float* y, int 
 // per-head counters in it are left at zero). For cutting a window back: snap [MAXT - 1][nv][HS][HS] gets the state
 // after each row but the last, hsnap [MAXT][3][ch] the history left by keeping only the first n rows (at n - 1)
 size_t gdn_scratch_floats(int nv);
+// Optional single-lane rollback: first-row state plus decay/key/delta operands
+// for rows 1..MAXT-2. Three padding floats keep each head's record aligned.
+constexpr int GDN_REPLAY_STRIDE = 2 * HS + 4;
+struct GdnReplayJob {
+    float* state;
+    const float* first;
+    const float* updates;
+};
+void gdn_replay(const GdnReplayJob* jobs, int layers, int nv, int keep, void* st);
 void gdn_core(const float* qkvz, const float* ab, float* hist, const float* convw, const float* dt, const float* a,
               const float* nw, float* S, void* yq, const int* ctl, float* scratch, float* snap, float* hsnap, int nk, int nv,
-              const int* vmap, int T, float eps, void* st, float* y32 = nullptr);
+              const int* vmap, int T, float eps, void* st, float* y32 = nullptr, float* replay_log = nullptr);
 // a batched window's T rows, one row each from a lane of its own: device arrays of row r's lane's state, conv history
 // (this layer's) and ctl. With row0: segments of several rows of one lane, indexed by segment, segment s's rows from
 // window row row0[s] (device), its snapshots (snap and hsnap as gdn_core's, this layer's) from that row on

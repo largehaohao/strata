@@ -14,7 +14,28 @@ namespace {
 
 constexpr int GDN_Q = 4, GDN_QC = HS / GDN_Q, GDN_THREADS = GDN_QC * 4;
 
-template <int T>
+// Match the existing gfx1100 core's contraction order in each four-row group.
+// Pin it explicitly for logging/replay; reassociating these products changes
+// restored states by an ULP even though the algebra is identical.
+__device__ __forceinline__ float gdn_replay_update(float s, float g, float k, float delta, int row) {
+    return row % 4 == 0 ? fmaf(g, s, __fmul_rn(k, delta)) : fmaf(k, delta, __fmul_rn(g, s));
+}
+
+__global__ void k_gdn_replay(const GdnReplayJob* jobs, int nv, int keep) {
+    const GdnReplayJob job = jobs[blockIdx.y];
+    const size_t count = (size_t) nv * HS * HS;
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < count; i += (size_t) gridDim.x * blockDim.x) {
+        const int head = i / (HS * HS), row = (i / HS) % HS, col = i % HS;
+        float s = job.first[i];
+        for (int t = 1; t < keep; ++t) {
+            const float* p = job.updates + ((size_t) (t - 1) * nv + head) * GDN_REPLAY_STRIDE;
+            s = gdn_replay_update(s, p[0], p[1 + row], p[1 + HS + col], row);
+        }
+        job.state[i] = s;
+    }
+}
+
+template <int T, bool LOG = false>
 __global__ void __launch_bounds__(GDN_THREADS) k_gdn_core(const float* __restrict__ qkvz, const float* __restrict__ ab,
                                                          float* __restrict__ hist, const float* __restrict__ convw,
                                                          const float* __restrict__ dt, const float* __restrict__ a,
@@ -24,7 +45,7 @@ __global__ void __launch_bounds__(GDN_THREADS) k_gdn_core(const float* __restric
                                                          float* __restrict__ hsnap, int nk, int nv, const int* __restrict__ vmap,
                                                          float eps,
                                                          int8_t* __restrict__ tq, float* __restrict__ td,
-                                                         float* __restrict__ y32, GdnLanes gl) {
+                                                         float* __restrict__ y32, GdnLanes gl, float* updates = nullptr) {
     const int lv = blockIdx.x / GDN_Q, qq = blockIdx.x % GDN_Q, vm = vmap[lv], kh = vm & 255, s0 = vm >> 8, tid = threadIdx.x;
     const int ch = (2 * nk + nv) * HS, row_stride = ch + nv * HS;
     // with lanes: blockIdx.y is a lane's segment of T rows from window row r0 (row0 null: one row, r0 = the segment), on
@@ -138,6 +159,13 @@ __global__ void __launch_bounds__(GDN_THREADS) k_gdn_core(const float* __restric
 #pragma unroll 1
     for (int t = 0; t < T; ++t) {
         const float gv = gates[t][0], bv = gates[t][1];
+        if constexpr (LOG) {
+            if (t > 0 && t < T - 1 && qq == 0) {
+                float* log = updates + ((size_t) (t - 1) * nv + lv) * GDN_REPLAY_STRIDE;
+                log[1 + tid] = xs[1][t][tid % 32][tid / 32];
+                if (tid == 0) log[0] = gv;
+            }
+        }
         float kvd0 = 0.f, kvd1 = 0.f, kvd2 = 0.f, kvd3 = 0.f;
 #pragma unroll
         for (int r = 0; r < 32; r += 4) {
@@ -150,13 +178,24 @@ __global__ void __launch_bounds__(GDN_THREADS) k_gdn_core(const float* __restric
         kvd += __shfl_xor_sync(0xffffffffu, kvd, 1);
         kvd += __shfl_xor_sync(0xffffffffu, kvd, 2);
         const float delta = (vs[t][cl] - gv * kvd) * bv;
+        if constexpr (LOG) {
+            if (t > 0 && t < T - 1 && part == 0)
+                updates[((size_t) (t - 1) * nv + lv) * GDN_REPLAY_STRIDE + 1 + HS + col] = delta;
+        }
         float at0 = 0.f, at1 = 0.f, at2 = 0.f, at3 = 0.f;
 #pragma unroll
         for (int r = 0; r < 32; r += 4) {
-            s[r] = gv * s[r] + xs[1][t][r][part] * delta;
-            s[r + 1] = gv * s[r + 1] + xs[1][t][r + 1][part] * delta;
-            s[r + 2] = gv * s[r + 2] + xs[1][t][r + 2][part] * delta;
-            s[r + 3] = gv * s[r + 3] + xs[1][t][r + 3][part] * delta;
+            if constexpr (LOG) {
+                s[r] = gdn_replay_update(s[r], gv, xs[1][t][r][part], delta, r);
+                s[r + 1] = gdn_replay_update(s[r + 1], gv, xs[1][t][r + 1][part], delta, r + 1);
+                s[r + 2] = gdn_replay_update(s[r + 2], gv, xs[1][t][r + 2][part], delta, r + 2);
+                s[r + 3] = gdn_replay_update(s[r + 3], gv, xs[1][t][r + 3][part], delta, r + 3);
+            } else {
+                s[r] = gv * s[r] + xs[1][t][r][part] * delta;
+                s[r + 1] = gv * s[r + 1] + xs[1][t][r + 1][part] * delta;
+                s[r + 2] = gv * s[r + 2] + xs[1][t][r + 2][part] * delta;
+                s[r + 3] = gv * s[r + 3] + xs[1][t][r + 3][part] * delta;
+            }
             at0 += s[r] * xs[0][t][r][part];
             at1 += s[r + 1] * xs[0][t][r + 1][part];
             at2 += s[r + 2] * xs[0][t][r + 2][part];
@@ -166,8 +205,8 @@ __global__ void __launch_bounds__(GDN_THREADS) k_gdn_core(const float* __restric
         at += __shfl_xor_sync(0xffffffffu, at, 1);
         at += __shfl_xor_sync(0xffffffffu, at, 2);
         ov[t] = at * scale;
-        if (t < T - 1) {
-            float* sp = snap + (size_t) t * nv * HS * HS + (st - S);
+        if (LOG ? (t == 0 && T > 1) : t < T - 1) {
+            float* sp = snap + (LOG ? 0 : (size_t) t * nv * HS * HS) + (st - S);
 #pragma unroll
             for (int r = 0; r < 32; ++r) sp[(size_t) r * HS] = s[r];
         }

@@ -1,0 +1,239 @@
+```python
+"""
+Thread-safe LRU Cache with TTL expiration, injectable clock, capacity validation,
+and get, put, delete, clear methods.
+
+Invariants:
+1. The cache never exceeds its capacity. When a new item is added and the cache
+   is at capacity, the least recently used item is evicted.
+2. Items expire after their TTL (time-to-live) has passed. Expired items are
+   treated as missing on access.
+3. The cache is thread-safe: all public methods are protected by a lock.
+4. The clock is injectable for testability; by default it uses time.time().
+5. Capacity must be a positive integer.
+6. get() returns the value if present and not expired, updating the LRU order.
+7. put() inserts/updates a key-value pair with a TTL, updating the LRU order.
+8. delete() removes a key if present.
+9. clear() removes all items.
+10. LRU order is maintained: most recently used items are at the end of the
+    internal ordering, least recently used at the front.
+"""
+
+import threading
+import time
+from collections import OrderedDict
+from typing import Any, Optional, Callable
+
+
+class LRUCache:
+    """
+    A thread-safe LRU cache with TTL expiration.
+    
+    Args:
+        capacity: Maximum number of items in the cache. Must be a positive integer.
+        clock: A callable that returns the current time in seconds. Defaults to time.time.
+    """
+    
+    def __init__(self, capacity: int, clock: Optional[Callable[[], float]] = None):
+        if not isinstance(capacity, int) or capacity <= 0:
+            raise ValueError("Capacity must be a positive integer")
+        
+        self._capacity = capacity
+        self._clock = clock if clock is not None else time.time
+        self._lock = threading.Lock()
+        # OrderedDict maintains insertion order; we use it to track LRU order.
+        # Keys are in order from least recently used (first) to most recently used (last).
+        self._cache: OrderedDict[str, tuple] = OrderedDict()
+        # Each entry is (value, expiry_time)
+    
+    def get(self, key: str) -> Optional[Any]:
+        """
+        Retrieve the value for the given key.
+        
+        If the key exists and has not expired, the value is returned and the
+        key is moved to the most recently used position.
+        If the key does not exist or has expired, None is returned.
+        """
+        with self._lock:
+            if key not in self._cache:
+                return None
+            
+            value, expiry = self._cache[key]
+            current_time = self._clock()
+            
+            if current_time >= expiry:
+                # Expired: remove and return None
+                del self._cache[key]
+                return None
+            
+            # Move to end (most recently used)
+            self._cache.move_to_end(key)
+            return value
+    
+    def put(self, key: str, value: Any, ttl: float) -> None:
+        """
+        Insert or update a key-value pair with a TTL.
+        
+        Args:
+            key: The cache key.
+            value: The value to store.
+            ttl: Time-to-live in seconds. Must be positive.
+        """
+        if not isinstance(ttl, (int, float)) or ttl <= 0:
+            raise ValueError("TTL must be a positive number")
+        
+        with self._lock:
+            current_time = self._clock()
+            expiry = current_time + ttl
+            
+            if key in self._cache:
+                # Update existing entry
+                self._cache[key] = (value, expiry)
+                self._cache.move_to_end(key)
+            else:
+                # Check capacity
+                if len(self._cache) >= self._capacity:
+                    # Evict least recently used (first item)
+                    self._cache.popitem(last=False)
+                
+                self._cache[key] = (value, expiry)
+                # New item is most recently used, so it's at the end by default
+    
+    def delete(self, key: str) -> bool:
+        """
+        Delete the key from the cache.
+        
+        Returns True if the key was present and deleted, False otherwise.
+        """
+        with self._lock:
+            if key in self._cache:
+                del self._cache[key]
+                return True
+            return False
+    
+    def clear(self) -> None:
+        """Remove all items from the cache."""
+        with self._lock:
+            self._cache.clear()
+    
+    def __len__(self) -> int:
+        """Return the number of items currently in the cache (including expired ones not yet purged)."""
+        with self._lock:
+            return len(self._cache)
+    
+    def __contains__(self, key: str) -> bool:
+        """Check if a key is in the cache and not expired."""
+        with self._lock:
+            if key not in self._cache:
+                return False
+            _, expiry = self._cache[key]
+            current_time = self._clock()
+            if current_time >= expiry:
+                del self._cache[key]
+                return False
+            return True
+
+
+# ============================================================================
+# Test Suite
+# ============================================================================
+
+import unittest
+
+
+class MockClock:
+    """A mock clock for testing TTL expiration."""
+    
+    def __init__(self, start_time: float = 0.0):
+        self._time = start_time
+    
+    def __call__(self) -> float:
+        return self._time
+    
+    def advance(self, delta: float) -> None:
+        self._time += delta
+
+
+class TestLRUCache(unittest.TestCase):
+    """Test suite for LRUCache."""
+    
+    def setUp(self):
+        self.clock = MockClock(0.0)
+        self.cache = LRUCache(capacity=3, clock=self.clock)
+    
+    def test_invalid_capacity_zero(self):
+        """Capacity of 0 should raise ValueError."""
+        with self.assertRaises(ValueError):
+            LRUCache(capacity=0, clock=self.clock)
+    
+    def test_invalid_capacity_negative(self):
+        """Negative capacity should raise ValueError."""
+        with self.assertRaises(ValueError):
+            LRUCache(capacity=-1, clock=self.clock)
+    
+    def test_invalid_capacity_non_integer(self):
+        """Non-integer capacity should raise ValueError."""
+        with self.assertRaises(ValueError):
+            LRUCache(capacity=3.5, clock=self.clock)
+    
+    def test_put_and_get(self):
+        """Basic put and get."""
+        self.cache.put("a", 1, ttl=10)
+        self.assertEqual(self.cache.get("a"), 1)
+    
+    def test_get_missing_key(self):
+        """Get on a missing key returns None."""
+        self.assertIsNone(self.cache.get("missing"))
+    
+    def test_ttl_expiration(self):
+        """Items expire after TTL."""
+        self.cache.put("a", 1, ttl=5)
+        self.assertEqual(self.cache.get("a"), 1)
+        
+        # Advance clock past TTL
+        self.clock.advance(6)
+        self.assertIsNone(self.cache.get("a"))
+    
+    def test_ttl_expiration_boundary(self):
+        """Item expires exactly at TTL boundary."""
+        self.cache.put("a", 1, ttl=5)
+        self.clock.advance(5)
+        # At exactly expiry time, item should be expired
+        self.assertIsNone(self.cache.get("a"))
+    
+    def test_ttl_not_expired(self):
+        """Item not expired before TTL."""
+        self.cache.put("a", 1, ttl=5)
+        self.clock.advance(4)
+        self.assertEqual(self.cache.get("a"), 1)
+    
+    def test_eviction_order_lru(self):
+        """Least recently used item is evicted when capacity is exceeded."""
+        self.cache.put("a", 1, ttl=100)
+        self.cache.put("b", 2, ttl=100)
+        self.cache.put("c", 3, ttl=100)
+        
+        # Access 'a' to make it most recently used
+        self.cache.get("a")
+        
+        # Add 'd', should evict 'b' (least recently used)
+        self.cache.put("d", 4, ttl=100)
+        
+        self.assertIsNone(self.cache.get("b"))
+        self.assertEqual(self.cache.get("a"), 1)
+        self.assertEqual(self.cache.get("c"), 3)
+        self.assertEqual(self.cache.get("d"), 4)
+    
+    def test_eviction_order_no_access(self):
+        """Without access, insertion order determines LRU."""
+        self.cache.put("a", 1, ttl=100)
+        self.cache.put("b", 2, ttl=100)
+        self.cache.put("c", 3, ttl=100)
+        
+        # Add 'd', should evict 'a' (first inserted, least recently used)
+        self.cache.put("d", 4, ttl=100)
+        
+        self.assertIsNone(self.cache.get("a"))
+        self.assertEqual(self.cache.get("b"), 2)
+        self.assertEqual(self.cache.get("c"), 3)
+        self.assertEqual(self.cache.get("

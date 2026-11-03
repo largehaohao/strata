@@ -1,0 +1,47 @@
+gguf: 675 dense/small tensors converted to Q8_0/F32 at load (the file's routed experts keep their types)
+fnx: The split engine is experimental on this card (gfx1100): Strata has not run it on this architecture. Please report whether it works: https://github.com/Niko1221/Strata/issues/new?template=amd_split_report.yml
+fnx: The split engine's self-test passed on gfx1100 (card 0: wmma, expert tile, dense product, dp4a, recurrent step against a scalar reference; card 1: wmma, expert tile, dense product, dp4a, recurrent step against a scalar reference).
+fnx: mlock of per_layer_token_embd.weight (27465 MiB) failed: Cannot allocate memory; the table stays unlocked in the page cache (raise RLIMIT_MEMLOCK to lock it)
+fnx: token_embd.weight and per_layer_token_embd.weight (29.5 GB) prefaulted in RAM in 0.6 s
+fnx: 7747 of 24576 routed experts (15.5 GiB) in RAM, ranked by /home/john/Strata/bench/results/2026-11-03-rx7900xtx-tensor-parallel/swift-decode-routes.bin
+fnx: static experts: immutable hot/cold placement, 15872 MiB host backing, no expert eviction or KV arena
+fnx: weights read in 9.2 s of reading (48.5 GB from the disk at 5.27 GB/s, 0.0 GB from the page cache), placed in 20.2 s
+fnx: released 7723 MiB of copied GGUF conversion buffers
+fnx: embedding refresh token_embd.weight: resident 644 -> 644 / 644 MiB in 0.02 s
+fnx: mlock of per_layer_token_embd.weight (27465 MiB) failed: Cannot allocate memory; the table stays unlocked in the page cache (raise RLIMIT_MEMLOCK to lock it)
+fnx: embedding refresh per_layer_token_embd.weight: resident 25452 -> 27465 / 27465 MiB in 0.84 s
+fnx: draft layer experts q4_0
+fnx: int8 K/V: 172 context pages (33024 positions) for requested context 32768; spare capacity expansion disabled
+fnx: Peer push between the cards is on (all 2 directed pairs: 4 MiB stored, compared in full on both sides, flag round trip at most 4.6 us).
+fnx: peer push: the window sums and the attention merge pushed into the peers' memory
+fnx: The prompt sums use RCCL (librccl.so.1).
+fnx: HC row group 64, grid 80, resident capacity 96 on card 0
+fnx: card 0: static decode cache 1184 slots, 1295 MiB in 2 pools, fixed hot experts bypass it
+fnx: cache pool 0: 37 layers, 896 slots, gate/up 627200 + down 460800 bytes
+fnx: cache pool 1: 11 layers, 288 slots, gate/up 870400 + down 460800 bytes
+fnx: card 0: GDN first-state/update log 65 MiB; prefill may need additional scratch
+fnx: HC row group 64, grid 80, resident capacity 96 on card 1
+fnx: card 1: static decode cache 1184 slots, 1295 MiB in 2 pools, fixed hot experts bypass it
+fnx: cache pool 0: 37 layers, 896 slots, gate/up 627200 + down 460800 bytes
+fnx: cache pool 1: 11 layers, 288 slots, gate/up 870400 + down 460800 bytes
+fnx: card 1: GDN first-state/update log 65 MiB; prefill may need additional scratch
+fnx: warm: prompt path (1100 tokens) ...
+fnx: warm: prompt path done
+fnx: warm: verify windows ...
+fnx: warm: verify 1 rows done
+fnx: warm: verify 16 rows done
+sfnx: loaded in 54.3 s, context 32768, MTP K=6, lookup 15, 1 slot(s); 2 cards, sums between them fp16; K/V pool (int8) 33024 positions free; VRAM free 828 / 828 MiB
+sfnx: slot 0: prompt 18 tokens = 0 reused + 18 read in 165 ms, 3 generated in 48 ms (62.6 tok/s), drafts 1 of 3, 2 rounds (0 with lookup drafts, 23.96 ms a round)
+sfnx: decode timing: verify 45.891 ms (GPU 45.651, launch 2.393), draft 1.789 ms (GPU 1.571, 3 calls), total 47.911 ms
+sfnx: slot 0: prompt 78 tokens = 0 reused + 78 read in 209 ms, 2048 generated in 10233 ms (200.1 tok/s), drafts 1565 of 2510, 483 rounds (91 with lookup drafts, 21.19 ms a round)
+sfnx: decode timing: verify 8896.292 ms (GPU 8852.799, launch 460.325), draft 1322.325 ms (GPU 1145.083, 2004 calls), total 10232.809 ms
+sfnx: slot 0: prompt 60 tokens = 0 reused + 60 read in 218 ms, 2048 generated in 12077 ms (169.6 tok/s), drafts 1369 of 2394, 679 rounds (68 with lookup drafts, 17.79 ms a round)
+sfnx: decode timing: verify 10589.981 ms (GPU 10531.201, launch 665.796), draft 1451.913 ms (GPU 1259.223, 2159 calls), total 12077.485 ms
+sfnx: slot 0: prompt 163 tokens = 0 reused + 163 read in 300 ms, 2048 generated in 10020 ms (204.4 tok/s), drafts 1608 of 2579, 440 rounds (156 with lookup drafts, 22.77 ms a round)
+sfnx: decode timing: verify 8845.420 ms (GPU 8797.958, launch 451.904), draft 1161.306 ms (GPU 1003.553, 1718 calls), total 10020.227 ms
+sfnx: slot 0: prompt 78 tokens = 0 reused + 78 read in 207 ms, 2048 generated in 10270 ms (199.4 tok/s), drafts 1565 of 2510, 483 rounds (91 with lookup drafts, 21.26 ms a round)
+sfnx: decode timing: verify 8917.891 ms (GPU 8869.520, launch 472.281), draft 1331.620 ms (GPU 1158.343, 2004 calls), total 10270.338 ms
+sfnx: slot 0: prompt 60 tokens = 0 reused + 60 read in 219 ms, 2048 generated in 12087 ms (169.4 tok/s), drafts 1369 of 2394, 679 rounds (68 with lookup drafts, 17.80 ms a round)
+sfnx: decode timing: verify 10594.724 ms (GPU 10534.145, launch 647.473), draft 1453.267 ms (GPU 1262.212, 2159 calls), total 12086.840 ms
+sfnx: slot 0: prompt 163 tokens = 0 reused + 163 read in 298 ms, 2048 generated in 10038 ms (204.0 tok/s), drafts 1608 of 2579, 440 rounds (156 with lookup drafts, 22.81 ms a round)
+sfnx: decode timing: verify 8841.251 ms (GPU 8793.026, launch 452.204), draft 1170.596 ms (GPU 1023.229, 1718 calls), total 10037.961 ms

@@ -1,0 +1,65 @@
+{
+  "comparisons": [
+    {
+      "candidate": "bench-gdn-replay-ram15p5",
+      "reference": "bench-mtp-q4",
+      "all_input_output_ids_equal": true,
+      "all_finish_reasons_equal": true,
+      "decode_major_faults": 0,
+      "weighted_decode_tps": 189.8476028032185,
+      "runs": 7
+    },
+    {
+      "candidate": "bench-gdn-replay-ram14",
+      "reference": "bench-mtp-q4",
+      "all_input_output_ids_equal": true,
+      "all_finish_reasons_equal": true,
+      "decode_major_faults": 0,
+      "weighted_decode_tps": 195.89213179357355,
+      "runs": 7
+    },
+    {
+      "candidate": "bench-gdn-replay-control",
+      "reference": "bench-mtp-q4",
+      "all_input_output_ids_equal": true,
+      "all_finish_reasons_equal": true,
+      "decode_major_faults": 0,
+      "weighted_decode_tps": 186.88518606391327,
+      "runs": 7
+    },
+    {
+      "candidate": "quality-gdn-replay",
+      "reference": "quality-split",
+      "all_input_output_ids_equal": true,
+      "all_finish_reasons_equal": true,
+      "decode_major_faults": 0,
+      "weighted_decode_tps": 205.9016393442623,
+      "runs": 4
+    },
+    {
+      "candidate": "near-context-gdn-replay",
+      "reference": "near-context-gdn-control",
+      "all_input_output_ids_equal": true,
+      "all_finish_reasons_equal": true,
+      "decode_major_faults": 0,
+      "weighted_decode_tps": 236.16236162361625,
+      "runs": 2
+    },
+    {
+      "candidate": "heldout-gdn-replay",
+      "reference": "heldout-mtp-q4",
+      "all_input_output_ids_equal": true,
+      "all_finish_reasons_equal": true,
+      "decode_major_faults": 0,
+      "weighted_decode_tps": 174.48052003373743,
+      "runs": 3
+    }
+  ],
+  "reviewed_code_checks": 1326,
+  "kernel_core_checks": 384,
+  "kernel_restoration_checks": 5760,
+  "kernel_log": "gdn-replay-checks.txt",
+  "scope": "single-request Flash-Next gfx1100; all benchmark warmup runs included in equality checks; warmup excluded from rate",
+  "acceptance_target_tps": 200,
+  "acceptance_target_reached": false
+}

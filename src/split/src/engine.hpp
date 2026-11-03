@@ -342,6 +342,7 @@ private:
     // FNX_PF_RCCL (AMD, hip/rccl.h): the prompt's chunk sums through RCCL, loaded at run time; rccl_ holds the library and the communicators (null: the host exchange)
     std::shared_ptr<void> rccl_;
     bool rccl_on_ = false;
+    bool gdn_replay_ = false;   // single-lane exact rollback from first state and logged rank-one updates
     // the prompt path's rows per chunk (FNX_PF_ROWS, a multiple of MAXT up to 8192, default 4096: prompts over 1k tokens
     // read ~20% faster than at 1024 for ~1.1 GiB more a card; Q4 at 262k makes room with FNX_EXPERT_RAM_GIB) and its jobs
     int pf_c_ = 4096, pf_jobs_ = 0;

@@ -93,6 +93,16 @@ not replaced. All new execution paths are opt-in.
   Smaller projections keep their original dispatch. Zero (the default) keeps
   all original choices; 1, 2 and 4 are accepted overrides. Integer operations,
   scaling and each row's reduction order are unchanged.
+- `FNX_GDN_REPLAY=1` replaces the recurrent layers' fifteen full rollback
+  snapshots with the first state and the actual rank-one updates for later
+  tokens. Partial acceptance restores that state and replays only the kept
+  updates. The logged keys, deltas and decay retain the original gfx1100
+  multiplication/FMA order; the default full-snapshot path is unchanged.
+  This option requires the Flash-Next HIP build, gfx1100, one lane and
+  `FNX_BATCH_DRAFTS=0`. Single-request MTP remains enabled. Batched multirow
+  verification is rejected before using the smaller buffers. Prefill can
+  borrow the allocation as before and may allocate additional scratch if
+  needed. At the tested prefill size, net savings are 744 MiB per card.
 
 `FNX_STATIC_CACHE_FUSED_DN=64` fills missing down weights inside the IQ gate/up
 launch: 64 prefix blocks copy bytes while the remaining blocks compute the
@@ -157,6 +167,7 @@ uses a forced continuation.
 | Same, context-sized KV pool and 15.5 GiB cold backing, two runs | 186.5–186.8 | 161.5–162.0 | 196.0–196.3 |
 | Same, two-row groups for large Q8 projections, two runs | 189.0–189.7 | 164.7–165.0 | 198.6–198.7 |
 | Same, BF16-derived Q4 draft experts, two runs | 196.0–196.4 | 167.5–167.7 | 200.7–201.3 |
+| Same, logged GDN rollback and 14 GiB cold backing, two runs | 205.8–206.2 | 173.3–173.7 | 212.6–213.2 |
 
 Values are tokens/s from the engine's reported decode time. The benchmark
 also records client time, time to first token, exact input/output token IDs,
@@ -292,6 +303,24 @@ held-out checks were not used to select expert residency. See `bench-mtp-q4`,
 Raising the Q4 draft limit from six to eight measured 186.70 tokens/s, with
 identical target outputs; the recipe retains six (`bench-mtp-q4-spec8`). The
 broader 200 tokens/s target remains open.
+
+Logged GDN rollback with the preceding 15.5 GiB cold backing measured
+**189.85 tokens/s**. Startup/warmup left 828 MiB free per card. Moving another
+1.5 GiB of expert weights from host memory to the two cards (14 GiB cold
+backing) measured **195.89 tokens/s**, versus **186.89** with full snapshots
+and 15.5 GiB backing in the same binary (**4.82%** higher). Both comparison
+runs disable batched draft windows. All input/output token IDs match the Q4
+reference; all six measured requests have zero decode major faults. The
+14 GiB recipe leaves 68 MiB free per card. See `bench-gdn-replay-ram15p5`,
+`bench-gdn-replay-ram14`, and `bench-gdn-replay-control`.
+The three reviewed code tasks retain their token IDs and pass all 1326 checks
+(`quality-gdn-replay`); varint measured 228.30 tokens/s. The full panel remains
+below 200 tokens/s.
+A real 32688-token input plus 64 generated tokens also matches the same-binary
+full-snapshot control exactly: prefill/decode took 45.66 s/271.0 ms, versus
+47.73 s/285.6 ms. Both additional Chinese tasks retain every Q4-reference
+token. These checks have zero decode major faults; see `near-context-gdn-replay`,
+`near-context-gdn-control`, `heldout-gdn-replay`, and `gdn-replay-checks.json`.
 
 The exact token records and the calibration profile are in
 [`bench/results/2026-11-03-rx7900xtx-tensor-parallel`](../bench/results/2026-11-03-rx7900xtx-tensor-parallel/).
@@ -485,7 +514,7 @@ Set the SDK library paths for the child process:
 ```sh
 export LD_LIBRARY_PATH="$PWD/.venv/lib/python3.12/site-packages/_rocm_sdk_core/lib:$PWD/.venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx110X_dgpu/lib"
 HIP_VISIBLE_DEVICES=0,1 HSA_FORCE_FINE_GRAIN_PCIE=1 \
-FNX_STATIC_EXPERTS=1 FNX_EXPERT_RAM_GIB=15.5 FNX_STATIC_CACHE_SLOTS=1024 \
+FNX_STATIC_EXPERTS=1 FNX_EXPERT_RAM_GIB=14 FNX_STATIC_CACHE_SLOTS=1024 \
 FNX_STATIC_CACHE_GROUPS=2 \
 FNX_MOE_STAGE=0 FNX_PF_ROWS=256 \
 FNX_IQ_REUSE=1 FNX_IQ_GROUP=16 FNX_MOE_PRE_ROWS=1 \
@@ -493,6 +522,7 @@ FNX_STATIC_HOST_CACHE=1 FNX_EMBED_WARM_AFTER_LOAD=1 \
 FNX_RELEASE_COPIED_WEIGHTS=1 FNX_KV_CONTEXT_ONLY=1 \
 FNX_HC_ROW_GROUP=64 FNX_STATIC_CACHE_FUSED_DN=64 \
 FNX_Q8S_ROW_GROUP=2 \
+FNX_GDN_REPLAY=1 FNX_BATCH_DRAFTS=0 \
 FNX_MTP_EXPERTS=q4_0 \
 FNX_EXPERT_PROFILE="$PWD/bench/results/2026-11-03-rx7900xtx-tensor-parallel/swift-decode-routes.bin" \
 python3 tools/tp_decode_bench.py \
@@ -575,6 +605,12 @@ context alone does not measure long-context decode.
 - Q4 draft pack: source tensor hashes verified; 24064 blocks match the pinned
   GGUF Q4 reference. Target token IDs match on the full panel, all three reviewed
   code tasks (1326 checks passed), and two additional Chinese prompts.
+- Logged GDN rollback: 384 exact core and 5760 exact restoration comparisons
+  passed on both cards. Tests cover T=1..16, every partial acceptance length,
+  both history parities, changed/zero inputs, output guards, direct/graph
+  execution, and two independent layer descriptors with rotated head order.
+  The original full snapshots are the byte oracle. Uniform FMA contraction
+  orders failed the prototype; the retained row-dependent order matches.
 - CUDA has not been built or run here. No SYCL files are changed.
 - Remaining: the 200 tokens/s target, long-context acceptance, broader quality
   and workload coverage, and integration into launch policy.

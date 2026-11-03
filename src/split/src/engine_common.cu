@@ -670,7 +670,7 @@ void Engine::commit(int n) {
             int k = 0;
             for (int l = 0; l < NL; ++l) {
                 if (is_attn(l)) continue;
-                jobs[k++] = {b.S[l], b.snap[l] + (size_t) (n - 1) * w.nv() * HS * HS, sbytes};
+                if (!gdn_replay_) jobs[k++] = {b.S[l], b.snap[l] + (size_t) (n - 1) * w.nv() * HS * HS, sbytes};
                 jobs[k++] = {b.chist[l] + wrote * hfloats, b.hsnap[l] + (size_t) (n - 1) * hfloats, hfloats * 4};
             }
             k += hist_jobs(jobs + k, b, nullptr, (size_t) (n - 1));
@@ -679,6 +679,7 @@ void Engine::commit(int n) {
                     throw std::runtime_error("commit: a copy not 16-byte aligned");
             ck(cudaMemcpyAsync(b.commit_jobs, jobs, (size_t) k * sizeof(CopyJob), cudaMemcpyHostToDevice, b.st), "commit jobs");
             ck(cudaEventRecord(b.commit_ev, b.st), "commit event");
+            if (gdn_replay_) gdn_replay(b.gdn_replay_jobs, b.gdn_replay_layers, w.nv(), n, b.st);
             copy_many(b.commit_jobs, k, b.st);
         });
     }
@@ -1055,6 +1056,7 @@ std::vector<int> Engine::verify_rows(const std::vector<int>& lanes, const std::v
         T += k;
     }
     if (T > MAXT || (int) tokens.size() != T) throw std::runtime_error("verify_rows: at most MAXT rows in all, a token each");
+    if (gdn_replay_ && T > 1) throw std::runtime_error("FNX_GDN_REPLAY uses single-lane verify(), not batched draft windows");
     if (!pending_.empty() || !rows_pending_.lanes.empty()) throw std::runtime_error("verify_rows: the last window is not committed");
     for (int i = 0; i < nl; ++i) {
         if (lanes[i] < 0 || lanes[i] >= (int) lanes_.size()) throw std::runtime_error("verify_rows: no lane " + std::to_string(lanes[i]));

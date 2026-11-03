@@ -1964,13 +1964,20 @@ size_t gdn_scratch_floats(int nv) { return (size_t) MAXT * nv * HS + (size_t) nv
 
 void gdn_core(const float* qkvz, const float* ab, float* hist, const float* convw, const float* dt, const float* a, const float* nw,
               float* S, void* yq, const int* ctl, float* scratch, float* snap, float* hsnap, int nk, int nv, const int* vmap, int T,
-              float eps, void* st, float* y32) {
+              float eps, void* st, float* y32, float* replay_log) {
     cudaStream_t s = (cudaStream_t) st;
     block_q8_1* y = (block_q8_1*) yq;
     int8_t* tq;
     float* td;
     twin_of(yq, nv * HS, tq, td);
+#if FNX_HIP && !FNX_27B
+#define FNX_GDN(t) \
+    if (replay_log) k_gdn_core<t, true><<<nv * GDN_Q, GDN_THREADS, 0, s>>>(qkvz, ab, hist, convw, dt, a, nw, S, y, ctl, scratch, snap, hsnap, nk, nv, vmap, eps, tq, td, y32, GdnLanes{}, replay_log); \
+    else k_gdn_core<t><<<nv * GDN_Q, GDN_THREADS, 0, s>>>(qkvz, ab, hist, convw, dt, a, nw, S, y, ctl, scratch, snap, hsnap, nk, nv, vmap, eps, tq, td, y32, GdnLanes{})
+#else
+    if (replay_log) throw std::runtime_error("GDN replay requires the Flash-Next HIP build");
 #define FNX_GDN(t) k_gdn_core<t><<<nv * GDN_Q, GDN_THREADS, 0, s>>>(qkvz, ab, hist, convw, dt, a, nw, S, y, ctl, scratch, snap, hsnap, nk, nv, vmap, eps, tq, td, y32, GdnLanes{})
+#endif
     switch (T) {
         case 1: FNX_GDN(1); break;
         case 2: FNX_GDN(2); break;
@@ -1992,6 +1999,14 @@ void gdn_core(const float* qkvz, const float* ab, float* hist, const float* conv
     }
 #undef FNX_GDN
     ck_launch("gdn_core");
+}
+
+void gdn_replay(const GdnReplayJob* jobs, int layers, int nv, int keep, void* st) {
+    if (!jobs || layers < 1 || nv < 1 || keep < 1 || keep >= MAXT)
+        throw std::runtime_error("gdn_replay: invalid jobs, shape or kept count");
+    const unsigned blocks = (unsigned) std::min<size_t>(32, ((size_t) nv * HS * HS + 255) / 256);
+    k_gdn_replay<<<dim3(blocks, layers), 256, 0, (cudaStream_t) st>>>(jobs, nv, keep);
+    ck_launch("gdn_replay");
 }
 
 void gdn_core_lanes(const float* qkvz, const float* ab, const float* convw, const float* dt, const float* a, const float* nw, void* yq,

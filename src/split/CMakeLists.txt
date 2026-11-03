@@ -168,6 +168,19 @@ if(_fnx_hip)
   set_target_properties(split_hc_compact_test PROPERTIES HIP_STANDARD 17 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${_fnx_hip_archs}")
 endif()
 
+# Exact logged GDN rollback is currently restricted to the Flash-Next gfx1100 path.
+if(_fnx_hip)
+  add_executable(split_gdn_replay_test EXCLUDE_FROM_ALL ${_sp}/tools/gdn_replay_test.cu)
+  foreach(_prop INCLUDE_DIRECTORIES COMPILE_DEFINITIONS COMPILE_OPTIONS LINK_LIBRARIES)
+    get_target_property(_value strata-split-${_moe_cards} ${_prop})
+    if(_value)
+      set_property(TARGET split_gdn_replay_test PROPERTY ${_prop} "${_value}")
+    endif()
+  endforeach()
+  set_source_files_properties(${_sp}/tools/gdn_replay_test.cu PROPERTIES LANGUAGE HIP)
+  set_target_properties(split_gdn_replay_test PROPERTIES HIP_STANDARD 17 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${_fnx_hip_archs}")
+endif()
+
 # CPU unit tests: split rule, ring plan, card checks, batch plan, rope and input parser.
 if(STRATA_BUILD_TESTS)
   list(GET STRATA_SPLIT_CARDS 0 _n0)
