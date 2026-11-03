@@ -113,6 +113,14 @@ existing peer probe to pass. The runtime still checks the actual links before
 using peer push. The startup log now reports host exchange only when it is
 actually selected.
 
+The existing `FNX_MTP_EXPERTS=q4_0` path can use draft experts quantized from
+the installed BF16 tensors. `tools/mtp_experts.py` now prepares a separate
+runtime directory, checking the input manifest hashes and Q4 bytes against the
+pinned GGUF reference. Dense draft weights and the complete draft vocabulary
+are reused. The target Swift IQ3_S weights are unchanged. Both draft formats
+use Q4 blocks on the GPU: the default Q2 pack is expanded when loading, so the
+Q4 experiment does not enlarge the expert allocations.
+
 ## Measurements so far
 
 Hardware: two RX 7900 XTX (`gfx1100`, 24 GiB each), Ryzen 7700, 64 GiB RAM.
@@ -148,6 +156,7 @@ uses a forced continuation.
 | Same, two cache pools within the existing byte budget, two runs | 184.2–184.5 | 160.6–160.7 | 192.9–193.2 |
 | Same, context-sized KV pool and 15.5 GiB cold backing, two runs | 186.5–186.8 | 161.5–162.0 | 196.0–196.3 |
 | Same, two-row groups for large Q8 projections, two runs | 189.0–189.7 | 164.7–165.0 | 198.6–198.7 |
+| Same, BF16-derived Q4 draft experts, two runs | 196.0–196.4 | 167.5–167.7 | 200.7–201.3 |
 
 Values are tokens/s from the engine's reported decode time. The benchmark
 also records client time, time to first token, exact input/output token IDs,
@@ -270,6 +279,20 @@ hardware; the option does not change defaults on other backends.
 The reviewed code tasks also retain their exact token IDs and pass all 1326
 checks (`quality-q8-group2`); the varint task measured 212.60 tokens/s.
 
+Q4 draft experts measured **187.03 tokens/s**, versus **183.14** with Q2 draft
+experts in the same binary (**2.12%** higher). Accepted draft tokens increased
+from 1536 to 1565 on code, 1350 to 1369 on prose, and 1593 to 1608 on edit.
+All six target output sequences match and decode major faults are zero.
+The completed-code tasks also match and pass all 1326 checks; varint measured
+218.17 tokens/s. Two additional Chinese prompts, generating 1024 tokens each,
+match the Q2 reference exactly: systems explanation measured 152.72 versus
+151.73 tokens/s, and Unicode explanation/code 187.08 versus 181.74. These
+held-out checks were not used to select expert residency. See `bench-mtp-q4`,
+`quality-mtp-q4`, `heldout-mtp-q2`, `heldout-mtp-q4`, and `mtp-q4-conversion.json`.
+Raising the Q4 draft limit from six to eight measured 186.70 tokens/s, with
+identical target outputs; the recipe retains six (`bench-mtp-q4-spec8`). The
+broader 200 tokens/s target remains open.
+
 The exact token records and the calibration profile are in
 [`bench/results/2026-11-03-rx7900xtx-tensor-parallel`](../bench/results/2026-11-03-rx7900xtx-tensor-parallel/).
 
@@ -317,6 +340,12 @@ GGUF. Thus, split and the native engine do not have the same arithmetic or
 necessarily the same output tokens. The checks above compare split variants.
 They do not establish quality equivalence with the native BF16 path. The
 2048-token performance replies hit their length limit.
+
+A separate IQ dot-product prototype split the integer accumulation into two
+or four independent chains. It passed 2304 exact direct/graph comparisons,
+but timing did not improve consistently across expert counts. It is not
+integrated; the source and microbenchmark log are retained in `iq-ilp/` beside
+the other results. No full-model speedup is claimed for it.
 
 Separate completed-code tasks cover interval merging (316 checks),
 lexicographically smallest topological sorting (125 checks), and canonical
@@ -439,8 +468,19 @@ GG="$PWD/third_party/llama.cpp" CARDS=2 ARCHS=gfx1100 JOBS=4 \
 bash packaging/build_split_hip.sh
 ```
 
-Set `MODEL`, `MTP` and `TOKENIZER` to the installed GGUF, MTP directory and
-tokenizer directory. Set the SDK library paths for the child process:
+Set `MODEL` and `TOKENIZER` to the installed GGUF and tokenizer directory.
+For the measured Q4 draft recipe, prepare a new runtime directory from the
+existing MTP source directory (containing `mtp-manifest.json`, `tensors/`, and
+`rt/`), then set `MTP` to that new directory:
+
+```sh
+python3 tools/mtp_experts.py --src "$MTP_SOURCE" --out "$PWD/build-tensor-parralize/mtp-rt-q4"
+MTP="$PWD/build-tensor-parralize/mtp-rt-q4"
+```
+
+The output must be new. The tool writes 1415577600 bytes of Q4 expert data and
+a provenance report; it symlinks the existing dense weights and draft vocabulary.
+Set the SDK library paths for the child process:
 
 ```sh
 export LD_LIBRARY_PATH="$PWD/.venv/lib/python3.12/site-packages/_rocm_sdk_core/lib:$PWD/.venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx110X_dgpu/lib"
@@ -453,6 +493,7 @@ FNX_STATIC_HOST_CACHE=1 FNX_EMBED_WARM_AFTER_LOAD=1 \
 FNX_RELEASE_COPIED_WEIGHTS=1 FNX_KV_CONTEXT_ONLY=1 \
 FNX_HC_ROW_GROUP=64 FNX_STATIC_CACHE_FUSED_DN=64 \
 FNX_Q8S_ROW_GROUP=2 \
+FNX_MTP_EXPERTS=q4_0 \
 FNX_EXPERT_PROFILE="$PWD/bench/results/2026-11-03-rx7900xtx-tensor-parallel/swift-decode-routes.bin" \
 python3 tools/tp_decode_bench.py \
   --exe build-tensor-parralize/src/split/strata-split-2 \
@@ -531,6 +572,9 @@ context alone does not measure long-context decode.
 - Q8 row groups: 6144 bit-exact direct/graph comparisons passed on both cards
   across settings 0/1/2/4, T=1..16, packed/split activations, segmented and plain
   matrices, uneven final rows, changed/zero inputs and output guards.
+- Q4 draft pack: source tensor hashes verified; 24064 blocks match the pinned
+  GGUF Q4 reference. Target token IDs match on the full panel, all three reviewed
+  code tasks (1326 checks passed), and two additional Chinese prompts.
 - CUDA has not been built or run here. No SYCL files are changed.
 - Remaining: the 200 tokens/s target, long-context acceptance, broader quality
   and workload coverage, and integration into launch policy.
