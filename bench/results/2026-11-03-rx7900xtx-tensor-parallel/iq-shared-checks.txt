@@ -1,0 +1,7 @@
+card 0 ffs 32 exact
+card 0 ffs 320 exact
+card 0 ffs 320 exact
+card 1 ffs 32 exact
+card 1 ffs 320 exact
+card 1 ffs 320 exact
+IQ shared: 4608 exact routed/shared direct/graph checks passed

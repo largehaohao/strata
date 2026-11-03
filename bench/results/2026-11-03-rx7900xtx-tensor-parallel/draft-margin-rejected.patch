@@ -1,0 +1,45 @@
+diff --git a/src/split/src/session.cpp b/src/split/src/session.cpp
+index 8e429c76..2e0bb2e2 100644
+--- a/src/split/src/session.cpp
++++ b/src/split/src/session.cpp
+@@ -408,6 +408,10 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
+     // model's: the verify accepts a draft with min(1, p / q) and otherwise draws from max(0, p - q)
+     const bool pen_drafts = penalize && env_int("FNX_DRAFT_PEN", 1) != 0;
+     const bool samp_drafts = sample && env_int("FNX_DRAFT_SAMPLE", 1) != 0;
++    const double min_margin = env_num("FNX_DRAFT_MIN_MARGIN", 0.0);
++    if (min_margin < 0) throw std::runtime_error("FNX_DRAFT_MIN_MARGIN: expected a nonnegative logit margin");
++    const bool confidence_gate = !sample && min_margin > 0;
++    bool draft_confident = true;
+     // The MTP chain's length follows acceptance: per chain position, how often a draft that got there stood (decayed,
+     // so it follows the text), and each round the length 1..K with the most tokens expected per ms. A round costs about
+     // ROUND_MS, a verify row DRAFT_ROW_MS more and a draft call after d1 DRAFT_CALL_MS (Q4, lab, 2026-10-25, prose with
+@@ -440,9 +444,13 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
+                          Dist& q) {
+         Engine::Penalties::Row pen;
+         if (pen_drafts) pen = penalty_row(pen_seq, s);
+-        int d = e_.draft(T, from_main, src_row, toks, pos0, pen_drafts ? &pen : nullptr, samp_drafts);
++        int d = e_.draft(T, from_main, src_row, toks, pos0, pen_drafts ? &pen : nullptr, samp_drafts || confidence_gate);
+         st.draft_ms += e_.last_draft_ms, st.draft_gpu_ms += e_.last_draft_gpu_ms, ++st.draft_calls;
+         q = Dist{};
++        if (confidence_gate) {
++            const auto& c = e_.last_draft_cands;
++            draft_confident = c.size() >= 2 && (double) c[0].first - c[1].first >= min_margin;
++        }
+         if (samp_drafts) {
+             q = make_dist(e_.last_draft_cands, s);
+             d = draw(q, unif(rng));
+@@ -576,10 +584,12 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
+         const int k = !adapt ? K_ : std::min(K_, chain_len() + (++mtp_chains % 4 ? 0 : 1));   // every 16th: code stuck at ~3
+         mtp_round = true;
+         drafts = {d1}, qs = {std::move(q1)};
+-        for (int j = 1; j < k; ++j) {
++        for (int j = 1; j < k && (!confidence_gate || draft_confident); ++j) {
+             if (pen_drafts) pen_seq.push_back(drafts.back());
+             Dist q;
+-            drafts.push_back(draft_one(1, false, j == 1 ? used - 1 : 0, {drafts.back()}, p + used - 1 + j, pen_seq, q));
++            const int candidate = draft_one(1, false, j == 1 ? used - 1 : 0, {drafts.back()}, p + used - 1 + j, pen_seq, q);
++            if (confidence_gate && !draft_confident) break;
++            drafts.push_back(candidate);
+             qs.push_back(std::move(q));
+         }
+     }

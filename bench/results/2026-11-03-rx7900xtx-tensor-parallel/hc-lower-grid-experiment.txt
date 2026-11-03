@@ -1,0 +1,336 @@
+validated mode 48
+validated mode 40
+validated mode 32
+validated mode 24
+card 0 T 1 round 0 mode 48 us 22.3175 exact
+card 0 T 1 round 0 mode 40 us 13.2062 exact
+card 0 T 1 round 0 mode 32 us 12.526 exact
+card 0 T 1 round 0 mode 24 us 14.9632 exact
+card 0 T 1 round 0 mode 24 us 15.139 exact
+card 0 T 1 round 0 mode 32 us 12.5468 exact
+card 0 T 1 round 0 mode 40 us 11.0922 exact
+card 0 T 1 round 0 mode 48 us 10.5514 exact
+card 0 T 1 round 1 mode 48 us 10.3286 exact
+card 0 T 1 round 1 mode 40 us 10.2598 exact
+card 0 T 1 round 1 mode 32 us 13.1542 exact
+card 0 T 1 round 1 mode 24 us 15.4462 exact
+card 0 T 1 round 1 mode 24 us 15.5362 exact
+card 0 T 1 round 1 mode 32 us 12.5412 exact
+card 0 T 1 round 1 mode 40 us 10.8828 exact
+card 0 T 1 round 1 mode 48 us 10.5078 exact
+card 0 T 1 round 2 mode 48 us 10.6822 exact
+card 0 T 1 round 2 mode 40 us 10.7316 exact
+card 0 T 1 round 2 mode 32 us 12.948 exact
+card 0 T 1 round 2 mode 24 us 15.3618 exact
+card 0 T 1 round 2 mode 24 us 15.629 exact
+card 0 T 1 round 2 mode 32 us 12.5368 exact
+card 0 T 1 round 2 mode 40 us 10.9894 exact
+card 0 T 1 round 2 mode 48 us 10.593 exact
+validated mode 48
+validated mode 40
+validated mode 32
+validated mode 24
+card 0 T 4 round 0 mode 48 us 27.7045 exact
+card 0 T 4 round 0 mode 40 us 22.1298 exact
+card 0 T 4 round 0 mode 32 us 25.6255 exact
+card 0 T 4 round 0 mode 24 us 31.3751 exact
+card 0 T 4 round 0 mode 24 us 31.3511 exact
+card 0 T 4 round 0 mode 32 us 25.2253 exact
+card 0 T 4 round 0 mode 40 us 19.9772 exact
+card 0 T 4 round 0 mode 48 us 19.2854 exact
+card 0 T 4 round 1 mode 48 us 19.8406 exact
+card 0 T 4 round 1 mode 40 us 19.874 exact
+card 0 T 4 round 1 mode 32 us 25.456 exact
+card 0 T 4 round 1 mode 24 us 31.1325 exact
+card 0 T 4 round 1 mode 24 us 30.5703 exact
+card 0 T 4 round 1 mode 32 us 24.2773 exact
+card 0 T 4 round 1 mode 40 us 18.8842 exact
+card 0 T 4 round 1 mode 48 us 18.91 exact
+card 0 T 4 round 2 mode 48 us 19.3486 exact
+card 0 T 4 round 2 mode 40 us 19.3802 exact
+card 0 T 4 round 2 mode 32 us 25.0328 exact
+card 0 T 4 round 2 mode 24 us 30.4475 exact
+card 0 T 4 round 2 mode 24 us 30.1901 exact
+card 0 T 4 round 2 mode 32 us 24.4376 exact
+card 0 T 4 round 2 mode 40 us 18.9154 exact
+card 0 T 4 round 2 mode 48 us 18.628 exact
+validated mode 48
+validated mode 40
+validated mode 32
+validated mode 24
+card 0 T 7 round 0 mode 48 us 37.3423 exact
+card 0 T 7 round 0 mode 40 us 27.9495 exact
+card 0 T 7 round 0 mode 32 us 36.3017 exact
+card 0 T 7 round 0 mode 24 us 44.6433 exact
+card 0 T 7 round 0 mode 24 us 44.2011 exact
+card 0 T 7 round 0 mode 32 us 35.3995 exact
+card 0 T 7 round 0 mode 40 us 26.8565 exact
+card 0 T 7 round 0 mode 48 us 27.2431 exact
+card 0 T 7 round 1 mode 48 us 27.1917 exact
+card 0 T 7 round 1 mode 40 us 27.1209 exact
+card 0 T 7 round 1 mode 32 us 35.4761 exact
+card 0 T 7 round 1 mode 24 us 43.0527 exact
+card 0 T 7 round 1 mode 24 us 42.8129 exact
+card 0 T 7 round 1 mode 32 us 34.4491 exact
+card 0 T 7 round 1 mode 40 us 25.9783 exact
+card 0 T 7 round 1 mode 48 us 25.7983 exact
+card 0 T 7 round 2 mode 48 us 25.9061 exact
+card 0 T 7 round 2 mode 40 us 25.9853 exact
+card 0 T 7 round 2 mode 32 us 34.0107 exact
+card 0 T 7 round 2 mode 24 us 43.4401 exact
+card 0 T 7 round 2 mode 24 us 43.3957 exact
+card 0 T 7 round 2 mode 32 us 33.9619 exact
+card 0 T 7 round 2 mode 40 us 25.8707 exact
+card 0 T 7 round 2 mode 48 us 25.8029 exact
+validated mode 48
+validated mode 40
+validated mode 32
+validated mode 24
+card 0 T 8 round 0 mode 48 us 36.9733 exact
+card 0 T 8 round 0 mode 40 us 29.5963 exact
+card 0 T 8 round 0 mode 32 us 39.8951 exact
+card 0 T 8 round 0 mode 24 us 49.5505 exact
+card 0 T 8 round 0 mode 24 us 48.9205 exact
+card 0 T 8 round 0 mode 32 us 38.7233 exact
+card 0 T 8 round 0 mode 40 us 29.4201 exact
+card 0 T 8 round 0 mode 48 us 29.2213 exact
+card 0 T 8 round 1 mode 48 us 29.5827 exact
+card 0 T 8 round 1 mode 40 us 28.9887 exact
+card 0 T 8 round 1 mode 32 us 38.1995 exact
+card 0 T 8 round 1 mode 24 us 47.3685 exact
+card 0 T 8 round 1 mode 24 us 46.9177 exact
+card 0 T 8 round 1 mode 32 us 37.1573 exact
+card 0 T 8 round 1 mode 40 us 28.5579 exact
+card 0 T 8 round 1 mode 48 us 29.0327 exact
+card 0 T 8 round 2 mode 48 us 28.9111 exact
+card 0 T 8 round 2 mode 40 us 28.3621 exact
+card 0 T 8 round 2 mode 32 us 37.6801 exact
+card 0 T 8 round 2 mode 24 us 49.0255 exact
+card 0 T 8 round 2 mode 24 us 48.9275 exact
+card 0 T 8 round 2 mode 32 us 38.1063 exact
+card 0 T 8 round 2 mode 40 us 28.3893 exact
+card 0 T 8 round 2 mode 48 us 28.7437 exact
+validated mode 48
+validated mode 40
+validated mode 32
+validated mode 24
+card 0 T 12 round 0 mode 48 us 44.2189 exact
+card 0 T 12 round 0 mode 40 us 38.8637 exact
+card 0 T 12 round 0 mode 32 us 53.5669 exact
+card 0 T 12 round 0 mode 24 us 65.3039 exact
+card 0 T 12 round 0 mode 24 us 65.0371 exact
+card 0 T 12 round 0 mode 32 us 51.4689 exact
+card 0 T 12 round 0 mode 40 us 38.3631 exact
+card 0 T 12 round 0 mode 48 us 38.0597 exact
+card 0 T 12 round 1 mode 48 us 37.7149 exact
+card 0 T 12 round 1 mode 40 us 37.5631 exact
+card 0 T 12 round 1 mode 32 us 50.4213 exact
+card 0 T 12 round 1 mode 24 us 63.5327 exact
+card 0 T 12 round 1 mode 24 us 65.0555 exact
+card 0 T 12 round 1 mode 32 us 50.6255 exact
+card 0 T 12 round 1 mode 40 us 37.7219 exact
+card 0 T 12 round 1 mode 48 us 36.7497 exact
+card 0 T 12 round 2 mode 48 us 35.9083 exact
+card 0 T 12 round 2 mode 40 us 36.0537 exact
+card 0 T 12 round 2 mode 32 us 50.4863 exact
+card 0 T 12 round 2 mode 24 us 64.7061 exact
+card 0 T 12 round 2 mode 24 us 64.7537 exact
+card 0 T 12 round 2 mode 32 us 50.5515 exact
+card 0 T 12 round 2 mode 40 us 36.1691 exact
+card 0 T 12 round 2 mode 48 us 35.8637 exact
+validated mode 48
+validated mode 40
+validated mode 32
+validated mode 24
+card 0 T 16 round 0 mode 48 us 51.2149 exact
+card 0 T 16 round 0 mode 40 us 49.3225 exact
+card 0 T 16 round 0 mode 32 us 66.7257 exact
+card 0 T 16 round 0 mode 24 us 87.418 exact
+card 0 T 16 round 0 mode 24 us 81.9966 exact
+card 0 T 16 round 0 mode 32 us 63.8535 exact
+card 0 T 16 round 0 mode 40 us 46.4923 exact
+card 0 T 16 round 0 mode 48 us 47.5347 exact
+card 0 T 16 round 1 mode 48 us 46.0603 exact
+card 0 T 16 round 1 mode 40 us 45.9501 exact
+card 0 T 16 round 1 mode 32 us 62.6981 exact
+card 0 T 16 round 1 mode 24 us 89.8836 exact
+card 0 T 16 round 1 mode 24 us 89.8302 exact
+card 0 T 16 round 1 mode 32 us 62.4071 exact
+card 0 T 16 round 1 mode 40 us 45.8419 exact
+card 0 T 16 round 1 mode 48 us 46.3539 exact
+card 0 T 16 round 2 mode 48 us 45.9039 exact
+card 0 T 16 round 2 mode 40 us 45.1945 exact
+card 0 T 16 round 2 mode 32 us 63.9527 exact
+card 0 T 16 round 2 mode 24 us 89.8688 exact
+card 0 T 16 round 2 mode 24 us 89.8492 exact
+card 0 T 16 round 2 mode 32 us 63.1681 exact
+card 0 T 16 round 2 mode 40 us 45.9473 exact
+card 0 T 16 round 2 mode 48 us 46.3179 exact
+validated mode 48
+validated mode 40
+validated mode 32
+validated mode 24
+card 1 T 1 round 0 mode 48 us 21.2241 exact
+card 1 T 1 round 0 mode 40 us 12.7124 exact
+card 1 T 1 round 0 mode 32 us 13.374 exact
+card 1 T 1 round 0 mode 24 us 15.5901 exact
+card 1 T 1 round 0 mode 24 us 15.5931 exact
+card 1 T 1 round 0 mode 32 us 12.3218 exact
+card 1 T 1 round 0 mode 40 us 11.013 exact
+card 1 T 1 round 0 mode 48 us 10.6782 exact
+card 1 T 1 round 1 mode 48 us 11.0118 exact
+card 1 T 1 round 1 mode 40 us 11.496 exact
+card 1 T 1 round 1 mode 32 us 12.8894 exact
+card 1 T 1 round 1 mode 24 us 15.9595 exact
+card 1 T 1 round 1 mode 24 us 15.9739 exact
+card 1 T 1 round 1 mode 32 us 12.6476 exact
+card 1 T 1 round 1 mode 40 us 10.9918 exact
+card 1 T 1 round 1 mode 48 us 10.7018 exact
+card 1 T 1 round 2 mode 48 us 10.7996 exact
+card 1 T 1 round 2 mode 40 us 11.2286 exact
+card 1 T 1 round 2 mode 32 us 12.8164 exact
+card 1 T 1 round 2 mode 24 us 15.5735 exact
+card 1 T 1 round 2 mode 24 us 15.3913 exact
+card 1 T 1 round 2 mode 32 us 12.6744 exact
+card 1 T 1 round 2 mode 40 us 10.9054 exact
+card 1 T 1 round 2 mode 48 us 10.6822 exact
+validated mode 48
+validated mode 40
+validated mode 32
+validated mode 24
+card 1 T 4 round 0 mode 48 us 24.5851 exact
+card 1 T 4 round 0 mode 40 us 20.6805 exact
+card 1 T 4 round 0 mode 32 us 24.8103 exact
+card 1 T 4 round 0 mode 24 us 31.5585 exact
+card 1 T 4 round 0 mode 24 us 31.0721 exact
+card 1 T 4 round 0 mode 32 us 25.0599 exact
+card 1 T 4 round 0 mode 40 us 19.9749 exact
+card 1 T 4 round 0 mode 48 us 20.3929 exact
+card 1 T 4 round 1 mode 48 us 19.9651 exact
+card 1 T 4 round 1 mode 40 us 20.4639 exact
+card 1 T 4 round 1 mode 32 us 26.0183 exact
+card 1 T 4 round 1 mode 24 us 31.4731 exact
+card 1 T 4 round 1 mode 24 us 30.9459 exact
+card 1 T 4 round 1 mode 32 us 25.0165 exact
+card 1 T 4 round 1 mode 40 us 19.2135 exact
+card 1 T 4 round 1 mode 48 us 19.7563 exact
+card 1 T 4 round 2 mode 48 us 19.9245 exact
+card 1 T 4 round 2 mode 40 us 19.5793 exact
+card 1 T 4 round 2 mode 32 us 25.4027 exact
+card 1 T 4 round 2 mode 24 us 31.0661 exact
+card 1 T 4 round 2 mode 24 us 31.0551 exact
+card 1 T 4 round 2 mode 32 us 24.8723 exact
+card 1 T 4 round 2 mode 40 us 19.1667 exact
+card 1 T 4 round 2 mode 48 us 19.2931 exact
+validated mode 48
+validated mode 40
+validated mode 32
+validated mode 24
+card 1 T 7 round 0 mode 48 us 32.8343 exact
+card 1 T 7 round 0 mode 40 us 26.4637 exact
+card 1 T 7 round 0 mode 32 us 36.8649 exact
+card 1 T 7 round 0 mode 24 us 44.5736 exact
+card 1 T 7 round 0 mode 24 us 44.3436 exact
+card 1 T 7 round 0 mode 32 us 35.0395 exact
+card 1 T 7 round 0 mode 40 us 26.8401 exact
+card 1 T 7 round 0 mode 48 us 27.2231 exact
+card 1 T 7 round 1 mode 48 us 27.5801 exact
+card 1 T 7 round 1 mode 40 us 27.1051 exact
+card 1 T 7 round 1 mode 32 us 35.0239 exact
+card 1 T 7 round 1 mode 24 us 43.2036 exact
+card 1 T 7 round 1 mode 24 us 43.6698 exact
+card 1 T 7 round 1 mode 32 us 34.6399 exact
+card 1 T 7 round 1 mode 40 us 25.8995 exact
+card 1 T 7 round 1 mode 48 us 26.2621 exact
+card 1 T 7 round 2 mode 48 us 26.3237 exact
+card 1 T 7 round 2 mode 40 us 26.0093 exact
+card 1 T 7 round 2 mode 32 us 34.6409 exact
+card 1 T 7 round 2 mode 24 us 43.7486 exact
+card 1 T 7 round 2 mode 24 us 43.7022 exact
+card 1 T 7 round 2 mode 32 us 34.6025 exact
+card 1 T 7 round 2 mode 40 us 26.0083 exact
+card 1 T 7 round 2 mode 48 us 25.9819 exact
+validated mode 48
+validated mode 40
+validated mode 32
+validated mode 24
+card 1 T 8 round 0 mode 48 us 34.4579 exact
+card 1 T 8 round 0 mode 40 us 28.4561 exact
+card 1 T 8 round 0 mode 32 us 40.5103 exact
+card 1 T 8 round 0 mode 24 us 49.7256 exact
+card 1 T 8 round 0 mode 24 us 49.0824 exact
+card 1 T 8 round 0 mode 32 us 38.8573 exact
+card 1 T 8 round 0 mode 40 us 28.6127 exact
+card 1 T 8 round 0 mode 48 us 29.3475 exact
+card 1 T 8 round 1 mode 48 us 29.1691 exact
+card 1 T 8 round 1 mode 40 us 28.9029 exact
+card 1 T 8 round 1 mode 32 us 38.3671 exact
+card 1 T 8 round 1 mode 24 us 49.281 exact
+card 1 T 8 round 1 mode 24 us 49.2724 exact
+card 1 T 8 round 1 mode 32 us 38.4253 exact
+card 1 T 8 round 1 mode 40 us 28.2795 exact
+card 1 T 8 round 1 mode 48 us 28.4167 exact
+card 1 T 8 round 2 mode 48 us 28.4275 exact
+card 1 T 8 round 2 mode 40 us 28.2781 exact
+card 1 T 8 round 2 mode 32 us 38.4295 exact
+card 1 T 8 round 2 mode 24 us 49.256 exact
+card 1 T 8 round 2 mode 24 us 49.2594 exact
+card 1 T 8 round 2 mode 32 us 38.4353 exact
+card 1 T 8 round 2 mode 40 us 28.2493 exact
+card 1 T 8 round 2 mode 48 us 28.3649 exact
+validated mode 48
+validated mode 40
+validated mode 32
+validated mode 24
+card 1 T 12 round 0 mode 48 us 43.4598 exact
+card 1 T 12 round 0 mode 40 us 39.4433 exact
+card 1 T 12 round 0 mode 32 us 54.2474 exact
+card 1 T 12 round 0 mode 24 us 66.0683 exact
+card 1 T 12 round 0 mode 24 us 65.9539 exact
+card 1 T 12 round 0 mode 32 us 51.8376 exact
+card 1 T 12 round 0 mode 40 us 38.1841 exact
+card 1 T 12 round 0 mode 48 us 39.1411 exact
+card 1 T 12 round 1 mode 48 us 38.8489 exact
+card 1 T 12 round 1 mode 40 us 37.8523 exact
+card 1 T 12 round 1 mode 32 us 51.0432 exact
+card 1 T 12 round 1 mode 24 us 65.684 exact
+card 1 T 12 round 1 mode 24 us 65.6494 exact
+card 1 T 12 round 1 mode 32 us 51.3088 exact
+card 1 T 12 round 1 mode 40 us 37.1861 exact
+card 1 T 12 round 1 mode 48 us 37.9151 exact
+card 1 T 12 round 2 mode 48 us 37.3481 exact
+card 1 T 12 round 2 mode 40 us 36.7949 exact
+card 1 T 12 round 2 mode 32 us 51.3218 exact
+card 1 T 12 round 2 mode 24 us 65.7066 exact
+card 1 T 12 round 2 mode 24 us 65.7248 exact
+card 1 T 12 round 2 mode 32 us 51.3356 exact
+card 1 T 12 round 2 mode 40 us 36.8931 exact
+card 1 T 12 round 2 mode 48 us 37.6385 exact
+validated mode 48
+validated mode 40
+validated mode 32
+validated mode 24
+card 1 T 16 round 0 mode 48 us 51.0436 exact
+card 1 T 16 round 0 mode 40 us 50.586 exact
+card 1 T 16 round 0 mode 32 us 67.6798 exact
+card 1 T 16 round 0 mode 24 us 89.9085 exact
+card 1 T 16 round 0 mode 24 us 89.9599 exact
+card 1 T 16 round 0 mode 32 us 64.221 exact
+card 1 T 16 round 0 mode 40 us 47.6434 exact
+card 1 T 16 round 0 mode 48 us 48.5774 exact
+card 1 T 16 round 1 mode 48 us 48.2378 exact
+card 1 T 16 round 1 mode 40 us 46.433 exact
+card 1 T 16 round 1 mode 32 us 64.5338 exact
+card 1 T 16 round 1 mode 24 us 89.9197 exact
+card 1 T 16 round 1 mode 24 us 89.8603 exact
+card 1 T 16 round 1 mode 32 us 64.5742 exact
+card 1 T 16 round 1 mode 40 us 46.0676 exact
+card 1 T 16 round 1 mode 48 us 47.1494 exact
+card 1 T 16 round 2 mode 48 us 47.003 exact
+card 1 T 16 round 2 mode 40 us 45.4522 exact
+card 1 T 16 round 2 mode 32 us 64.5576 exact
+card 1 T 16 round 2 mode 24 us 89.8845 exact
+card 1 T 16 round 2 mode 24 us 89.8685 exact
+card 1 T 16 round 2 mode 32 us 64.557 exact
+card 1 T 16 round 2 mode 40 us 46.172 exact
+card 1 T 16 round 2 mode 48 us 47.2952 exact

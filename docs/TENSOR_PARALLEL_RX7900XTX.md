@@ -242,6 +242,49 @@ at 14.26%, dense Q8 at 17.55% and peer window sums at 19.63% of summed kernel
 time. The different sample mixes prevent treating these percentages as an A/B
 speedup. Raw trace locations and binary provenance accompany the summary.
 
+Additional tuning experiments kept every benchmark output token unchanged but
+did not improve the 170.19 tokens/s cache baseline: choosing the longest prompt
+lookup match measured 168.85, fixed MTP K=3 measured 167.05, a top-logit margin
+cutoff measured 167.95, and reducing HC to 40 blocks measured 170.18. These
+changes are not enabled in the recipe. Fusing the shared expert into the IQ
+router/gate-up launches measured 170.05 tokens/s and was also reverted; its
+routed/shared outputs passed direct and graph checks and all benchmark tokens
+matched. Raw runs and rejected source patches
+are retained with the results. The margin experiment's first pass had major
+page faults, so its timing also includes that variability.
+
+An exact INT8 WMMA dense prototype matched the original Q8 reductions on both
+cards, but was slower for the common 5–7-row windows, including with tile-packed
+weights. It remains an experiment. The measurements use warm repeated kernels
+and are not full-model speed claims.
+
+A direct-read down prototype (precomputed activations read from device memory,
+with each IQ4_NL/Q4_0 weight block decoded once per job) passed 1536 direct/graph
+checks across three FF widths, including negative/zero scales, changed inputs,
+partial output blocks and guards. Its first six-run result was 171.43 tokens/s.
+A same-build repeat measured 171.32 with the flag off and 169.32 with it on;
+the latter had 288/277/85 first-pass major faults after the first token. The
+second passes differed by less than 0.4% on each task. This does not establish
+a reliable full-model gain, so the source is retained as a deferred patch.
+Its complete code-quality run matched all reviewed token IDs and passed all
+1326 checks. The 494-token varint task measured **201.14 tokens/s** without a
+concurrent compile/profiler, but this short individual task does not satisfy
+the broader 2048-token panel's 200 tokens/s target.
+
+IQ lookup tables staged in shared memory matched the reference but did not
+improve the representative kernel timings. A separate HC prototype with
+64-row groups and 80 blocks was about 16–17% faster in warm microbenchmarks;
+its full-model performance and broader input coverage are still unvalidated.
+A finite-work occupancy probe observed 96 resident blocks for that 512-thread
+layout on both cards. This is different from the original 768-thread layout,
+for which 80 blocks were unsafe.
+
+The exploratory clock probe also confirmed that `clock64()` can go backwards
+on these cards while `wall_clock64()` advances at 100 MHz. AMD documents
+[the RDNA3 clock limitation](https://rocm.docs.amd.com/projects/HIP/en/docs-7.0.0/how-to/hip_cpp_language_extensions.html).
+The existing device watchdogs need a separate correction; reported decode
+rates use host timing and GPU events, not those watchdog counters.
+
 ## Reproduce
 
 Build the split target using the installed ROCm SDK and its compiler:
