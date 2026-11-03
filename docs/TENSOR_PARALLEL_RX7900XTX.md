@@ -334,6 +334,15 @@ candidate for investigation. Simple two-hit/ghost admission simulations moved
 more host bytes than the existing CLOCK policy, so those policies were rejected
 before implementation (`cache-admission-estimates.json`).
 
+A separate-stream cold-cache copy experiment passed 4608 byte-for-byte checks
+but reduced the full panel from 173.8272 to 172.7733 tokens/s (-0.61%) in a
+same-binary comparison. Every output token matched. Splitting gate/up and down
+copies introduced extra graph events and substantially more host minor faults;
+this implementation was removed. The patch, test log and both measurements are
+retained as `cache-overlap-rejected.patch`, `cache-overlap-checks.txt`, and
+`bench-cache-overlap{,-control}`. No overlapping-copy flag is enabled by the
+accepted recipe.
+
 ## Reproduce
 
 Build the split target using the installed ROCm SDK and its compiler:
