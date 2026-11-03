@@ -137,6 +137,25 @@ void Gguf::convert_small_tensors() {
     std::fprintf(stderr, "gguf: %d dense/small tensors converted to Q8_0/F32 at load (the file's routed experts keep their types)\n", converted_);
 }
 
+size_t Gguf::release_owned_except(const std::set<std::string>& keep) {
+    std::set<const uint8_t*> retained;
+    for (const auto& name : keep) {
+        const Tensor* tensor = find(name);
+        if (!tensor || !tensor->data) throw std::runtime_error("gguf: cannot retain unavailable tensor " + name);
+        retained.insert(tensor->data);
+    }
+    size_t released = 0;
+    for (auto& bytes : owned_) {
+        if (bytes.empty() || retained.count(bytes.data())) continue;
+        const uint8_t* data = bytes.data();
+        for (auto& kv : tensors_)
+            if (kv.second.data == data) kv.second.data = nullptr;
+        released += bytes.size();
+        std::vector<uint8_t>().swap(bytes);
+    }
+    return released;
+}
+
 Gguf::~Gguf() {
     for (Map& mp : maps_) {
         if (mp.base) munmap(mp.base, mp.size);

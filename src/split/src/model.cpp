@@ -1317,6 +1317,11 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
     if (static_setting != 0 && static_setting != 1)
         throw std::runtime_error("FNX_STATIC_EXPERTS: expected 0 or 1");
     const bool static_experts = static_setting == 1;
+    const auto release_setting = env_int("FNX_RELEASE_COPIED_WEIGHTS", 0);
+    if (release_setting != 0 && release_setting != 1)
+        throw std::runtime_error("FNX_RELEASE_COPIED_WEIGHTS: expected 0 or 1");
+    if (release_setting && (!static_experts || how != Load::PLAIN))
+        throw std::runtime_error("FNX_RELEASE_COPIED_WEIGHTS requires plain static expert placement");
     if (static_experts && how != Load::PLAIN)
         throw std::runtime_error("FNX_STATIC_EXPERTS: only plain loads are supported");
     // the cards first: reading the embeddings into RAM below takes seconds on a cold cache
@@ -1509,34 +1514,52 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
 #if !FNX_27B
     if (how == Load::PLAIN) choose_residency();   // the holder leaves that to its workers: every expert to a host copy
 #endif
-    const auto t0 = std::chrono::steady_clock::now();
-    Stager st(g, stage_groups(g), NCARD);
-    std::vector<std::thread> th;
-    std::vector<std::string> errs(NCARD);
-    for (int c = 0; c < NCARD; ++c)
-        th.emplace_back([&, c] {
-            try {
-                load_card(st, cards[c], resident, arena ? &score : nullptr, how == Load::HOLD ? store : nullptr,
-                          how == Load::HOLD || (!resident.empty() && !static_experts), static_experts);
-            } catch (const std::exception& e) {
-                errs[c] = e.what();
-                st.abort("card " + std::to_string(c) + " failed");   // the other cards wait on groups no one gives back
-            }
-        });
-    for (auto& t : th) t.join();
-    for (int c = 0; c < NCARD; ++c)
-        if (!errs[c].empty()) throw std::runtime_error("card " + std::to_string(c) + ": " + errs[c]);
-    if (static_experts) {
-        size_t host = 0;
-        for (const CardW& card : cards) host += card.host_bytes;
-        std::fprintf(stderr, "fnx: static experts: immutable hot/cold placement, %zu MiB host backing, no expert eviction or KV arena\n", host >> 20);
+    {   // Release all staging buffers before refreshing the large CPU embedding table.
+        const auto t0 = std::chrono::steady_clock::now();
+        Stager st(g, stage_groups(g), NCARD);
+        std::vector<std::thread> th;
+        std::vector<std::string> errs(NCARD);
+        for (int c = 0; c < NCARD; ++c)
+            th.emplace_back([&, c] {
+                try {
+                    load_card(st, cards[c], resident, arena ? &score : nullptr, how == Load::HOLD ? store : nullptr,
+                              how == Load::HOLD || (!resident.empty() && !static_experts), static_experts);
+                } catch (const std::exception& e) {
+                    errs[c] = e.what();
+                    st.abort("card " + std::to_string(c) + " failed");   // the other cards wait on groups no one gives back
+                }
+            });
+        for (auto& t : th) t.join();
+        for (int c = 0; c < NCARD; ++c)
+            if (!errs[c].empty()) throw std::runtime_error("card " + std::to_string(c) + ": " + errs[c]);
+        if (static_experts) {
+            size_t host = 0;
+            for (const CardW& card : cards) host += card.host_bytes;
+            std::fprintf(stderr, "fnx: static experts: immutable hot/cold placement, %zu MiB host backing, no expert eviction or KV arena\n", host >> 20);
+        }
+        // the disk rate only when the disk gave nearly all of it (tools/lab.sh estimates its next cold loads from it)
+        const double disk = st.disk_bytes() / 1e9, cache = st.cache_bytes() / 1e9;
+        char rate[64] = "";
+        if (cache < 0.05 * (disk + cache)) std::snprintf(rate, sizeof rate, " at %.2f GB/s", disk / st.read_seconds());
+        std::fprintf(stderr, "fnx: weights read in %.1f s of reading (%.1f GB from the disk%s, %.1f GB from the page cache), placed in %.1f s\n",
+                     st.read_seconds(), disk, rate, cache, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     }
-    // the disk rate only when the disk gave nearly all of it (tools/lab.sh estimates its next cold loads from it)
-    const double disk = st.disk_bytes() / 1e9, cache = st.cache_bytes() / 1e9;
-    char rate[64] = "";
-    if (cache < 0.05 * (disk + cache)) std::snprintf(rate, sizeof rate, " at %.2f GB/s", disk / st.read_seconds());
-    std::fprintf(stderr, "fnx: weights read in %.1f s of reading (%.1f GB from the disk%s, %.1f GB from the page cache), placed in %.1f s\n",
-                 st.read_seconds(), disk, rate, cache, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    if (release_setting) {
+        int previous = 0;
+        ck(cudaGetDevice(&previous), "current device before releasing copied weights");
+        for (const CardW& card : cards) {
+            ck(cudaSetDevice(card.dev), "device before releasing copied weights");
+            ck(cudaDeviceSynchronize(), "finish weight copies");
+        }
+        ck(cudaSetDevice(previous), "restore device after weight copies");
+        // CPU token/PLE lookups stay live. MTP can still build a draft head from
+        // output.weight after this constructor returns. All other converted
+        // tensors now have their own device or pinned expert-bank copies.
+        std::set<std::string> keep{tok_embd->name, "output.weight"};
+        if (ple_table) keep.insert(ple_table->name);
+        const size_t released = g.release_owned_except(keep);
+        std::fprintf(stderr, "fnx: released %zu MiB of copied GGUF conversion buffers\n", released >> 20);
+    }
     if (env_flag("FNX_EMBED_WARM_AFTER_LOAD")) {
         // Streaming the expert tensors can evict unlocked embedding pages read
         // before load_card. Refresh only after those bulk reads have finished.

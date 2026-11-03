@@ -197,3 +197,10 @@ if(STRATA_BUILD_TESTS)
   target_link_libraries(split_fnx_run PRIVATE CUDA::cublas CUDA::cuda_driver Threads::Threads)
   set_target_properties(split_fnx_run PROPERTIES CUDA_RUNTIME_LIBRARY Shared)
 endif()
+
+# Host-only conversion-buffer lifetime test, independent of model/GPU allocations.
+find_package(Threads REQUIRED)
+add_executable(split_gguf_release_test EXCLUDE_FROM_ALL ${_sp}/tools/gguf_release_test.cpp)
+target_compile_definitions(split_gguf_release_test PRIVATE FNX_27B=0)
+target_link_libraries(split_gguf_release_test PRIVATE Threads::Threads)
+set_target_properties(split_gguf_release_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)

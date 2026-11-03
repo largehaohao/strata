@@ -61,6 +61,12 @@ not replaced. All new execution paths are opt-in.
   bulk expert reads, which can evict unlocked pages. It reports page residency
   before and after the refresh. This moves work to startup; it does not change
   the request, output or model arithmetic.
+- `FNX_RELEASE_COPIED_WEIGHTS=1` releases owned GGUF conversion buffers after
+  static plain loading has copied weights to each card and cold expert bank.
+  Token/PLE embeddings and the output weight needed by MTP remain available.
+  Metadata remains, but released tensors have null data and cannot be staged
+  again without reloading. Staging scratch is destroyed before the optional
+  embedding refresh, regardless of this flag.
 
 `FNX_PF_ROWS=256` reduces prefill scratch compared with the existing default
 4096. This allowed the cold allocation to fall from 16 to 14 GiB. With staging,
@@ -101,6 +107,7 @@ uses a forced continuation.
 | Same, packed IQ sign operations, two runs | 163.2–167.1 | 137.0–138.8 | 167.9–169.0 |
 | Same, 256-slot cold cache, 14 GiB cold, two runs | 169.9–171.2 | 149.6–150.0 | 174.5–174.8 |
 | Same, 1024-slot cold cache, 16 GiB cold, two runs | 174.4–177.9 | 153.2–155.7 | 181.8–183.6 |
+| Same, release copied GGUF conversions, two runs | 177.7–178.0 | 156.1–156.2 | 183.6–183.8 |
 
 Values are tokens/s from the engine's reported decode time. The benchmark
 also records client time, time to first token, exact input/output token IDs,
@@ -156,6 +163,14 @@ caveat. It left 144 MiB free per card after startup/warmup; the 256-slot
 setting left 102 MiB. The cache persists across requests, and both first and
 second passes are retained. First-pass embedding page faults remain visible
 in the 16 GiB run, so neither this nor the earlier trials are latency guarantees.
+
+Releasing copied conversion buffers freed **7723 MiB** after loading. The
+PLE refresh restored all 27465 MiB, and all six measured requests recorded zero
+major faults during decode. This run measured **171.73 tokens/s** weighted,
+with every output token identical to the cache reference. A separate recent
+control measured 171.32 tokens/s, so the result primarily establishes reduced
+memory pressure; it does not establish a GPU arithmetic speedup. A mid-run
+RSS sample was 57092372 KiB. See `bench-release-owned` for the complete run.
 
 The exact token records and the calibration profile are in
 [`bench/results/2026-11-03-rx7900xtx-tensor-parallel`](../bench/results/2026-11-03-rx7900xtx-tensor-parallel/).
@@ -308,6 +323,7 @@ FNX_STATIC_EXPERTS=1 FNX_EXPERT_RAM_GIB=16 FNX_STATIC_CACHE_SLOTS=1024 \
 FNX_MOE_STAGE=0 FNX_PF_ROWS=256 \
 FNX_IQ_REUSE=1 FNX_IQ_GROUP=16 FNX_MOE_PRE_ROWS=1 \
 FNX_STATIC_HOST_CACHE=1 FNX_EMBED_WARM_AFTER_LOAD=1 \
+FNX_RELEASE_COPIED_WEIGHTS=1 \
 FNX_EXPERT_PROFILE="$PWD/bench/results/2026-11-03-rx7900xtx-tensor-parallel/swift-decode-routes.bin" \
 python3 tools/tp_decode_bench.py \
   --exe build-tensor-parralize/src/split/strata-split-2 \
@@ -336,6 +352,9 @@ context alone does not measure long-context decode.
 ## Validation and remaining work
 
 - HIP build and model startup self-tests passed on both physical cards.
+- GGUF ownership release passed a host-only regression and ASan/UBSan, covering
+  mixed mapped/converted tensors, retained bytes, metadata, invalid retention,
+  null released pointers and repeated release.
 - Static placement: all 256 partitions of eight experts passed, including
   empty hot/cold banks and invalid-input rejection; tested with `NDEBUG` too.
 - Staging: 432 byte-for-byte direct/graph checks passed on both cards, with

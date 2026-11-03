@@ -37,7 +37,7 @@ struct Tensor {
     uint32_t type = 0;
     int64_t ne[4] = {1, 1, 1, 1};
     int n_dims = 0;
-    const uint8_t* data = nullptr;   // in the mapping
+    const uint8_t* data = nullptr;   // mapping or owned conversion; null after explicit release
     size_t nbytes = 0;
     int shard = -1;                  // the file it is in (-1: not from a GGUF file) and where in it
     uint64_t offset = 0;
@@ -70,6 +70,10 @@ public:
     const std::string& shard_path(int s) const { return maps_[(size_t) s].path; }
     size_t shard_size(int s) const { return maps_[(size_t) s].size; }
     const uint8_t* shard_base(int s) const { return (const uint8_t*) maps_[(size_t) s].base; }
+    // After consumers finish copying weights, discard owned conversion buffers
+    // except the named CPU tensors. Released tensors keep metadata but data is
+    // null; staging them again requires reloading the GGUF. Mappings are kept.
+    size_t release_owned_except(const std::set<std::string>& keep);
 
 private:
     struct Map { void* base = nullptr; size_t size = 0; int fd = -1; std::string path; };
