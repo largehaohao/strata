@@ -161,6 +161,15 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         b->jobs_gu = dalloc<Job>(P + 1);
         b->jobs_dn = dalloc<Job>(P + 1);
         if (env_flag("FNX_MOE_STAGE")) {
+            if (env_flag("FNX_MOE_STAGE_COLD_ONLY")) {
+                if (env_int("FNX_STATIC_EXPERTS", 0) != 1 || m.resident.size() != NL)
+                    throw std::runtime_error("FNX_MOE_STAGE_COLD_ONLY requires static residency");
+                b->moe_stage_hot = dalloc<unsigned char>(NL * NEXP);
+                for (int l = 0; l < NL; ++l) {
+                    if (m.resident[l].size() != NEXP) throw std::runtime_error("static residency shape");
+                    ck(cudaMemcpy(b->moe_stage_hot + l * NEXP, m.resident[l].data(), NEXP, cudaMemcpyHostToDevice), "static hot mask");
+                }
+            }
             size_t largest = 0;
             for (const LayerW& layer : w.L)
                 largest = std::max(largest, std::max(layer.gu_e_stride, layer.down_e_stride));
@@ -899,7 +908,7 @@ void Engine::attention(int T, CardBuf& b, const CardW& w, const LayerW& L, uint1
 // the FFN half: the hc read with the attention half's write folded in, the shared expert (in the router's and the
 // routed gate|up's launches on Q4_K layers, else on the second stream beside the router), the routing and the routed
 // experts, the weighted sum across the cards into b.bo_f
-void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW& L, float* R, const int* ctl) {
+void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW& L, float* R, const int* ctl, int lyr) {
     const int P = T * TOPK, ffs = w.ff1 - w.ff0;
     hc_read(R, b.bo_a, b.inj_a, L.hc_norm[1], L.hc_down[1], L.hc_up[1], L.hc_inj[1], m_.eps, b.mixed, b.inj_f, b.hcs, b.ring.err, T, b.st, b.xq);
     // the shared expert (rows P + t of part): its gate|up in the router's launch and its swiglu and down in the routed
@@ -913,7 +922,6 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
         q8s_gemv(L.sh_down.s, N, ffs, b.sh_hq, b.part + (size_t) P * N, N, T, b.st2);
         ck(cudaEventRecord(b.join, b.st2), "join");
     }
-    const int lyr = (int) (&L - w.L.data());
     // experts in RAM: the router's last block plans this window's slots (the prefetch probe scores the picks against
     // the slots as they were, so with it the plan runs after, in moe_cache)
     const bool live = cache_live() && lyr >= 0 && lyr < NL;
@@ -935,10 +943,13 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
         // the planned experts copied into their slots before the MoE kernels read the layer's tables
         if (live) moe_cache(l, L.gu_e_stride, L.down_e_stride, w.ec, b.cache_list, b.st, plan_in_router ? nullptr : b.jobs_gu, b.njobs);
     }
-    const DW gu = stage_moe(L.gu_e, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.moe_stage, b.moe_stage_ep, b.st);
+    // MTP also calls ffn_half with a layer outside the main model's layer array.
+    const unsigned char* hot = b.moe_stage_hot && lyr >= 0 && lyr < NL
+        ? b.moe_stage_hot + lyr * NEXP : nullptr;
+    const DW gu = stage_moe(L.gu_e, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.moe_stage, b.moe_stage_ep, b.st, hot);
     if (sh_in) moe_gate_up(gu, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st, &L.sh_down.s, ffs, b.sh_gu, b.part + (size_t) P * N);
     else moe_gate_up(gu, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st);
-    const DW down = stage_moe(L.down_e, L.down_e_stride, b.jobs_dn, b.njobs, P, b.moe_stage, b.moe_stage_ep, b.st);
+    const DW down = stage_moe(L.down_e, L.down_e_stride, b.jobs_dn, b.njobs, P, b.moe_stage, b.moe_stage_ep, b.st, hot);
     moe_down(down, L.down_e_stride, b.jobs_dn, b.njobs, P, b.gu, b.part, b.st);
     if (!sh_in) ck(cudaStreamWaitEvent(b.st, b.join, 0), "join wait");
     RingMoe m;
@@ -1003,7 +1014,7 @@ void Engine::enqueue(int T, bool dumps) {
         dd("hc_mixed", l, cb_[0]->mixed, N);
         dd("mixer_out", l, cb_[0]->bo_a, N);
         // ---- FFN half
-        each([&](int, CardBuf& b, const CardW& w) { ffn_half(T, call, b, w, w.L[l], b.R, b.ctl); });
+        each([&](int, CardBuf& b, const CardW& w) { ffn_half(T, call, b, w, w.L[l], b.R, b.ctl, l); });
         ++call;
         dd("ffn_mixed", l, cb_[0]->mixed, N);
         dd("ffn_out", l, cb_[0]->bo_f, N);
@@ -1086,7 +1097,7 @@ void Engine::enqueue_batch(const std::vector<int>& lanes) {
             ring_sum(b.ring, b.bo_a, T, (const unsigned*) (b.ctl + 1), call, b.st);
         });
         ++call;
-        each([&](int, CardBuf& b, const CardW& w) { ffn_half(T, call, b, w, w.L[l], b.R, b.ctl); });
+        each([&](int, CardBuf& b, const CardW& w) { ffn_half(T, call, b, w, w.L[l], b.R, b.ctl, l); });
         ++call;
     }
     each([&](int, CardBuf& b, const CardW& w) {
@@ -1171,7 +1182,7 @@ void Engine::enqueue_rows(const std::vector<int>& lanes, const std::vector<int>&
             ring_sum(b.ring, b.bo_a, T, (const unsigned*) (b.ctl + 1), call, b.st);
         });
         ++call;
-        each([&](int, CardBuf& b, const CardW& w) { ffn_half(T, call, b, w, w.L[l], b.R, b.ctl); });
+        each([&](int, CardBuf& b, const CardW& w) { ffn_half(T, call, b, w, w.L[l], b.R, b.ctl, l); });
         ++call;
     }
     each([&](int, CardBuf& b, const CardW& w) {
@@ -1278,7 +1289,7 @@ void Engine::mtp_enqueue(int T) {
     for (int c = 0; c < NCARD; ++c) {
         CardBuf& b = *cb_[c];
         ck(cudaSetDevice(b.dev), "set");
-        ffn_half(T, 1, b, m_.cards[c], mtp_->cards[c].L, b.mtp_R, b.mtp_ctl);
+        ffn_half(T, 1, b, m_.cards[c], mtp_->cards[c].L, b.mtp_R, b.mtp_ctl, -1);
     }
     for (int c = 0; c < NCARD; ++c) {
         CardBuf& b = *cb_[c];
@@ -1342,7 +1353,7 @@ void Engine::mtp_enqueue_lanes(const std::vector<DraftReq>& reqs, int T) {
     for (int c = 0; c < NCARD; ++c) {
         CardBuf& b = *cb_[c];
         ck(cudaSetDevice(b.dev), "set");
-        ffn_half(T, 1, b, m_.cards[c], mtp_->cards[c].L, b.mtp_R, b.mtp_ctl);
+        ffn_half(T, 1, b, m_.cards[c], mtp_->cards[c].L, b.mtp_R, b.mtp_ctl, -1);
     }
     for (int c = 0; c < NCARD; ++c) {
         CardBuf& b = *cb_[c];

@@ -7,11 +7,15 @@ namespace fnx {
 namespace {
 constexpr size_t MOE_STAGE_CHUNK = 16 * 1024;
 __global__ void k_moe_stage(DW w, size_t stride, const Job* jobs, const int* njobs,
-                            char* scratch, const char** ep) {
+                            char* scratch, const char** ep, const unsigned char* hot) {
     const int j = blockIdx.y;
     if (j >= *njobs) return;
     const int e = jobs[j].w;
     const char* src = w.ep ? w.ep[e] : (const char*) w.p + (size_t) e * stride;
+    if (hot && hot[e]) {
+        if (blockIdx.x == 0 && threadIdx.x == 0) ep[e] = src;
+        return;
+    }
     char* dst = scratch + (size_t) j * stride;
     if (blockIdx.x == 0 && threadIdx.x == 0) ep[e] = dst;
     const size_t start = (size_t) blockIdx.x * MOE_STAGE_CHUNK;
@@ -22,10 +26,10 @@ __global__ void k_moe_stage(DW w, size_t stride, const Job* jobs, const int* njo
 }
 
 DW stage_moe(const DW& w, size_t stride, const Job* jobs, const int* njobs, int max_jobs,
-             char* scratch, const char** ep, cudaStream_t stream) {
+             char* scratch, const char** ep, cudaStream_t stream, const unsigned char* hot = nullptr) {
     if (!scratch) return w;
     k_moe_stage<<<dim3((stride + MOE_STAGE_CHUNK - 1) / MOE_STAGE_CHUNK, max_jobs), 128, 0, stream>>>(
-        w, stride, jobs, njobs, scratch, ep);
+        w, stride, jobs, njobs, scratch, ep, hot);
     ck(cudaGetLastError(), "moe staging");
     DW staged = w;
     staged.p = nullptr;

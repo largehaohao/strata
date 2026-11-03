@@ -28,6 +28,10 @@ not replaced. All new execution paths are opt-in.
 - `FNX_IQ_REUSE=1` decodes an IQ2_S, IQ3_XXS or IQ3_S weight group once for
   all token rows in an expert job. Its integer divisions, scaling and reduction
   order match the existing Q8 dot product. Other weight types keep their path.
+- `FNX_MOE_STAGE_COLD_ONLY=1`, with static placement and staging enabled,
+  copies only host-resident experts. Hot experts keep their VRAM pointers.
+  The main layer index is now passed explicitly to the FFN helper; MTP uses
+  -1 and does not index the main model's residency table.
 
 `FNX_PF_ROWS=256` reduces prefill scratch compared with the existing default
 4096. This allowed the cold allocation to fall from 16 to 14 GiB. With staging,
@@ -59,6 +63,7 @@ uses a forced continuation.
 | Staging, 14 GiB cold, prefill rows 256 | 109.0 | 99.6 | 110.8 |
 | Same, calibrated decode residency, two runs | 129.6–134.3 | 113.7–115.8 | 136.1–137.8 |
 | Same, IQ weight reuse, two runs | 130.0–141.4 | 110.2–120.1 | 139.3–145.2 |
+| IQ reuse plus cold-only staging, two runs | 133.7–149.1 | 111.0–124.9 | 142.6–150.5 |
 
 Values are tokens/s from the engine's reported decode time. The benchmark
 also records client time, time to first token, exact input/output token IDs,
@@ -67,6 +72,12 @@ Warmup is excluded. The calibrated split's weighted rate is 127.13 tokens/s;
 with IQ reuse it is 129.76 tokens/s. This is a small end-to-end gain and needs
 more runs to separate it from run-to-run variation. It does not establish a
 general advantage over the native engine.
+Cold-only staging with IQ reuse measured 133.75 tokens/s across its two runs.
+A separate one-pass run measured 144.1 / 120.7 / 147.1 (weighted 136.22).
+These differences between runs are material: for example, the code task's
+verify GPU time was 12.24 s on the first pass and 12.16 s on the second, while
+verify wall time fell from 13.78 to 12.21 s. The unlocked PLE table and host-side
+first-use work need separate investigation. Both passes remain in the results.
 
 The exact token records and the calibration profile are in
 [`bench/results/2026-11-03-rx7900xtx-tensor-parallel`](../bench/results/2026-11-03-rx7900xtx-tensor-parallel/).
@@ -79,8 +90,9 @@ calibration. This is workload calibration, not a claim that the profile suits
 every workload.
 
 Staging and residency changes produced the exact same 2048 output token IDs
-on all three measurement prompts, including both calibrated repeats. A trial
-that skipped staging for hot experts was slower on these tasks and was removed.
+on all three measurement prompts, including both calibrated repeats. An early
+trial that skipped staging for hot experts without IQ reuse was slower and was
+removed. The retained cold-only option is evaluated together with IQ reuse.
 Two gate/up kernel trials were also removed: a bounded persistent grid passed
 3072 exact direct/graph checks but was slower; cooperative loading of job
 descriptors passed 1024 checks but had no consistent benefit. Their experiment
@@ -95,6 +107,12 @@ Increasing native MTP to five drafts with a 0.30 confidence cutoff was slower
 (115.1 / 75.9 / 126.6 tokens/s). A fixed split draft limit of three produced
 132.9 / 116.0 / 136.1 tokens/s, with the same output IDs, without a clear gain.
 Neither setting is adopted by the reproduction recipe.
+`FNX_RING_GRID=80` with cold-only staging measured 138.7–149.1 / 116.8–125.4 /
+145.0–150.6. Its second-pass GPU verify times differ from the default grid by
+less than 0.5%; it is not adopted as a demonstrated optimization.
+The existing prefill FP16 matrix kernel was also slower than IQ reuse for
+the representative small expert jobs in a separate synthetic trial. It is
+not selected for decode.
 
 The split loader already converts 675 dense/small tensors to Q8_0/F32 for this
 GGUF. Thus, split and the native engine do not have the same arithmetic or
@@ -111,6 +129,8 @@ outputs, prompts and reports are saved with the measurements; check them using
 `python3 tools/tp_code_quality.py <quality-output-directory>`. The checker
 executes Python and is intended only for reviewed outputs of these fixed tasks.
 The quality runs overlapped CPU compilation and are excluded from speed claims.
+The IQ-reuse/cold-only binary was then run on the same tasks. It produced
+exactly the reviewed split token sequences and passed all 1326 checks too.
 
 A four-second ROCprofiler sample showed matrix staging at 23.15% and the
 window-sum peer kernel at 15.99% of summed kernel duration. This includes
@@ -141,14 +161,16 @@ tokenizer directory. Set the SDK library paths for the child process:
 export LD_LIBRARY_PATH="$PWD/.venv/lib/python3.12/site-packages/_rocm_sdk_core/lib:$PWD/.venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx110X_dgpu/lib"
 HIP_VISIBLE_DEVICES=0,1 HSA_FORCE_FINE_GRAIN_PCIE=1 \
 FNX_STATIC_EXPERTS=1 FNX_EXPERT_RAM_GIB=14 FNX_MOE_STAGE=1 FNX_PF_ROWS=256 \
+FNX_IQ_REUSE=1 FNX_MOE_STAGE_COLD_ONLY=1 \
+FNX_EXPERT_PROFILE="$PWD/bench/results/2026-11-03-rx7900xtx-tensor-parallel/swift-decode-routes.bin" \
 python3 tools/tp_decode_bench.py \
   --exe build-tensor-parralize/src/split/strata-split-2 \
   --model "$MODEL" --mtp "$MTP" --tokenizer "$TOKENIZER" \
   --context 32768 --tokens 2048 --repeats 2 --out /tmp/strata-tp-new-run
 ```
 
-The output directory must be new. For calibrated placement, also set
-`FNX_EXPERT_PROFILE` to the measured split-format count file. It is different
+The output directory must be new. The recipe uses calibrated placement via
+`FNX_EXPERT_PROFILE`, a measured split-format count file. It is different
 from the native engine's `STRP` profile format.
 The recorded profile is
 `bench/results/2026-11-03-rx7900xtx-tensor-parallel/swift-decode-routes.bin`;
@@ -170,9 +192,10 @@ context alone does not measure long-context decode.
 - HIP build and model startup self-tests passed on both physical cards.
 - Static placement: all 256 partitions of eight experts passed, including
   empty hot/cold banks and invalid-input rejection; tested with `NDEBUG` too.
-- Staging: 288 byte-for-byte direct/graph checks passed on both cards, with
+- Staging: 432 byte-for-byte direct/graph checks passed on both cards, with
   changing routes, mixed host/device pointer tables, contiguous weights,
-  several strides and guard bytes.
+  hot-pointer bypass, several strides and guard bytes. Full-model startup
+  and nine cold-only benchmark outputs also match the reference token IDs.
 - Existing split Python suite: 52 tests passed.
 - IQ gate/up reuse: 1024 exact direct/graph checks passed on both physical cards;
   the full engine builds and matches all six reference token sequences.
