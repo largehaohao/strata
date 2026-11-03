@@ -28,6 +28,12 @@ not replaced. All new execution paths are opt-in.
 - `FNX_IQ_REUSE=1` decodes an IQ2_S, IQ3_XXS or IQ3_S weight group once for
   all token rows in an expert job. Its integer divisions, scaling and reduction
   order match the existing Q8 dot product. Other weight types keep their path.
+- `FNX_IQ_GROUP=16`, with IQ reuse, assigns 16 lanes to each output row.
+  Each lane keeps two partial sums, then joins them in the original 32-lane
+  reduction order. The default remains 32 lanes.
+- `FNX_MOE_PRE_ROWS=1` computes the routed down activations once for every
+  decode window, using the existing precompute kernel. The default threshold
+  remains 9 rows; values 1..17 are accepted (17 disables it).
 - `FNX_MOE_STAGE_COLD_ONLY=1`, with static placement and staging enabled,
   copies only host-resident experts. Hot experts keep their VRAM pointers.
   The main layer index is now passed explicitly to the FFN helper; MTP uses
@@ -68,6 +74,7 @@ uses a forced continuation.
 | Engine / setting | Code | Prose | Edit |
 | --- | ---: | ---: | ---: |
 | Native engine, existing tuning | 137.1 | 100.3 | 154.8 |
+| Native engine, same tuning, separate two-run comparison | 133.3–134.9 | 103.4–104.3 | 153.4–157.6 |
 | Split, static 16 GiB cold, peer push | 71.9–77.0 | 69.2–75.1 | 70.1–72.4 |
 | Same, with matrix staging | 99.1 | 92.3 | 100.8 |
 | Staging, 14 GiB cold, prefill rows 256 | 109.0 | 99.6 | 110.8 |
@@ -76,6 +83,8 @@ uses a forced continuation.
 | IQ reuse plus cold-only staging, two runs | 133.7–149.1 | 111.0–124.9 | 142.6–150.5 |
 | Same, embedding refresh after load, two runs | 148.1–149.0 | 123.7–125.0 | 149.6–150.4 |
 | Cached host weights, direct reads, embedding refresh, two runs | 155.7–156.1 | 131.5–131.6 | 158.3–158.7 |
+| Same, 16-lane IQ groups, two runs | 156.8–158.7 | 133.3–133.5 | 161.4 |
+| Same, precompute down activations from one row, two runs | 158.1–161.1 | 134.3–134.4 | 163.1–163.3 |
 
 Values are tokens/s from the engine's reported decode time. The benchmark
 also records client time, time to first token, exact input/output token IDs,
@@ -104,6 +113,18 @@ identical token IDs. The reproduction recipe therefore uses direct reads.
 The same short prompts' prefill times fell from about 590 / 702 / 888 ms to
 200 / 208 / 285 ms on the second pass. These are measurements of this workload,
 not a general prefill throughput claim. The **200 tokens/s target remains open**.
+The separate two-pass native comparison measured 127.53 tokens/s weighted,
+versus 147.60 for the cached split (15.7% higher for these tasks). Native output
+and draft acceptance can vary across repeated greedy requests; split/native
+arithmetic differs as described below, so this is not an equal-token comparison.
+The 16-lane IQ groups measured 149.77 tokens/s weighted, a further 1.5% gain.
+All six sequences match the cached 32-lane reference. The full engine gain is
+much smaller than the roughly 15% kernel improvement at 24 expert jobs.
+Precomputing down activations from one row measured 151.24 tokens/s weighted;
+again all six output sequences match the reference. Its representative
+six-row/24-job kernel pair took about 27 us versus 41–44 us for fused IQ4_NL
+and 23–24 us versus 36–38 us for Q4_0. Kernel savings do not translate directly
+to the full model because other work overlaps and remains on the critical path.
 
 The exact token records and the calibration profile are in
 [`bench/results/2026-11-03-rx7900xtx-tensor-parallel`](../bench/results/2026-11-03-rx7900xtx-tensor-parallel/).
@@ -132,13 +153,20 @@ full engine: at 24 jobs its three IQ formats take about 62–67 us instead of
 Increasing native MTP to five drafts with a 0.30 confidence cutoff was slower
 (115.1 / 75.9 / 126.6 tokens/s). A fixed split draft limit of three produced
 132.9 / 116.0 / 136.1 tokens/s, with the same output IDs, without a clear gain.
-Neither setting is adopted by the reproduction recipe.
+Neither setting is adopted by the reproduction recipe. With cached host weights,
+a draft limit of eight measured 153.8 / 131.3 / 158.5 tokens/s, with reference
+token IDs unchanged; it did not improve on the limit of six.
 `FNX_RING_GRID=80` with cold-only staging measured 138.7–149.1 / 116.8–125.4 /
 145.0–150.6. Its second-pass GPU verify times differ from the default grid by
 less than 0.5%; it is not adopted as a demonstrated optimization.
 The existing prefill FP16 matrix kernel was also slower than IQ reuse for
 the representative small expert jobs in a separate synthetic trial. It is
 not selected for decode.
+A separate gfx11 small-window WMMA prototype tested 16/32/64-row tiles with
+256/128/64-column steps. At 24 expert jobs the 32-row tile took about 81–91 us
+versus 57–63 us for retained IQ reuse. The prototype is not integrated. Its
+FP16 arithmetic also differs from the integer-dot reference (relative L2 error
+about 0.00023–0.00026 on the synthetic inputs).
 
 The split loader already converts 675 dense/small tensors to Q8_0/F32 for this
 GGUF. Thus, split and the native engine do not have the same arithmetic or
@@ -159,6 +187,11 @@ The IQ-reuse/cold-only binary was then run on the same tasks. It produced
 exactly the reviewed split token sequences and passed all 1326 checks too.
 The cached direct-read/embedding-refresh binary also reproduced those exact
 token sequences and passed all 1326 checks (`quality-hostcache`).
+The 16-lane binary also matched them and passed all 1326 checks
+(`quality-hostcache-iq16`).
+The down-precompute binary passed the same checks with exactly the reviewed
+tokens (`quality-hostcache-iq16-pre1`); route tracing was enabled in that quality
+run, so its timing is excluded from performance claims.
 
 A four-second ROCprofiler sample showed matrix staging at 23.15% and the
 window-sum peer kernel at 15.99% of summed kernel duration. This includes
@@ -189,7 +222,8 @@ tokenizer directory. Set the SDK library paths for the child process:
 export LD_LIBRARY_PATH="$PWD/.venv/lib/python3.12/site-packages/_rocm_sdk_core/lib:$PWD/.venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx110X_dgpu/lib"
 HIP_VISIBLE_DEVICES=0,1 HSA_FORCE_FINE_GRAIN_PCIE=1 \
 FNX_STATIC_EXPERTS=1 FNX_EXPERT_RAM_GIB=14 FNX_MOE_STAGE=0 FNX_PF_ROWS=256 \
-FNX_IQ_REUSE=1 FNX_STATIC_HOST_CACHE=1 FNX_EMBED_WARM_AFTER_LOAD=1 \
+FNX_IQ_REUSE=1 FNX_IQ_GROUP=16 FNX_MOE_PRE_ROWS=1 \
+FNX_STATIC_HOST_CACHE=1 FNX_EMBED_WARM_AFTER_LOAD=1 \
 FNX_EXPERT_PROFILE="$PWD/bench/results/2026-11-03-rx7900xtx-tensor-parallel/swift-decode-routes.bin" \
 python3 tools/tp_decode_bench.py \
   --exe build-tensor-parralize/src/split/strata-split-2 \
@@ -231,6 +265,11 @@ context alone does not measure long-context decode.
 - Existing split serving/fallback Python suite: 25 tests passed.
 - IQ gate/up reuse: 1024 exact direct/graph checks passed on both physical cards;
   the full engine builds and matches all six reference token sequences.
+- Extended IQ grouping: 2048 exact direct/graph checks passed on both cards,
+  covering both lane groups and the fallback. Guard initialization is explicitly
+  ordered on the compute stream.
+- Down precompute: 512 exact direct/graph comparisons passed on both cards,
+  including T=1..16, changing routes/job counts, IQ4_NL and Q4_0, and guards.
 - Both engines passed the three completed-code tasks described above.
 - CUDA has not been built or run here. No SYCL files are changed.
 - Remaining: the 200 tokens/s target, long-context acceptance, broader quality

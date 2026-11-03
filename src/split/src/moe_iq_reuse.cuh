@@ -92,7 +92,7 @@ __device__ __forceinline__ float iq_dot32(const IqDot32& w, const block_q8_1& x)
     return d * sum;
 }
 
-template <ggml_type TA, int TT>
+template <ggml_type TA, int TT, int G = 32>
 __global__ void __launch_bounds__(MMVQ_THREADS) k_moe_gu_iq(
     MoeW w, const Job* __restrict__ jobs, const int* __restrict__ njobs,
     const block_q8_1* __restrict__ y, float* __restrict__ out) {
@@ -101,26 +101,37 @@ __global__ void __launch_bounds__(MMVQ_THREADS) k_moe_gu_iq(
     __shared__ Job jb;
     if (threadIdx.x == 0) jb = jobs[ji];
     __syncthreads();
-    constexpr int G = 32;
+    static_assert(G == 16 || G == 32, "IQ lanes per row");
     const int row = blockIdx.x * (MMVQ_THREADS / G) + threadIdx.x / G;
     const bool live = row < w.nrows;
     const char* wr = moe_expert(w, jb.w) + (size_t) (live ? row : 0) * w.row_a;
-    float tmp[TT] = {};
+    // A 16-lane row keeps both halves of the original 32-lane sums separately.
+    // Join them before the remaining shuffles to preserve the reduction order.
+    constexpr int PARTS = 32 / G;
+    float tmp[PARTS][TT] = {};
     if constexpr (TA == GGML_TYPE_IQ2_S || TA == GGML_TYPE_IQ3_XXS || TA == GGML_TYPE_IQ3_S) {
         constexpr int qk = ggml_cuda_type_traits<TA>::qk, vdr = vdr_of<TA>();
         constexpr int per_block = ggml_cuda_type_traits<TA>::qi / vdr;
         static_assert(G >= per_block && G % per_block == 0, "lanes per weight block");
         const int gl = threadIdx.x % G, kqs = vdr * (gl % per_block);
         if (live)
-#pragma unroll 8
-            for (int kbx = gl / per_block; kbx < w.ncols / qk; kbx += G / per_block) {
-                const IqDot32 decoded = iq_decode32<TA>(wr, kbx, kqs);
 #pragma unroll
-                for (int j = 0; j < TT; ++j)
-                    if (j < jb.n) tmp[j] += iq_dot32<TA>(decoded, y[(size_t) jb.y[j] * (w.ncols / 32) + kbx * (qk / 32) + kqs / 2]);
+            for (int p = 0; p < PARTS; ++p) {
+#pragma unroll 8
+                for (int kbx = (gl + p * G) / per_block; kbx < w.ncols / qk; kbx += 32 / per_block) {
+                    const IqDot32 decoded = iq_decode32<TA>(wr, kbx, kqs);
+#pragma unroll
+                    for (int j = 0; j < TT; ++j)
+                        if (j < jb.n) tmp[p][j] += iq_dot32<TA>(decoded, y[(size_t) jb.y[j] * (w.ncols / 32) + kbx * (qk / 32) + kqs / 2]);
+                }
             }
     } else {
-        job_rows<TA, G, TT>(wr, live, w.ncols, jb.n, y, jb.y, w.ncols / 32, tmp);
+        static_assert(G == 32, "fallback keeps its original lane group");
+        job_rows<TA, G, TT>(wr, live, w.ncols, jb.n, y, jb.y, w.ncols / 32, tmp[0]);
     }
-    job_store<G, TT>(tmp, jb.n, live, row, jb.out, out, w.nrows);
+    if constexpr (PARTS == 2) {
+#pragma unroll
+        for (int j = 0; j < TT; ++j) tmp[0][j] += tmp[1][j];
+    }
+    job_store<G, TT>(tmp[0], jb.n, live, row, jb.out, out, w.nrows);
 }

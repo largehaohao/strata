@@ -477,7 +477,12 @@ void moe_launch(bool down, const MoeW& w, const Job* jobs, const int* njobs, int
         const int rpb = DN_THREADS / (w.ncols / DN_U), nh = njobs_max * (w.ncols / DN_U);   // njobs_max: the window's pairs
         const dim3 grid((w.nrows + rpb - 1) / rpb, njobs_max);
         const size_t smem = sizeof(float) * T * DN_THREADS;
-        if (T > 8) {
+        static const int pre_rows = [] {
+            const long long v = env_int("FNX_MOE_PRE_ROWS", 9);
+            if (v < 1 || v > MAXT + 1) throw std::runtime_error("FNX_MOE_PRE_ROWS: expected 1..17");
+            return (int) v;
+        }();
+        if (T >= pre_rows) {
             if (njobs_max > MAXT * TOPK) throw std::runtime_error("moe_down: more pairs than g_moe_hq holds");
             k_moe_h<<<(nh + 7) / 8, 256, 0, s>>>((const float*) in, w.ncols, njobs_max);
             k_moe_down<TA, true><<<grid, DN_THREADS, smem, s>>>(w, jobs, njobs, (const float*) in, out);
@@ -497,7 +502,13 @@ void moe_launch(bool down, const MoeW& w, const Job* jobs, const int* njobs, int
             static const long long reuse = env_int("FNX_IQ_REUSE", 0);
             if (reuse != 0 && reuse != 1) throw std::runtime_error("FNX_IQ_REUSE: expected 0 or 1");
             if (reuse) {
-#define FNX_IQR(t) case t: k_moe_gu_iq<TA, t><<<grid, MMVQ_THREADS, 0, s>>>(w, jobs, njobs, (const block_q8_1*) in, out); break
+                static const long long group = env_int("FNX_IQ_GROUP", 32);
+                if (group != 16 && group != 32) throw std::runtime_error("FNX_IQ_GROUP: expected 16 or 32");
+                const dim3 grid16((w.nrows + 7) / 8, njobs_max);
+#define FNX_IQR(t) case t: \
+    if (group == 16) k_moe_gu_iq<TA, t, 16><<<grid16, MMVQ_THREADS, 0, s>>>(w, jobs, njobs, (const block_q8_1*) in, out); \
+    else k_moe_gu_iq<TA, t><<<grid, MMVQ_THREADS, 0, s>>>(w, jobs, njobs, (const block_q8_1*) in, out); \
+    break
                 switch (T) {
                     FNX_IQR(1); FNX_IQR(2); FNX_IQR(3); FNX_IQR(4);
                     FNX_IQR(5); FNX_IQR(6); FNX_IQR(7); FNX_IQR(8);

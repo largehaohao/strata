@@ -14,6 +14,22 @@ template <ggml_type TA>
 void launch_test(int T, int cap, const MoeW& w, const Job* jobs, const int* njobs,
                  const block_q8_1* x, float* out, cudaStream_t stream) {
     const dim3 grid((w.nrows + 3) / 4, 48);
+    if (cap == 2) {
+        if constexpr (TA == GGML_TYPE_IQ2_S || TA == GGML_TYPE_IQ3_XXS || TA == GGML_TYPE_IQ3_S) {
+            const dim3 grid16((w.nrows + 7) / 8, 48);
+#define GU16_CASE(t) case t: k_moe_gu_iq<TA, t, 16><<<grid16, MMVQ_THREADS, 0, stream>>>(w, jobs, njobs, x, out); break
+            switch (T) {
+                GU16_CASE(1); GU16_CASE(2); GU16_CASE(3); GU16_CASE(4);
+                GU16_CASE(5); GU16_CASE(6); GU16_CASE(7); GU16_CASE(8);
+                GU16_CASE(9); GU16_CASE(10); GU16_CASE(11); GU16_CASE(12);
+                GU16_CASE(13); GU16_CASE(14); GU16_CASE(15); GU16_CASE(16);
+                default: throw std::runtime_error("invalid test window");
+            }
+#undef GU16_CASE
+            ck(cudaGetLastError(), "gate/up 16-lane launch");
+            return;
+        }
+    }
 #define GU_CASE(t) case t: \
     if (cap) k_moe_gu_iq<TA, t><<<grid, MMVQ_THREADS, 0, stream>>>(w, jobs, njobs, x, out); \
     else k_moe_gu<TA, 32, t><<<grid, MMVQ_THREADS, 0, stream>>>(w, jobs, njobs, x, out); \
@@ -65,7 +81,7 @@ void run_type(int dev) {
     ck(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
     std::vector<unsigned char> ref(output_bytes), got(output_bytes);
     for (int T = 1; T <= MAXT; ++T) {
-        for (int cap : {1}) {
+        for (int cap : {1, 2}) {
             cudaGraph_t graph;
             cudaGraphExec_t exec;
             ck(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed), "capture");
@@ -86,8 +102,8 @@ void run_type(int dev) {
                 }
                 ck(cudaMemcpy(dj, jobs.data(), experts * sizeof(Job), cudaMemcpyHostToDevice), "job copy");
                 ck(cudaMemcpy(dn, &count, sizeof(int), cudaMemcpyHostToDevice), "count copy");
-                ck(cudaMemset(baseline, 0xA5, output_bytes), "baseline guard");
-                ck(cudaMemset(candidate, 0xA5, output_bytes), "candidate guard");
+                ck(cudaMemsetAsync(baseline, 0xA5, output_bytes, stream), "baseline guard");
+                ck(cudaMemsetAsync(candidate, 0xA5, output_bytes, stream), "candidate guard");
                 launch_test<TA>(T, 0, w, dj, dn, dx, baseline, stream);
                 if ((rep / 4) % 2) ck(cudaGraphLaunch(exec, stream), "graph replay");
                 else launch_test<TA>(T, cap, w, dj, dn, dx, candidate, stream);
@@ -113,8 +129,8 @@ void run_type(int dev) {
             for (int t = 0; t < jobs[j].n; ++t) jobs[j].y[t] = (j + t) % 6, jobs[j].out[t] = j * MAXT + t;
         }
         ck(cudaMemcpy(dj, jobs.data(), experts * sizeof(Job), cudaMemcpyHostToDevice), "timing jobs");
-        for (int cap : {0, 1}) {
-            for (int i = 0; i < 4; ++i) launch_test<TA>(6, cap, w, dj, dn, dx, candidate, stream);
+        for (int cap : {0, 1, 2, 2, 1, 0}) {
+            for (int i = 0; i < 500; ++i) launch_test<TA>(6, cap, w, dj, dn, dx, candidate, stream);
             ck(cudaEventRecord(start, stream), "record start");
             for (int i = 0; i < 40; ++i) launch_test<TA>(6, cap, w, dj, dn, dx, candidate, stream);
             ck(cudaEventRecord(end, stream), "record end");
@@ -141,5 +157,5 @@ int main() {
         fnx::run_type<GGML_TYPE_IQ3_S>(dev);
         fnx::run_type<GGML_TYPE_IQ4_XS>(dev);
     }
-    std::cout << "MoE gate/up: 1024 exact direct/graph checks passed\n";
+    std::cout << "MoE gate/up: 2048 exact direct/graph checks passed\n";
 }
