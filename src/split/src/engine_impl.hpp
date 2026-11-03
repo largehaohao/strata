@@ -40,6 +40,8 @@ struct CardBuf {
     float *logits, *topw;
     int *topi, *njobs;
     Job *jobs_gu, *jobs_dn, *dense[MAXT + 1];
+    char* moe_stage = nullptr;
+    const char** moe_stage_ep = nullptr;
     float *gu, *part;
     float* sh_gu;                     // the shared expert: [T][gate | up]
     void* sh_hq;                      // its h as q8_1

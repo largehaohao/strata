@@ -850,6 +850,9 @@ struct Server {
                      slot, st.prompt_tokens, st.reused, st.prompt_tokens - st.reused, st.prompt_ms, st.generated, st.decode_ms,
                      st.generated * 1000.0 / std::max(1.0, st.decode_ms), st.drafts_accepted, st.drafts_offered, st.rounds, st.lookup_rounds,
                      st.decode_ms / std::max(1, st.rounds));
+        if (fnx::env_flag("FNX_DECODE_TIMING"))
+            std::fprintf(stderr, "sfnx: decode timing: verify %.3f ms (GPU %.3f, launch %.3f), draft %.3f ms (GPU %.3f, %d calls), total %.3f ms\n",
+                         st.verify_ms, st.verify_gpu_ms, st.launch_ms, st.draft_ms, st.draft_gpu_ms, st.draft_calls, st.decode_ms);
         slots[(size_t) slot].idle_since = std::chrono::steady_clock::now();
         save_routes();
     }
@@ -1092,5 +1095,8 @@ int main(int argc, char** argv) {
         fail(ex);
     }
     std::fflush(stdout);
+    // Profilers flush their traces through atexit. Keep the fast normal exit,
+    // but allow a diagnostic run to flush without destroying local GPU state.
+    if (fnx::env_flag("FNX_PROFILE_EXIT")) std::exit(0);
     std::_Exit(0);
 }

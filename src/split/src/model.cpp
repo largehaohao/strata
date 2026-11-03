@@ -2,6 +2,7 @@
 #include "card_check.hpp"
 #include "env.hpp"
 #include "rope_gguf.hpp"
+#include "static_experts.hpp"
 
 #include "store.hpp"
 #if FNX_HIP
@@ -271,6 +272,7 @@ struct Up {
     CardW& c;
     Store* store = nullptr;               // the lab's holder: the shared memory instead of cudaMalloc / cudaHostAlloc
     std::vector<void*>* track = nullptr;  // a worker placing its experts: what it allocates (Model::free_experts)
+    const std::vector<char>* static_res = nullptr;
     template <typename T> T* put(const void* host, size_t bytes) {
         void* d = nullptr;
         if (store) d = store->dev(c.dev, bytes);
@@ -303,6 +305,32 @@ struct Up {
                                      cudaGetErrorString(err));
         c.host_bytes += bytes;
         return (uint8_t*) hp;
+    }
+    // Assemble one layer's hot and cold slices separately. Unlike ExpertCache,
+    // immutable placement needs backing RAM only for the cold experts. This
+    // keeps a 50 GB expert set from pinning another 50 GB on a 64 GB host.
+    template <typename Fill>
+    void place_static(DW& w, size_t stride, size_t count, Fill fill) {
+        if (store || !static_res || static_res->size() != count)
+            throw std::runtime_error("static experts: plain load with one residency entry per expert required");
+        const StaticExpertPlan plan(*static_res);
+        std::vector<uint8_t> hot(plan.hot * stride);
+        void* cold = nullptr;
+        void* cold_device = nullptr;
+        if (plan.cold) {
+            ck(cudaHostAlloc(&cold, plan.cold * stride, cudaHostAllocMapped), "static experts: cold host allocation");
+            ck(cudaHostGetDevicePointer(&cold_device, cold, 0), "static experts: cold mapped pointer");
+            c.host_bytes += plan.cold * stride;
+        }
+        for (size_t e = 0; e < count; ++e) {
+            uint8_t* dst = (*static_res)[e] ? hot.data() : (uint8_t*) cold;
+            fill(e, dst + plan.slot[e] * stride);
+        }
+        const char* hot_device = plan.hot ? put<char>(hot.data(), hot.size()) : nullptr;
+        std::vector<const char*> pointers(count);
+        for (size_t e = 0; e < count; ++e)
+            pointers[e] = ((*static_res)[e] ? hot_device : (const char*) cold_device) + plan.slot[e] * stride;
+        w.ep = put<const char*>(pointers.data(), pointers.size() * sizeof(const char*));
     }
     // routed experts (h from expert_buf: every expert's matrix, stride bytes apart): to VRAM at p, or with an
     // ExpertCache each one's address in host_of (the layer's row of the card's host addresses)
@@ -620,6 +648,13 @@ struct Up {
         w.row_bytes = t1.row_bytes();
         stride = (size_t) w.n_out * w.row_bytes;
         const size_t half = (size_t) (r1 - r0) * w.row_bytes, src_mat = (size_t) t1.ne[1] * w.row_bytes;
+        if (static_res) {
+            place_static(w, stride, (size_t) t1.ne[2], [&](size_t e, uint8_t* dst) {
+                std::memcpy(dst, t1.data + e * src_mat + (size_t) r0 * w.row_bytes, half);
+                std::memcpy(dst + half, t2.data + e * src_mat + (size_t) r0 * w.row_bytes, half);
+            });
+            return w;
+        }
         std::vector<uint8_t> tmp;
         const size_t bytes = (size_t) t1.ne[2] * stride;
         uint8_t* h = expert_buf(bytes, host_of, tmp);
@@ -653,6 +688,14 @@ struct Up {
         if (b0 < 0 || b1 <= b0 || (size_t) b1 * ti.bytes > src_row)
             throw std::runtime_error(t.name + ": blocks [" + std::to_string(b0) + ", " + std::to_string(b1) + ") asked for, a row has " +
                                      std::to_string(src_row / ti.bytes));
+        if (static_res) {
+            place_static(w, stride, (size_t) t.ne[2], [&](size_t e, uint8_t* dst) {
+                for (int r = 0; r < w.n_out; ++r)
+                    std::memcpy(dst + (size_t) r * w.row_bytes,
+                                t.data + e * src_mat + (size_t) r * src_row + (size_t) b0 * ti.bytes, w.row_bytes);
+            });
+            return w;
+        }
         std::vector<uint8_t> tmp;
         const size_t bytes = (size_t) t.ne[2] * stride;
         uint8_t* h = expert_buf(bytes, host_of, tmp);
@@ -762,7 +805,7 @@ void load_layers_27b(Stager& st, CardW& c, Up& up, const std::vector<int>& conv_
 // once this card is through with it.
 // host_experts: every routed expert to a host copy (an ExpertCache, or the lab's holder); store: the holder's shared memory
 void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resident, const std::vector<double>* arena_score,
-               Store* store, bool host_experts) {
+               Store* store, bool host_experts, bool static_experts = false) {
     ck(cudaSetDevice(c.dev), "cudaSetDevice");
     Up up{c, store};
     auto L = [&](int l, const char* s) -> const Tensor& { return st.t(l, "blk." + std::to_string(l) + "." + s); };
@@ -812,6 +855,7 @@ void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resid
     std::vector<const char*> hgu(host_experts ? (size_t) NL * NEXP : 0), hdn(hgu.size());   // the experts' host copies
     for (int l = 0; l < NL; ++l) {
         LayerW& w = c.L[l];
+        up.static_res = static_experts && !resident.empty() ? &resident[(size_t) l] : nullptr;
         const char** hg = host_experts ? hgu.data() + (size_t) l * NEXP : nullptr;
         const char** hd = host_experts ? hdn.data() + (size_t) l * NEXP : nullptr;
         const char* hp[2] = {"hc_attn_", "hc_ffn_"};
@@ -893,7 +937,7 @@ void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resid
     c.head_up = up.q8split(st.t(NL, "output_hc_up.weight"));
     c.out = up.dense(up.rows(st.t(NL, "output.weight"), range(c.v0, c.v1)));
     st.done(NL);
-    if (!resident.empty()) {   // tracked, so the engine can place them again with more in RAM (Engine: VRAM short)
+    if (!resident.empty() && !static_experts) {   // tracked, so the engine can place them again with more in RAM (Engine: VRAM short)
         const size_t before = c.bytes;
         Up ue{c, store, &c.expert_mem};
         ue.expert_cache(resident, hgu, hdn, arena_score);
@@ -1251,6 +1295,12 @@ static void check_supported(const Gguf& g) {
 }
 
 Model::Model(const std::string& path, Load how, Store* store, const std::string* image) : g(path) {
+    const long long static_setting = env_int("FNX_STATIC_EXPERTS", 0);
+    if (static_setting != 0 && static_setting != 1)
+        throw std::runtime_error("FNX_STATIC_EXPERTS: expected 0 or 1");
+    const bool static_experts = static_setting == 1;
+    if (static_experts && how != Load::PLAIN)
+        throw std::runtime_error("FNX_STATIC_EXPERTS: only plain loads are supported");
     // the cards first: reading the embeddings into RAM below takes seconds on a cold cache
     {
         int ndev = 0;
@@ -1449,7 +1499,7 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
         th.emplace_back([&, c] {
             try {
                 load_card(st, cards[c], resident, arena ? &score : nullptr, how == Load::HOLD ? store : nullptr,
-                          how == Load::HOLD || !resident.empty());
+                          how == Load::HOLD || (!resident.empty() && !static_experts), static_experts);
             } catch (const std::exception& e) {
                 errs[c] = e.what();
                 st.abort("card " + std::to_string(c) + " failed");   // the other cards wait on groups no one gives back
@@ -1458,6 +1508,11 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
     for (auto& t : th) t.join();
     for (int c = 0; c < NCARD; ++c)
         if (!errs[c].empty()) throw std::runtime_error("card " + std::to_string(c) + ": " + errs[c]);
+    if (static_experts) {
+        size_t host = 0;
+        for (const CardW& card : cards) host += card.host_bytes;
+        std::fprintf(stderr, "fnx: static experts: immutable hot/cold placement, %zu MiB host backing, no expert eviction or KV arena\n", host >> 20);
+    }
     // the disk rate only when the disk gave nearly all of it (tools/lab.sh estimates its next cold loads from it)
     const double disk = st.disk_bytes() / 1e9, cache = st.cache_bytes() / 1e9;
     char rate[64] = "";
@@ -1477,6 +1532,11 @@ void Model::choose_residency() {
     if (arena_s && std::strcmp(arena_s, "0") && std::strcmp(arena_s, "1"))
         throw std::runtime_error(std::string("fnx: FNX_ARENA: 0 or 1, not '") + arena_s + "'");
     arena = !arena_s || !std::strcmp(arena_s, "1");
+    if (env_int("FNX_STATIC_EXPERTS", 0) == 1) {
+        if (arena_s && !std::strcmp(arena_s, "1"))
+            throw std::runtime_error("FNX_STATIC_EXPERTS=1 conflicts with FNX_ARENA=1");
+        arena = false;
+    }
     const bool cache = !(ram_s && !std::strcmp(ram_s, "off"));
     double ram_gib = 3.0;
     if (ram_s && cache) {

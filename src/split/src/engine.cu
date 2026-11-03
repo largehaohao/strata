@@ -20,6 +20,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <thread>
+#include "moe_stage.cuh"
 #if FNX_HIP
 #include "hip/peer.h"
 #include "hip/rccl.h"
@@ -116,7 +117,7 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         CardBuf* b = new CardBuf();
         b->dev = w.dev;
         ck(cudaSetDevice(w.dev), "cudaSetDevice");
-        // FNX_HOSTRING: no peer access is ever enabled; the cards exchange through host memory
+        // Streams are also used by the probed peer-push exchange when enabled.
         ck(cudaStreamCreateWithFlags(&b->st, cudaStreamNonBlocking), "stream");
         own_stream(b->st);
         ck(cudaStreamCreateWithFlags(&b->st2, cudaStreamNonBlocking), "stream");
@@ -159,6 +160,17 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         b->njobs = dalloc<int>(2);
         b->jobs_gu = dalloc<Job>(P + 1);
         b->jobs_dn = dalloc<Job>(P + 1);
+        if (env_flag("FNX_MOE_STAGE")) {
+            size_t largest = 0;
+            for (const LayerW& layer : w.L)
+                largest = std::max(largest, std::max(layer.gu_e_stride, layer.down_e_stride));
+            for (const LayerW& layer : w.L)
+                if (layer.gu_e_stride % sizeof(uint4) || layer.down_e_stride % sizeof(uint4))
+                    throw std::runtime_error("FNX_MOE_STAGE: expert strides must be 16-byte aligned");
+            b->moe_stage = dalloc<char>((size_t) P * largest);
+            b->moe_stage_ep = dalloc<const char*>(NEXP);
+            std::fprintf(stderr, "fnx: card %d: decode MoE staging %zu MiB\n", c, ((size_t) P * largest) >> 20);
+        }
         for (int T = 1; T <= MAXT; ++T) {
             Job j{};
             j.w = 0;
@@ -253,8 +265,7 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
     }
     // every link carries a probe's stores before the ring's (src/peer_probe.hpp): one that drops them stops the engine
     // here, named, instead of in the first window's ring; a slow one is said and the engine goes on
-    std::fprintf(stderr, "fnx: HOSTRING build: the cards exchange through page-locked host memory; peer access is never enabled, "
-                         "no peer probe, IOMMU and BAR1 checks skipped\n");
+    if (!peer_on) std::fprintf(stderr, "fnx: host exchange active: the cards exchange through page-locked host memory\n");
     for (int c = 0; c < NCARD; ++c) {
         cb_[c]->ring.next_in = cb_[(c + 1) % NCARD]->ring.in;
         cb_[c]->ring.next_ag = cb_[(c + 1) % NCARD]->ring.ag;
@@ -924,9 +935,11 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
         // the planned experts copied into their slots before the MoE kernels read the layer's tables
         if (live) moe_cache(l, L.gu_e_stride, L.down_e_stride, w.ec, b.cache_list, b.st, plan_in_router ? nullptr : b.jobs_gu, b.njobs);
     }
-    if (sh_in) moe_gate_up(L.gu_e, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st, &L.sh_down.s, ffs, b.sh_gu, b.part + (size_t) P * N);
-    else moe_gate_up(L.gu_e, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st);
-    moe_down(L.down_e, L.down_e_stride, b.jobs_dn, b.njobs, P, b.gu, b.part, b.st);
+    const DW gu = stage_moe(L.gu_e, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.moe_stage, b.moe_stage_ep, b.st);
+    if (sh_in) moe_gate_up(gu, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st, &L.sh_down.s, ffs, b.sh_gu, b.part + (size_t) P * N);
+    else moe_gate_up(gu, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st);
+    const DW down = stage_moe(L.down_e, L.down_e_stride, b.jobs_dn, b.njobs, P, b.moe_stage, b.moe_stage_ep, b.st);
+    moe_down(down, L.down_e_stride, b.jobs_dn, b.njobs, P, b.gu, b.part, b.st);
     if (!sh_in) ck(cudaStreamWaitEvent(b.st, b.join, 0), "join wait");
     RingMoe m;
     m.part = b.part;

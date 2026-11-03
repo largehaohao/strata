@@ -1,0 +1,7 @@
+{
+  "rust_parser": "Write a robust Rust library for parsing CSV records with quoted fields, escaped double quotes and embedded newlines. Include error types, a streaming API, detailed comments and unit tests. Explain how the parser handles each state.",
+  "go_workers": "Implement a bounded worker pool in Go with context cancellation, backpressure, panic recovery and graceful shutdown. Include a complete example and tests. Explain how channel ownership prevents leaks and races.",
+  "sql_report": "Design PostgreSQL tables and queries for an online shop with customers, orders, line items, payments and refunds. Include constraints, indexes, monthly revenue reports, top products, and tests with sample rows. Explain your query choices.",
+  "chinese_systems": "请用中文详细解释 Linux 虚拟内存、缺页处理、页缓存、匿名内存与 NUMA。结合数据库服务的内存使用给出具体例子，并说明如何区分缓存增长、内存泄漏与交换抖动。",
+  "algorithm": "Implement a Python directed graph library with topological sorting, cycle detection, strongly connected components and shortest paths for nonnegative weights. Include invariants, complexity analysis and representative tests. Return complete implementations."
+}
