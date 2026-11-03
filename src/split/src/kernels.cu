@@ -1818,10 +1818,12 @@ void cache_copy(const ExpertCache& ec, int p, const int* list, void* st) {
     k_cache_copy<<<640, 256, 0, (cudaStream_t) st>>>(ec, p, list, ec.dn_off[p], ec.slot_bytes[p] - ec.dn_off[p]);
     ck_launch("cache_copy");
 }
-void moe_cache(int layer, size_t gu_stride, size_t dn_stride, const ExpertCache& ec, int* list, void* st, const Job* jobs, const int* njobs) {
+void moe_cache(int layer, size_t gu_stride, size_t dn_stride, const ExpertCache& ec, int* list, void* st, const Job* jobs, const int* njobs, bool padded) {
     const int p = ec.pool_of[layer];
-    if (gu_stride != ec.dn_off[p] || ec.dn_off[p] + dn_stride != ec.slot_bytes[p])
-        throw std::runtime_error("moe_cache: the layer's experts are not its pool's size");
+    const bool fits = padded ? gu_stride <= ec.dn_off[p] && dn_stride <= ec.slot_bytes[p] - ec.dn_off[p]
+                             : gu_stride == ec.dn_off[p] && ec.dn_off[p] + dn_stride == ec.slot_bytes[p];
+    if (!fits || gu_stride % 16 || dn_stride % 16)
+        throw std::runtime_error("moe_cache: the layer's experts do not fit its pool");
     if (jobs) k_cache_plan<<<1, 32, 0, (cudaStream_t) st>>>(jobs, njobs, layer, ec, list);
     k_cache_copy<<<160, 256, 0, (cudaStream_t) st>>>(ec, p, list, gu_stride, dn_stride);
     ck_launch("moe_cache");

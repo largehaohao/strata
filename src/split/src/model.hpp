@@ -102,7 +102,7 @@ struct ExpertCache {
     const char** ep_dn = nullptr;
     const char* const* host_gu = nullptr;  // [NL * NEXP]: its copy in host memory
     const char* const* host_dn = nullptr;
-    int* slot_of = nullptr;              // [NL * NEXP]: its slot, or -1
+    int* slot_of = nullptr;              // [NL * NEXP]: its slot, -1 in host memory, -2 fixed VRAM (decode-only cache)
     int* owner = nullptr;                // [n_slots]: the expert in it (layer * NEXP + expert)
     unsigned char* ref = nullptr;        // [n_slots]: used since the hand passed (2: by the layer being planned, 3: lent)
     int* hand = nullptr;                 // [EC_POOLS]: each pool's, a slot number in it

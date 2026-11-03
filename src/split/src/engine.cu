@@ -21,6 +21,7 @@
 #include <stdexcept>
 #include <thread>
 #include "moe_stage.cuh"
+#include "static_decode_cache.cuh"
 #if FNX_HIP
 #include "hip/peer.h"
 #include "hip/rccl.h"
@@ -65,6 +66,11 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         throw std::runtime_error("FNX_PF_ROWS: a multiple of " + std::to_string(MAXT) + " from " + std::to_string(MAXT) + " to 8192, got " +
                                  std::to_string(pf_rows));
     pf_c_ = (int) pf_rows;
+    const long long static_slots = env_int("FNX_STATIC_CACHE_SLOTS", 0);
+    if (static_slots && (static_slots < MAXT * TOPK || static_slots > 4096 || static_slots % 32))
+        throw std::runtime_error("FNX_STATIC_CACHE_SLOTS: 0 or a multiple of 32 from 160 to 4096");
+    if (static_slots && (env_int("FNX_STATIC_EXPERTS", 0) != 1 || m.resident.size() != NL || lanes != 1))
+        throw std::runtime_error("FNX_STATIC_CACHE_SLOTS requires static experts and one lane");
     hc1_rows();   // FNX_HC1 checked now, not at the first hc read (inside a graph capture)
     pf_jobs_ = pf_c_ * TOPK / PF_JOB + NEXP;   // jobs of up to PF_JOB pairs per expert, at most
     set_prompt_rows(pf_c_);
@@ -188,7 +194,8 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
             b->dense[T] = dalloc<Job>(1);
             ck(cudaMemcpy(b->dense[T], &j, sizeof j, cudaMemcpyHostToDevice), "dense job");
         }
-        if (w.ec.n_slots) b->cache_list = dalloc<int>(1 + P);
+        if (static_slots) b->static_cache = static_decode_cache(m, w, (int) static_slots);
+        if (w.ec.n_slots || b->static_cache.n_slots) b->cache_list = dalloc<int>(1 + P);
         b->gu = dalloc<float>((size_t) (P + MAXT) * 2 * ffs);
         b->part = dalloc<float>((size_t) (P + MAXT) * N);
         b->sh_gu = dalloc<float>((size_t) MAXT * 2 * ffs);
@@ -924,9 +931,11 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
     }
     // experts in RAM: the router's last block plans this window's slots (the prefetch probe scores the picks against
     // the slots as they were, so with it the plan runs after, in moe_cache)
-    const bool live = cache_live() && lyr >= 0 && lyr < NL;
+    const bool static_live = b.static_cache.n_slots && lyr >= 0 && lyr < NL;
+    const ExpertCache& ec = static_live ? b.static_cache : w.ec;
+    const bool live = (static_live || cache_live()) && lyr >= 0 && lyr < NL;
     const bool plan_in_router = live && !b.probe_cnt;
-    router_route(L.router, b.mixed, b.logits, T, b.topi, b.topw, b.jobs_gu, b.jobs_dn, b.njobs, b.st, plan_in_router ? &w.ec : nullptr,
+    router_route(L.router, b.mixed, b.logits, T, b.topi, b.topw, b.jobs_gu, b.jobs_dn, b.njobs, b.st, plan_in_router ? &ec : nullptr,
                  lyr, b.cache_list, sh_in ? &L.sh_gu.s : nullptr, 2 * ffs, b.xq, b.sh_gu);
     if (const int l = lyr; l >= 0 && l < NL) {
         if (b.route_cnt) route_count(b.topi, P, b.route_cnt + (size_t) l * NEXP, b.st);
@@ -941,15 +950,20 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
             }
         }
         // the planned experts copied into their slots before the MoE kernels read the layer's tables
-        if (live) moe_cache(l, L.gu_e_stride, L.down_e_stride, w.ec, b.cache_list, b.st, plan_in_router ? nullptr : b.jobs_gu, b.njobs);
+        if (live) moe_cache(l, L.gu_e_stride, L.down_e_stride, ec, b.cache_list, b.st, plan_in_router ? nullptr : b.jobs_gu, b.njobs, static_live);
     }
     // MTP also calls ffn_half with a layer outside the main model's layer array.
     const unsigned char* hot = b.moe_stage_hot && lyr >= 0 && lyr < NL
         ? b.moe_stage_hot + lyr * NEXP : nullptr;
-    const DW gu = stage_moe(L.gu_e, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.moe_stage, b.moe_stage_ep, b.st, hot);
+    DW gu_source = L.gu_e, down_source = L.down_e;
+    if (static_live) {
+        gu_source.ep = ec.ep_gu + lyr * NEXP;
+        down_source.ep = ec.ep_dn + lyr * NEXP;
+    }
+    const DW gu = stage_moe(gu_source, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.moe_stage, b.moe_stage_ep, b.st, hot);
     if (sh_in) moe_gate_up(gu, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st, &L.sh_down.s, ffs, b.sh_gu, b.part + (size_t) P * N);
     else moe_gate_up(gu, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st);
-    const DW down = stage_moe(L.down_e, L.down_e_stride, b.jobs_dn, b.njobs, P, b.moe_stage, b.moe_stage_ep, b.st, hot);
+    const DW down = stage_moe(down_source, L.down_e_stride, b.jobs_dn, b.njobs, P, b.moe_stage, b.moe_stage_ep, b.st, hot);
     moe_down(down, L.down_e_stride, b.jobs_dn, b.njobs, P, b.gu, b.part, b.st);
     if (!sh_in) ck(cudaStreamWaitEvent(b.st, b.join, 0), "join wait");
     RingMoe m;

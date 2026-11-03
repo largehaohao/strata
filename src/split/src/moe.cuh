@@ -31,7 +31,7 @@ __device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache
     if (hand < 0 || hand >= n) hand = 0;
     // the misses found 32 jobs at a time (a load each, side by side), then taken in job order
     for (int j0 = 0; j0 < nj; j0 += 32) {
-        unsigned miss = __ballot_sync(0xffffffffu, j0 + lane < nj && ec.slot_of[base + jobs[j0 + lane].w] < 0);
+        unsigned miss = __ballot_sync(0xffffffffu, j0 + lane < nj && ec.slot_of[base + jobs[j0 + lane].w] == -1);
         while (miss) {
             const int g = base + jobs[j0 + __ffs(miss) - 1].w;
             miss &= miss - 1;
@@ -63,7 +63,8 @@ __device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache
             __syncwarp();
         }
     }
-    for (int j = lane; j < nj; j += 32) ec.ref[ec.slot_of[base + jobs[j].w]] = 1;
+    for (int j = lane; j < nj; j += 32)
+        if (const int s = ec.slot_of[base + jobs[j].w]; s >= 0) ec.ref[s] = 1;
     if (lane == 0) {
         ec.hand[p] = s0 + hand;
         list[0] = k;

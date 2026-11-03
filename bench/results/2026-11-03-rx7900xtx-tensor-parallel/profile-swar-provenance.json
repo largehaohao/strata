@@ -1,0 +1,8 @@
+{
+  "binary_sha256": "52a720a78300424d6c9d2127daf8bc2974ed9abf72866d3b1760d2f42cfb599a",
+  "source_commit": "397fc041",
+  "flags_manifest": "/home/john/Strata/build-tensor-parralize-baseline/bench-profile-swar/results.json",
+  "profiler": "ROCm SDK rocprofv3 --kernel-trace --stats --output-format csv --collection-period 65:4:1",
+  "raw_trace": "/home/john/Strata/build-tensor-parralize-baseline/profile-swar/john-MS-7D76/277327_kernel_trace.csv",
+  "note": "Kernel sums include overlap and peer wait. Profiled request speed is excluded from acceptance."
+}

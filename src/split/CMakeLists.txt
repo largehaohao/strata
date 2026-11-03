@@ -137,7 +137,7 @@ endif()
 
 # Explicit MoE kernel comparisons, with the engine's headers and arithmetic flags.
 list(GET STRATA_SPLIT_CARDS 0 _moe_cards)
-foreach(_kind iq down)
+foreach(_kind iq down cache)
   set(_target split_moe_${_kind}_test)
   set(_source ${_sp}/tools/moe_${_kind}_test.cu)
   add_executable(${_target} EXCLUDE_FROM_ALL ${_source})

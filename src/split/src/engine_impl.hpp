@@ -40,6 +40,7 @@ struct CardBuf {
     float *logits, *topw;
     int *topi, *njobs;
     Job *jobs_gu, *jobs_dn, *dense[MAXT + 1];
+    ExpertCache static_cache;         // decode-only tables; prefill keeps the model's immutable placement
     char* moe_stage = nullptr;
     const char** moe_stage_ep = nullptr;
     unsigned char* moe_stage_hot = nullptr;

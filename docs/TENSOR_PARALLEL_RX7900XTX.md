@@ -18,6 +18,15 @@ not replaced. All new execution paths are opt-in.
 - Static placement disables expert eviction and the KV arena. It supports a
   plain model load, not the holder/worker path. An explicit `FNX_ARENA=1` is
   rejected. `FNX_EXPERT_RAM_GIB` and `FNX_EXPERT_PROFILE` select the cold set.
+- `FNX_STATIC_CACHE_SLOTS=N` adds an optional decode cache for cold experts.
+  It requires static placement and one lane; zero disables it (the default).
+  Accepted nonzero values are multiples of 32 from 160 to 4096. There must be
+  room for at least every possible job in a 16-row window. Each card uses one
+  CLOCK pool with the maximum gate/up and down strides; transfers copy only
+  the actual layer bytes. Fixed hot experts never take or reference a slot.
+  Decode owns separate pointer tables, so prefill keeps the immutable model
+  placement and needs no additional staging allocation. The cache persists
+  across requests. Its VRAM allocation is additional to the fixed hot weights.
 - `FNX_MOE_STAGE=1` copies each selected expert matrix into reusable VRAM
   scratch before its quantized dot products. Gate/up and down reuse the same
   scratch in stream order. Copies preserve every weight byte. The normal
@@ -90,6 +99,8 @@ uses a forced continuation.
 | Same, 16-lane IQ groups, two runs | 156.8–158.7 | 133.3–133.5 | 161.4 |
 | Same, precompute down activations from one row, two runs | 158.1–161.1 | 134.3–134.4 | 163.1–163.3 |
 | Same, packed IQ sign operations, two runs | 163.2–167.1 | 137.0–138.8 | 167.9–169.0 |
+| Same, 256-slot cold cache, 14 GiB cold, two runs | 169.9–171.2 | 149.6–150.0 | 174.5–174.8 |
+| Same, 1024-slot cold cache, 16 GiB cold, two runs | 174.4–177.9 | 153.2–155.7 | 181.8–183.6 |
 
 Values are tokens/s from the engine's reported decode time. The benchmark
 also records client time, time to first token, exact input/output token IDs,
@@ -134,6 +145,17 @@ Packed IQ sign operations measured **155.87 tokens/s** weighted across two
 passes, 3.1% above the down-precompute version. All six output sequences match.
 This is 22.2% above the 127.53 tokens/s two-pass native comparison for these
 tasks; the different-arithmetic caveat above still applies. The target remains 200 tokens/s.
+
+A 256-slot cold cache (325 MiB per card) measured 164.27 tokens/s weighted,
+5.4% above direct cached host reads. Increasing the cache to 1024 slots
+(1300 MiB per card), with 16 GiB of cold backing to make room, measured
+**170.19 tokens/s** weighted. All twelve output sequences from these two
+configurations match the direct-read reference. The 1024-slot setting is
+33.4% above the native comparison on these tasks, with the same arithmetic
+caveat. It left 144 MiB free per card after startup/warmup; the 256-slot
+setting left 102 MiB. The cache persists across requests, and both first and
+second passes are retained. First-pass embedding page faults remain visible
+in the 16 GiB run, so neither this nor the earlier trials are latency guarantees.
 
 The exact token records and the calibration profile are in
 [`bench/results/2026-11-03-rx7900xtx-tensor-parallel`](../bench/results/2026-11-03-rx7900xtx-tensor-parallel/).
@@ -203,6 +225,9 @@ tokens (`quality-hostcache-iq16-pre1`); route tracing was enabled in that qualit
 run, so its timing is excluded from performance claims.
 The packed-sign binary also matched all reviewed tokens and passed all 1326
 checks (`quality-hostcache-iq16-pre1-swar`).
+The 1024-slot static cache again reproduced all reviewed token IDs and passed
+all 1326 checks (`quality-static-cache1024-ram16`). This run overlapped a CPU
+compile and is excluded from speed claims.
 
 A four-second ROCprofiler sample showed matrix staging at 23.15% and the
 window-sum peer kernel at 15.99% of summed kernel duration. This includes
@@ -212,6 +237,10 @@ excluded from the performance table.
 With IQ reuse, another sample still puts staging at 23.99% and peer window sums
 at 16.38% of summed kernel time. The IQ gate/up calls average about 76–82 us for
 seven-row windows; reducing this alone cannot close the remaining decode gap.
+A later four-second sample with packed IQ signs puts gate/up at 19.52%, down
+at 14.26%, dense Q8 at 17.55% and peer window sums at 19.63% of summed kernel
+time. The different sample mixes prevent treating these percentages as an A/B
+speedup. Raw trace locations and binary provenance accompany the summary.
 
 ## Reproduce
 
@@ -232,7 +261,8 @@ tokenizer directory. Set the SDK library paths for the child process:
 ```sh
 export LD_LIBRARY_PATH="$PWD/.venv/lib/python3.12/site-packages/_rocm_sdk_core/lib:$PWD/.venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx110X_dgpu/lib"
 HIP_VISIBLE_DEVICES=0,1 HSA_FORCE_FINE_GRAIN_PCIE=1 \
-FNX_STATIC_EXPERTS=1 FNX_EXPERT_RAM_GIB=14 FNX_MOE_STAGE=0 FNX_PF_ROWS=256 \
+FNX_STATIC_EXPERTS=1 FNX_EXPERT_RAM_GIB=16 FNX_STATIC_CACHE_SLOTS=1024 \
+FNX_MOE_STAGE=0 FNX_PF_ROWS=256 \
 FNX_IQ_REUSE=1 FNX_IQ_GROUP=16 FNX_MOE_PRE_ROWS=1 \
 FNX_STATIC_HOST_CACHE=1 FNX_EMBED_WARM_AFTER_LOAD=1 \
 FNX_EXPERT_PROFILE="$PWD/bench/results/2026-11-03-rx7900xtx-tensor-parallel/swift-decode-routes.bin" \
@@ -280,6 +310,9 @@ context alone does not measure long-context decode.
   covering both lane groups and the fallback. Guard initialization is explicitly
   ordered on the compute stream.
 - Packed IQ signs: all 2048 exact direct/graph checks passed again on both cards.
+- Cold decode cache: 2304 exact checks passed on both cards, with 160/256/1024 slots,
+  four layer sizes, changing routes, eviction, zero/max jobs, all-hot/all-cold
+  and mixed placement, coherent/non-coherent backing, guards and graph replay.
 - Down precompute: 512 exact direct/graph comparisons passed on both cards,
   including T=1..16, changing routes/job counts, IQ4_NL and Q4_0, and guards.
 - Both engines passed the three completed-code tasks described above.
