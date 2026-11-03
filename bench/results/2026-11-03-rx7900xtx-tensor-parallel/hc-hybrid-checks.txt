@@ -1,0 +1,97 @@
+fnx: HC row group 64, grid 80, resident capacity 96 on card 0
+card 0 T 1 one 0 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 0
+card 0 T 1 one 1 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 0
+card 0 T 2 one 0 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 0
+card 0 T 2 one 1 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 0
+card 0 T 3 one 0 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 0
+card 0 T 3 one 1 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 0
+card 0 T 4 one 0 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 0
+card 0 T 4 one 1 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 0
+card 0 T 5 one 0 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 0
+card 0 T 5 one 1 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 0
+card 0 T 6 one 0 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 0
+card 0 T 6 one 1 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 0
+card 0 T 7 one 0 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 0
+card 0 T 7 one 1 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 0
+card 0 T 8 one 0 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 0
+card 0 T 8 one 1 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 0
+card 0 T 9 one 0 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 0
+card 0 T 10 one 0 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 0
+card 0 T 11 one 0 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 0
+card 0 T 12 one 0 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 0
+card 0 T 13 one 0 dispatch grid 48: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 0
+card 0 T 14 one 0 dispatch grid 48: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 0
+card 0 T 15 one 0 dispatch grid 48: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 0
+card 0 T 16 one 0 dispatch grid 48: 123 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 1
+card 1 T 1 one 0 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 1
+card 1 T 1 one 1 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 1
+card 1 T 2 one 0 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 1
+card 1 T 2 one 1 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 1
+card 1 T 3 one 0 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 1
+card 1 T 3 one 1 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 1
+card 1 T 4 one 0 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 1
+card 1 T 4 one 1 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 1
+card 1 T 5 one 0 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 1
+card 1 T 5 one 1 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 1
+card 1 T 6 one 0 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 1
+card 1 T 6 one 1 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 1
+card 1 T 7 one 0 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 1
+card 1 T 7 one 1 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 1
+card 1 T 8 one 0 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 1
+card 1 T 8 one 1 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 1
+card 1 T 9 one 0 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 1
+card 1 T 10 one 0 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 1
+card 1 T 11 one 0 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 1
+card 1 T 12 one 0 dispatch grid 80: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 1
+card 1 T 13 one 0 dispatch grid 48: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 1
+card 1 T 14 one 0 dispatch grid 48: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 1
+card 1 T 15 one 0 dispatch grid 48: 120 exact checks
+fnx: HC row group 64, grid 80, resident capacity 96 on card 1
+card 1 T 16 one 0 dispatch grid 48: 123 exact checks
+HC compact: 5766 bit-exact checks, guards, graph replay, counter wrap and watchdog passed

@@ -1,0 +1,97 @@
+resources card 0 T 1 one 0 regs 149 shared 2688 local 0 resident 96
+card 0 T 1 one 0 resident 96: 120 exact checks
+resources card 0 T 1 one 1 regs 118 shared 2688 local 0 resident 96
+card 0 T 1 one 1 resident 96: 120 exact checks
+resources card 0 T 2 one 0 regs 168 shared 5376 local 0 resident 96
+card 0 T 2 one 0 resident 96: 120 exact checks
+resources card 0 T 2 one 1 regs 168 shared 5376 local 0 resident 96
+card 0 T 2 one 1 resident 96: 120 exact checks
+resources card 0 T 3 one 0 regs 148 shared 8064 local 0 resident 96
+card 0 T 3 one 0 resident 96: 120 exact checks
+resources card 0 T 3 one 1 regs 148 shared 8064 local 0 resident 96
+card 0 T 3 one 1 resident 96: 120 exact checks
+resources card 0 T 4 one 0 regs 149 shared 10752 local 0 resident 96
+card 0 T 4 one 0 resident 96: 120 exact checks
+resources card 0 T 4 one 1 regs 149 shared 10752 local 0 resident 96
+card 0 T 4 one 1 resident 96: 120 exact checks
+resources card 0 T 5 one 0 regs 151 shared 13440 local 0 resident 96
+card 0 T 5 one 0 resident 96: 120 exact checks
+resources card 0 T 5 one 1 regs 151 shared 13440 local 0 resident 96
+card 0 T 5 one 1 resident 96: 120 exact checks
+resources card 0 T 6 one 0 regs 152 shared 16128 local 0 resident 96
+card 0 T 6 one 0 resident 96: 120 exact checks
+resources card 0 T 6 one 1 regs 152 shared 16128 local 0 resident 96
+card 0 T 6 one 1 resident 96: 120 exact checks
+resources card 0 T 7 one 0 regs 153 shared 18816 local 0 resident 96
+card 0 T 7 one 0 resident 96: 120 exact checks
+resources card 0 T 7 one 1 regs 153 shared 18816 local 0 resident 96
+card 0 T 7 one 1 resident 96: 120 exact checks
+resources card 0 T 8 one 0 regs 154 shared 21504 local 0 resident 96
+card 0 T 8 one 0 resident 96: 120 exact checks
+resources card 0 T 8 one 1 regs 154 shared 21504 local 0 resident 96
+card 0 T 8 one 1 resident 96: 120 exact checks
+resources card 0 T 9 one 0 regs 155 shared 24192 local 0 resident 96
+card 0 T 9 one 0 resident 96: 120 exact checks
+resources card 0 T 10 one 0 regs 156 shared 26880 local 0 resident 96
+card 0 T 10 one 0 resident 96: 120 exact checks
+resources card 0 T 11 one 0 regs 157 shared 29568 local 0 resident 96
+card 0 T 11 one 0 resident 96: 120 exact checks
+resources card 0 T 12 one 0 regs 158 shared 32256 local 0 resident 96
+card 0 T 12 one 0 resident 96: 120 exact checks
+resources card 0 T 13 one 0 regs 168 shared 22656 local 376 resident 96
+card 0 T 13 one 0 resident 96: 120 exact checks
+resources card 0 T 14 one 0 regs 168 shared 23296 local 380 resident 96
+card 0 T 14 one 0 resident 96: 120 exact checks
+resources card 0 T 15 one 0 regs 168 shared 25984 local 384 resident 96
+card 0 T 15 one 0 resident 96: 120 exact checks
+resources card 0 T 16 one 0 regs 168 shared 26624 local 388 resident 96
+card 0 T 16 one 0 resident 96: 120 exact checks
+resources card 1 T 1 one 0 regs 149 shared 2688 local 0 resident 96
+card 1 T 1 one 0 resident 96: 120 exact checks
+resources card 1 T 1 one 1 regs 118 shared 2688 local 0 resident 96
+card 1 T 1 one 1 resident 96: 120 exact checks
+resources card 1 T 2 one 0 regs 168 shared 5376 local 0 resident 96
+card 1 T 2 one 0 resident 96: 120 exact checks
+resources card 1 T 2 one 1 regs 168 shared 5376 local 0 resident 96
+card 1 T 2 one 1 resident 96: 120 exact checks
+resources card 1 T 3 one 0 regs 148 shared 8064 local 0 resident 96
+card 1 T 3 one 0 resident 96: 120 exact checks
+resources card 1 T 3 one 1 regs 148 shared 8064 local 0 resident 96
+card 1 T 3 one 1 resident 96: 120 exact checks
+resources card 1 T 4 one 0 regs 149 shared 10752 local 0 resident 96
+card 1 T 4 one 0 resident 96: 120 exact checks
+resources card 1 T 4 one 1 regs 149 shared 10752 local 0 resident 96
+card 1 T 4 one 1 resident 96: 120 exact checks
+resources card 1 T 5 one 0 regs 151 shared 13440 local 0 resident 96
+card 1 T 5 one 0 resident 96: 120 exact checks
+resources card 1 T 5 one 1 regs 151 shared 13440 local 0 resident 96
+card 1 T 5 one 1 resident 96: 120 exact checks
+resources card 1 T 6 one 0 regs 152 shared 16128 local 0 resident 96
+card 1 T 6 one 0 resident 96: 120 exact checks
+resources card 1 T 6 one 1 regs 152 shared 16128 local 0 resident 96
+card 1 T 6 one 1 resident 96: 120 exact checks
+resources card 1 T 7 one 0 regs 153 shared 18816 local 0 resident 96
+card 1 T 7 one 0 resident 96: 120 exact checks
+resources card 1 T 7 one 1 regs 153 shared 18816 local 0 resident 96
+card 1 T 7 one 1 resident 96: 120 exact checks
+resources card 1 T 8 one 0 regs 154 shared 21504 local 0 resident 96
+card 1 T 8 one 0 resident 96: 120 exact checks
+resources card 1 T 8 one 1 regs 154 shared 21504 local 0 resident 96
+card 1 T 8 one 1 resident 96: 120 exact checks
+resources card 1 T 9 one 0 regs 155 shared 24192 local 0 resident 96
+card 1 T 9 one 0 resident 96: 120 exact checks
+resources card 1 T 10 one 0 regs 156 shared 26880 local 0 resident 96
+card 1 T 10 one 0 resident 96: 120 exact checks
+resources card 1 T 11 one 0 regs 157 shared 29568 local 0 resident 96
+card 1 T 11 one 0 resident 96: 120 exact checks
+resources card 1 T 12 one 0 regs 158 shared 32256 local 0 resident 96
+card 1 T 12 one 0 resident 96: 120 exact checks
+resources card 1 T 13 one 0 regs 168 shared 22656 local 376 resident 96
+card 1 T 13 one 0 resident 96: 120 exact checks
+resources card 1 T 14 one 0 regs 168 shared 23296 local 380 resident 96
+card 1 T 14 one 0 resident 96: 120 exact checks
+resources card 1 T 15 one 0 regs 168 shared 25984 local 384 resident 96
+card 1 T 15 one 0 resident 96: 120 exact checks
+resources card 1 T 16 one 0 regs 168 shared 26624 local 388 resident 96
+card 1 T 16 one 0 resident 96: 120 exact checks
+HC compact: 5760 bit-exact checks, guards, graph replay, counter wrap and watchdog passed

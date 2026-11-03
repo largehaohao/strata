@@ -1140,7 +1140,7 @@ void gemv_f32(const float* W, const float* x, float* y, int rows, int n, int T, 
 
 #endif
 #if FNX_KPART == 3
-size_t hc_scratch_floats(int T) { return (size_t) H_NS * T * H_ROWS + (size_t) T * H_NS + (size_t) T * LR / 4 + (size_t) T * LR / 32 + 1; }
+size_t hc_scratch_floats(int T) { return (size_t) H_NS * T * H_ROWS + (size_t) T * H_NS + (size_t) T * LR / 4 + (size_t) T * LR / 32 + 2; }
 
 // FNX_HC1=R: windows of up to R rows (at most 8) take k_hc's one-barrier form (default 3: kbench 1-2 us faster a read at
 // 1-3 rows, the same at 4-5, slower at 8). Read once; the engine reads it when made, so a bad value fails at start
@@ -1158,6 +1158,34 @@ int hc_blocks() { return H_BLOCKS; }
 // the read's grid on each card (0: hc_prepare not run there)
 constexpr int HC_MAXDEV = 64;
 int hc_grid_[HC_MAXDEV] = {};
+int hc_wide_grid_[HC_MAXDEV] = {};
+unsigned long long hc_timeout_[HC_MAXDEV] = {};
+
+bool hc_compact() {
+    static const bool compact = [] {
+        const auto rows = env_int("FNX_HC_ROW_GROUP", 96);
+        if (rows != 64 && rows != 96) throw std::runtime_error("FNX_HC_ROW_GROUP: expected 64 or 96");
+#if !FNX_HIP
+        if (rows == 64) throw std::runtime_error("FNX_HC_ROW_GROUP=64 requires HIP gfx1100");
+#endif
+        return rows == 64;
+    }();
+    return compact;
+}
+
+#if FNX_HIP
+template <int T> int hc_compact_residency() {
+    int blocks = 0;
+    hipError_t e;
+    if constexpr (T <= 8) {
+        if (T <= hc1_rows()) e = hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, k_hc<T, true, true, 64>, 512, 0);
+        else e = hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, k_hc<T, false, true, 64>, 512, 0);
+    } else e = hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, k_hc<T, false, true, 64>, 512, 0);
+    if (e != hipSuccess || blocks <= 0)
+        throw std::runtime_error("hc_prepare: cannot determine compact kernel residency");
+    return blocks;
+}
+#endif
 
 int hc_dev() {
     int dev = -1;
@@ -1180,15 +1208,42 @@ int hc_prepare(float* scratch, int cap) {
     if (e != cudaSuccess) throw std::runtime_error(std::string("hc_prepare: SM count: ") + cudaGetErrorString(e));
     if (sms <= 0) throw std::runtime_error("hc_prepare: card " + std::to_string(dev) + " reports " + std::to_string(sms) + " SMs");
     if (cap < 0 || cap > H_BLOCKS) throw std::runtime_error("hc_prepare: cap 1.." + std::to_string(H_BLOCKS) + " (0: none), got " + std::to_string(cap));
-    hc_grid_[dev] = std::min(sms, cap ? cap : H_BLOCKS);
+    int capacity = sms;
+    hc_timeout_[dev] = 2000000000ULL;
+#if FNX_HIP
+    int wall_khz = 0;
+    if (hipDeviceGetAttribute(&wall_khz, hipDeviceAttributeWallClockRate, dev) != hipSuccess || wall_khz <= 0)
+        throw std::runtime_error("hc_prepare: cannot determine wall-clock rate");
+    hc_timeout_[dev] = (unsigned long long) wall_khz * 1000;   // one second
+    if (hc_compact()) {
+        hipDeviceProp_t prop{};
+        if (hipGetDeviceProperties(&prop, dev) != hipSuccess || std::string(prop.gcnArchName).rfind("gfx1100", 0) != 0)
+            throw std::runtime_error("FNX_HC_ROW_GROUP=64 has only been validated on gfx1100");
+        const int per_sm = std::min({hc_compact_residency<1>(), hc_compact_residency<2>(),
+            hc_compact_residency<3>(), hc_compact_residency<4>(), hc_compact_residency<5>(), hc_compact_residency<6>(),
+            hc_compact_residency<7>(), hc_compact_residency<8>(), hc_compact_residency<9>(), hc_compact_residency<10>(),
+            hc_compact_residency<11>(), hc_compact_residency<12>()});
+        capacity = sms * per_sm;
+    }
+#endif
+    hc_grid_[dev] = std::min(capacity, cap ? cap : H_BLOCKS);
+    hc_wide_grid_[dev] = std::min(sms, cap ? cap : H_BLOCKS);
 #if FNX_HIP
     // FNX_HC_GRID=n (screen): n blocks of the read resident at once instead of one per multiprocessor. An R9700 reports 32 (one per WGP of two CUs), so the 80 blocks of work
     // ran in 2-3 turns each; several blocks fit one WGP, and a barrier that waits too long sets err bit 4 rather than hang
-    if (const long long g = env_int("FNX_HC_GRID", 0); g > 0) hc_grid_[dev] = (int) std::min<long long>(g, cap ? cap : H_BLOCKS);
+    if (const long long g = env_int("FNX_HC_GRID", 0); g > 0) {
+        const int requested = (int) std::min<long long>(g, cap ? cap : H_BLOCKS);
+        if (hc_compact() && requested > capacity)
+            throw std::runtime_error("FNX_HC_GRID exceeds compact kernel residency");
+        hc_grid_[dev] = requested;
+        hc_wide_grid_[dev] = hc_compact() ? std::min(requested, sms) : requested;
+    }
+    if (hc_compact()) std::fprintf(stderr, "fnx: HC row group 64, grid %d, resident capacity %d on card %d\n",
+                                   hc_grid_[dev], capacity, dev);
 #endif
     // a counter left by another grid sits mid-generation for this one: its next barrier would let blocks through early
-    const unsigned zero = 0;
-    const cudaError_t z = cudaMemcpy(scratch + hc_scratch_floats(MAXT) - 1, &zero, sizeof zero, cudaMemcpyHostToDevice);
+    const unsigned zero[2] = {};
+    const cudaError_t z = cudaMemcpy(scratch + hc_scratch_floats(MAXT) - 2, zero, sizeof zero, cudaMemcpyHostToDevice);
     if (z != cudaSuccess) throw std::runtime_error(std::string("hc_prepare: the barrier counter: ") + cudaGetErrorString(z));
     return hc_grid_[dev];
 }
@@ -1202,40 +1257,47 @@ void hc_read(float* R, const float* bo, const float* inj_prev, const float* w_no
     a.ssp = a.part + (size_t) H_NS * T * H_ROWS;
     a.loq = (int8_t*) (a.ssp + (size_t) T * H_NS);
     a.lod = a.ssp + (size_t) T * H_NS + (size_t) T * LR / 4;
-    // the barrier's counter: the last float of a scratch sized for MAXT rows, so it stays put whatever T is
-    a.bar = (unsigned*) (scratch + hc_scratch_floats(MAXT) - 1);
+    // Separate counters keep each grid in its own barrier generation when T changes.
+    const bool compact = hc_compact() && T <= 12;
+    a.bar = (unsigned*) (scratch + hc_scratch_floats(MAXT) - (compact ? 1 : 2));
     if (q8) twin_of(q8, N, a.tq, a.td);
     cudaStream_t s = (cudaStream_t) st;
     const bool one = T <= hc1_rows();
-    const int grid = hc_grid();
+    const int prepared_grid = hc_grid(), dev = hc_dev();
+    const int grid = compact ? prepared_grid : hc_wide_grid_[dev];
+    a.timeout_ticks = hc_timeout_[dev];
     switch (T) {
-        case 1: hc_launch<1>(a, s, one, grid); break;
-        case 2: hc_launch<2>(a, s, one, grid); break;
-        case 3: hc_launch<3>(a, s, one, grid); break;
-        case 4: hc_launch<4>(a, s, one, grid); break;
-        case 5: hc_launch<5>(a, s, one, grid); break;
-        case 6: hc_launch<6>(a, s, one, grid); break;
-        case 7: hc_launch<7>(a, s, one, grid); break;
-        case 8: hc_launch<8>(a, s, one, grid); break;
-        case 9: hc_launch<9>(a, s, one, grid); break;
-        case 10: hc_launch<10>(a, s, one, grid); break;
-        case 11: hc_launch<11>(a, s, one, grid); break;
-        case 12: hc_launch<12>(a, s, one, grid); break;
-        case 13: hc_launch<13>(a, s, one, grid); break;
-        case 14: hc_launch<14>(a, s, one, grid); break;
-        case 15: hc_launch<15>(a, s, one, grid); break;
-        case 16: hc_launch<16>(a, s, one, grid); break;
+        case 1: hc_launch<1>(a, s, one, grid, compact); break;
+        case 2: hc_launch<2>(a, s, one, grid, compact); break;
+        case 3: hc_launch<3>(a, s, one, grid, compact); break;
+        case 4: hc_launch<4>(a, s, one, grid, compact); break;
+        case 5: hc_launch<5>(a, s, one, grid, compact); break;
+        case 6: hc_launch<6>(a, s, one, grid, compact); break;
+        case 7: hc_launch<7>(a, s, one, grid, compact); break;
+        case 8: hc_launch<8>(a, s, one, grid, compact); break;
+        case 9: hc_launch<9>(a, s, one, grid, compact); break;
+        case 10: hc_launch<10>(a, s, one, grid, compact); break;
+        case 11: hc_launch<11>(a, s, one, grid, compact); break;
+        case 12: hc_launch<12>(a, s, one, grid, compact); break;
+        case 13: hc_launch<13>(a, s, one, grid, compact); break;
+        case 14: hc_launch<14>(a, s, one, grid, compact); break;
+        case 15: hc_launch<15>(a, s, one, grid, compact); break;
+        case 16: hc_launch<16>(a, s, one, grid, compact); break;
         default: throw std::runtime_error("hc_read: T out of range");
     }
     ck_launch("hc_read");
 }
 
 void hc_preset_barrier(float* scratch, unsigned barriers_left) {
-    const unsigned g = (unsigned) hc_grid(), mod = hc_bar_mod(g);
-    if (barriers_left == 0 || barriers_left > mod / g)
-        throw std::runtime_error("hc_preset_barrier: barriers_left must be 1.." + std::to_string(mod / g));
-    const unsigned v = mod - barriers_left * g;
-    const cudaError_t e = cudaMemcpy(scratch + hc_scratch_floats(MAXT) - 1, &v, sizeof v, cudaMemcpyHostToDevice);
+    const unsigned grids[2] = {(unsigned) hc_wide_grid_[hc_dev()], (unsigned) hc_grid()};
+    unsigned values[2];
+    for (int i = 0; i < 2; ++i) {
+        const unsigned g = grids[i], mod = hc_bar_mod(g);
+        if (barriers_left == 0 || barriers_left > mod / g)
+            throw std::runtime_error("hc_preset_barrier: barriers_left must be 1.." + std::to_string(mod / g));
+        values[i] = mod - barriers_left * g;
+    }
+    const cudaError_t e = cudaMemcpy(scratch + hc_scratch_floats(MAXT) - 2, values, sizeof values, cudaMemcpyHostToDevice);
     if (e != cudaSuccess) throw std::runtime_error(std::string("hc_preset_barrier: ") + cudaGetErrorString(e));
 }
 

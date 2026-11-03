@@ -67,6 +67,13 @@ not replaced. All new execution paths are opt-in.
   Metadata remains, but released tensors have null data and cannot be staged
   again without reloading. Staging scratch is destroyed before the optional
   embedding refresh, regardless of this flag.
+- `FNX_HC_ROW_GROUP=64` selects a 512-thread HC layout for windows of 1–12
+  tokens on gfx1100. Larger windows retain the original 768-thread layout.
+  The grids have separate barrier counters, including during graph replay;
+  switching window size does not reset a counter or add a GPU launch. Startup
+  checks residency across the selected compact kernels and caps their grid at
+  80 blocks. The default remains 96-row groups. HIP HC timeouts use the device's
+  wall-clock rate, since the previous cycle counter is unreliable on RDNA3.
 
 `FNX_PF_ROWS=256` reduces prefill scratch compared with the existing default
 4096. This allowed the cold allocation to fall from 16 to 14 GiB. With staging,
@@ -108,6 +115,7 @@ uses a forced continuation.
 | Same, 256-slot cold cache, 14 GiB cold, two runs | 169.9–171.2 | 149.6–150.0 | 174.5–174.8 |
 | Same, 1024-slot cold cache, 16 GiB cold, two runs | 174.4–177.9 | 153.2–155.7 | 181.8–183.6 |
 | Same, release copied GGUF conversions, two runs | 177.7–178.0 | 156.1–156.2 | 183.6–183.8 |
+| Same, compact HC for 1–12 rows, two runs | 179.7–180.3 | 157.9–158.3 | 186.2–186.4 |
 
 Values are tokens/s from the engine's reported decode time. The benchmark
 also records client time, time to first token, exact input/output token IDs,
@@ -171,6 +179,13 @@ with every output token identical to the cache reference. A separate recent
 control measured 171.32 tokens/s, so the result primarily establishes reduced
 memory pressure; it does not establish a GPU arithmetic speedup. A mid-run
 RSS sample was 57092372 KiB. See `bench-release-owned` for the complete run.
+
+Compact HC for 1–12 rows measured **173.92 tokens/s**, against **171.64** with
+the flag off in the same binary (1.33% higher). All six measured output token
+sequences match and decode major faults were zero. See `bench-hc-hybrid` and
+`bench-hc-hybrid-control`. The complete-code tasks also matched their reviewed
+token IDs and passed all 1326 checks. The 494-token varint task measured
+203.95 tokens/s; the broader 2048-token panel still falls short of 200.
 
 The exact token records and the calibration profile are in
 [`bench/results/2026-11-03-rx7900xtx-tensor-parallel`](../bench/results/2026-11-03-rx7900xtx-tensor-parallel/).
@@ -289,15 +304,23 @@ the broader 2048-token panel's 200 tokens/s target.
 IQ lookup tables staged in shared memory matched the reference but did not
 improve the representative kernel timings. A separate HC prototype with
 64-row groups and 80 blocks was about 16–17% faster in warm microbenchmarks;
-its full-model performance and broader input coverage are still unvalidated.
-A finite-work occupancy probe observed 96 resident blocks for that 512-thread
-layout on both cards. This is different from the original 768-thread layout,
-for which 80 blocks were unsafe.
+that initial result did not cover every window. Broader checks found register
+pressure at 5–6 rows and excessive LDS usage at 13–16 rows. The final compact
+layout constrains register use and keeps the original layout above 12 rows.
+The runtime checks all selected kernels' occupancy rather than relying on the
+earlier finite-work occupancy probe. The original 768-thread layout cannot
+safely use an 80-block grid on these cards.
+
+A version forcing compact execution for all windows passed 5760 exact checks
+but made the large windows slower. It measured 172.33 tokens/s versus 171.77
+with the flag off in the same binary; all output tokens matched. It is retained
+as `hc-all-windows-deferred.patch`, not the final dispatch policy.
 
 The exploratory clock probe also confirmed that `clock64()` can go backwards
 on these cards while `wall_clock64()` advances at 100 MHz. AMD documents
 [the RDNA3 clock limitation](https://rocm.docs.amd.com/projects/HIP/en/docs-7.0.0/how-to/hip_cpp_language_extensions.html).
-The existing device watchdogs need a separate correction; reported decode
+The HC watchdog now uses the wall clock and has a bounded missing-arrival
+test. Other device watchdogs still need a separate correction; reported decode
 rates use host timing and GPU events, not those watchdog counters.
 
 ## Reproduce
@@ -324,6 +347,7 @@ FNX_MOE_STAGE=0 FNX_PF_ROWS=256 \
 FNX_IQ_REUSE=1 FNX_IQ_GROUP=16 FNX_MOE_PRE_ROWS=1 \
 FNX_STATIC_HOST_CACHE=1 FNX_EMBED_WARM_AFTER_LOAD=1 \
 FNX_RELEASE_COPIED_WEIGHTS=1 \
+FNX_HC_ROW_GROUP=64 \
 FNX_EXPERT_PROFILE="$PWD/bench/results/2026-11-03-rx7900xtx-tensor-parallel/swift-decode-routes.bin" \
 python3 tools/tp_decode_bench.py \
   --exe build-tensor-parralize/src/split/strata-split-2 \
@@ -352,9 +376,16 @@ context alone does not measure long-context decode.
 ## Validation and remaining work
 
 - HIP build and model startup self-tests passed on both physical cards.
+- HC compact dispatch: 5766 bit-exact comparisons passed on both cards,
+  covering T=1..16, both barrier forms, optional writes/injection/quantization,
+  changed and zero inputs, guard bytes, graph replay and barrier-counter wrap.
+  A mixed-window sequence switches between 48- and 80-block grids on the same
+  scratch, including inside a graph, without resetting counters between reads.
 - GGUF ownership release passed a host-only regression and ASan/UBSan, covering
   mixed mapped/converted tensors, retained bytes, metadata, invalid retention,
   null released pointers and repeated release.
+  The complete model also matched all reviewed quality token IDs and passed
+  all 1326 checks after release (`quality-release-owned`).
 - Static placement: all 256 partitions of eight experts passed, including
   empty hot/cold banks and invalid-input rejection; tested with `NDEBUG` too.
 - Staging: 432 byte-for-byte direct/graph checks passed on both cards, with

@@ -155,7 +155,20 @@ foreach(_kind iq down cache)
   endif()
 endforeach()
 
-# the CPU unit tests sFNX ships (split rule, ring plan, card checks, batch plan, rope, input parser): plain C++, no GPU
+# Compact HC is currently restricted to gfx1100; its regression needs HIP residency APIs.
+if(_fnx_hip)
+  add_executable(split_hc_compact_test EXCLUDE_FROM_ALL ${_sp}/tools/hc_compact_test.cu)
+  foreach(_prop INCLUDE_DIRECTORIES COMPILE_DEFINITIONS COMPILE_OPTIONS LINK_LIBRARIES)
+    get_target_property(_value strata-split-${_moe_cards} ${_prop})
+    if(_value)
+      set_property(TARGET split_hc_compact_test PROPERTY ${_prop} "${_value}")
+    endif()
+  endforeach()
+  set_source_files_properties(${_sp}/tools/hc_compact_test.cu PROPERTIES LANGUAGE HIP)
+  set_target_properties(split_hc_compact_test PROPERTIES HIP_STANDARD 17 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${_fnx_hip_archs}")
+endif()
+
+# CPU unit tests: split rule, ring plan, card checks, batch plan, rope and input parser.
 if(STRATA_BUILD_TESTS)
   list(GET STRATA_SPLIT_CARDS 0 _n0)
   foreach(_tt batch_plan_test pf_ring_plan_test card_check_test rope_test sfnx_input_test peer_policy_test rccl_policy_test selftest_policy_test static_experts_test)
