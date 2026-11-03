@@ -131,6 +131,14 @@ are reused. The target Swift IQ3_S weights are unchanged. Both draft formats
 use Q4 blocks on the GPU: the default Q2 pack is expanded when loading, so the
 Q4 experiment does not enlarge the expert allocations.
 
+`FNX_MTP_HEAD_Q4=1` separately converts the draft output head's Q8 rows to
+Q4_0 at load time. It keeps every draft vocabulary row, in the same order,
+and leaves the main output head unchanged. The default is the original Q8
+head. The Flash-Next HIP Q4 reader uses eight lanes per output row for large
+matrices. This changes draft predictions and can change acceptance; it is
+not an exact replacement for the draft head's arithmetic. On these cards,
+each draft head shrinks from 137.87 to 72.99 MiB.
+
 ## Measurements so far
 
 Hardware: two RX 7900 XTX (`gfx1100`, 24 GiB each), Ryzen 7700, 64 GiB RAM.
@@ -168,6 +176,7 @@ uses a forced continuation.
 | Same, two-row groups for large Q8 projections, two runs | 189.0–189.7 | 164.7–165.0 | 198.6–198.7 |
 | Same, BF16-derived Q4 draft experts, two runs | 196.0–196.4 | 167.5–167.7 | 200.7–201.3 |
 | Same, logged GDN rollback and 14 GiB cold backing, two runs | 205.8–206.2 | 173.3–173.7 | 212.6–213.2 |
+| Same, Q4 draft head and 13.875 GiB cold backing, two runs | 205.3–205.8 | 177.9–178.5 | 214.0–214.4 |
 
 Values are tokens/s from the engine's reported decode time. The benchmark
 also records client time, time to first token, exact input/output token IDs,
@@ -321,6 +330,19 @@ full-snapshot control exactly: prefill/decode took 45.66 s/271.0 ms, versus
 47.73 s/285.6 ms. Both additional Chinese tasks retain every Q4-reference
 token. These checks have zero decode major faults; see `near-context-gdn-replay`,
 `near-context-gdn-control`, `heldout-gdn-replay`, and `gdn-replay-checks.json`.
+
+The Q4 draft head, using the freed memory for additional fixed hot experts,
+measured **198.09 tokens/s** versus **195.78** with the preceding Q8-head
+recipe in the same binary (**1.18%** higher). All six target output sequences
+match and decode major faults are zero. Accepted draft counts changed from
+1565/1369/1608 to 1559/1391/1606 for code/prose/edit; the gain is not uniform
+across tasks. Startup/warmup left 64 MiB free on each card. See
+`bench-mtp-head-q4-ram13p875` and `bench-mtp-head-q4-control`. The reviewed
+code tasks also keep their token IDs and pass all 1326 checks; varint measured
+238.28 tokens/s (`quality-mtp-head-q4`). The full panel remains below 200.
+The near-context input/output IDs and both additional Chinese replies also
+match their earlier references, with zero decode major faults. See
+`near-context-mtp-head-q4`, `heldout-mtp-head-q4`, and `mtp-head-checks.json`.
 
 The exact token records and the calibration profile are in
 [`bench/results/2026-11-03-rx7900xtx-tensor-parallel`](../bench/results/2026-11-03-rx7900xtx-tensor-parallel/).
@@ -514,7 +536,7 @@ Set the SDK library paths for the child process:
 ```sh
 export LD_LIBRARY_PATH="$PWD/.venv/lib/python3.12/site-packages/_rocm_sdk_core/lib:$PWD/.venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx110X_dgpu/lib"
 HIP_VISIBLE_DEVICES=0,1 HSA_FORCE_FINE_GRAIN_PCIE=1 \
-FNX_STATIC_EXPERTS=1 FNX_EXPERT_RAM_GIB=14 FNX_STATIC_CACHE_SLOTS=1024 \
+FNX_STATIC_EXPERTS=1 FNX_EXPERT_RAM_GIB=13.875 FNX_STATIC_CACHE_SLOTS=1024 \
 FNX_STATIC_CACHE_GROUPS=2 \
 FNX_MOE_STAGE=0 FNX_PF_ROWS=256 \
 FNX_IQ_REUSE=1 FNX_IQ_GROUP=16 FNX_MOE_PRE_ROWS=1 \
@@ -523,7 +545,7 @@ FNX_RELEASE_COPIED_WEIGHTS=1 FNX_KV_CONTEXT_ONLY=1 \
 FNX_HC_ROW_GROUP=64 FNX_STATIC_CACHE_FUSED_DN=64 \
 FNX_Q8S_ROW_GROUP=2 \
 FNX_GDN_REPLAY=1 FNX_BATCH_DRAFTS=0 \
-FNX_MTP_EXPERTS=q4_0 \
+FNX_MTP_EXPERTS=q4_0 FNX_MTP_HEAD_Q4=1 \
 FNX_EXPERT_PROFILE="$PWD/bench/results/2026-11-03-rx7900xtx-tensor-parallel/swift-decode-routes.bin" \
 python3 tools/tp_decode_bench.py \
   --exe build-tensor-parralize/src/split/strata-split-2 \
@@ -611,6 +633,14 @@ context alone does not measure long-context decode.
   execution, and two independent layer descriptors with rotated head order.
   The original full snapshots are the byte oracle. Uniform FMA contraction
   orders failed the prototype; the retained row-dependent order matches.
+- Q4 draft head: 32768 converted blocks match the pinned GGUF reference
+  byte-for-byte in both normal and ASan/UBSan host builds. Checks include
+  signed scales, subnormals, zero blocks, maximum ties, row order/repetition
+  and invalid metadata. The GPU reader passed 384 direct/graph product and
+  guard checks on both cards, across T=1..16 and changed/zero inputs. The
+  eight-lane sums are compared with the original 32-lane Q4 reader with a
+  2e-5 relative/absolute tolerance; different reduction groups need not be
+  bit-identical. Full-model target token comparisons are exact.
 - CUDA has not been built or run here. No SYCL files are changed.
 - Remaining: the 200 tokens/s target, long-context acceptance, broader quality
   and workload coverage, and integration into launch policy.

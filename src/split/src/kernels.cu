@@ -1078,6 +1078,10 @@ void mmvq_t(const DW& W, size_t w_stride, const Job* jobs, const int* njobs, int
     const int lanes = (W.n_in / qk) * per_block;   // lanes that keep every block of a row busy
     int G = per_block;
     while (G < lanes && G < 32) G *= 2;
+#if FNX_HIP && !FNX_27B
+    // The optional Q4 draft head: more rows in flight for its one-token steps.
+    if constexpr (type == GGML_TYPE_Q4_0) { if (W.n_out >= 8192) G = 8; }
+#endif
     const int ys = W.n_in / 32;
 #define FNX_G(g) k_mmvq<type, g><<<dim3((W.n_out + MMVQ_THREADS / g - 1) / (MMVQ_THREADS / g), njobs_max), MMVQ_THREADS, 0, s>>>( \
         (const char*) W.p, w_stride, W.row_bytes, W.n_out, W.n_in, jobs, njobs, njobs_max, (const block_q8_1*) y, ys, out, out_stride)
@@ -1095,6 +1099,7 @@ void mmvq(const DW& W, size_t w_stride, const Job* jobs, const int* njobs, int n
     cudaStream_t s = (cudaStream_t) st;
     switch (W.type) {
         case T_Q8_0: mmvq_t<GGML_TYPE_Q8_0>(W, w_stride, jobs, njobs, njobs_max, y, out, out_stride, s); break;
+        case T_Q4_0: mmvq_t<GGML_TYPE_Q4_0>(W, w_stride, jobs, njobs, njobs_max, y, out, out_stride, s); break;
         case T_Q4_K: mmvq_t<GGML_TYPE_Q4_K>(W, w_stride, jobs, njobs, njobs_max, y, out, out_stride, s); break;
         case T_Q5_K: mmvq_t<GGML_TYPE_Q5_K>(W, w_stride, jobs, njobs, njobs_max, y, out, out_stride, s); break;
         case T_Q5_1: mmvq_t<GGML_TYPE_Q5_1>(W, w_stride, jobs, njobs, njobs_max, y, out, out_stride, s); break;

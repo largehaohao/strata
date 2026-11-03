@@ -137,7 +137,7 @@ endif()
 
 # Explicit kernel comparisons, with the engine's headers and arithmetic flags.
 list(GET STRATA_SPLIT_CARDS 0 _moe_cards)
-foreach(_kind moe_iq moe_down moe_cache dense_q8)
+foreach(_kind moe_iq moe_down moe_cache dense_q8 mtp_head_gpu)
   set(_target split_${_kind}_test)
   set(_source ${_sp}/tools/${_kind}_test.cu)
   add_executable(${_target} EXCLUDE_FROM_ALL ${_source})
@@ -184,7 +184,7 @@ endif()
 # CPU unit tests: split rule, ring plan, card checks, batch plan, rope and input parser.
 if(STRATA_BUILD_TESTS)
   list(GET STRATA_SPLIT_CARDS 0 _n0)
-  foreach(_tt batch_plan_test pf_ring_plan_test card_check_test rope_test sfnx_input_test peer_policy_test rccl_policy_test selftest_policy_test static_experts_test)
+  foreach(_tt batch_plan_test pf_ring_plan_test card_check_test rope_test sfnx_input_test peer_policy_test rccl_policy_test selftest_policy_test static_experts_test mtp_head_test)
     add_executable(split_${_tt} ${_sp}/tools/${_tt}.cpp)
     target_include_directories(split_${_tt} PRIVATE ${_sp}/src ${_sp}/tools)
     target_compile_definitions(split_${_tt} PRIVATE FNX_NCARD=${_n0} FNX_27B=0)

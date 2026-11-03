@@ -3,6 +3,7 @@
 #include "env.hpp"
 #include "rope_gguf.hpp"
 #include "static_experts.hpp"
+#include "mtp_head_q4.hpp"
 
 #include "store.hpp"
 #if FNX_HIP
@@ -1122,6 +1123,8 @@ void free_mtp_cards(std::vector<MtpCard>& cards) {
 }
 
 void load_mtp_card(const Model& m, const MtpFiles& f, const CardW& c, const std::vector<int>& vocab, MtpCard& mc) {
+    const long long q4_head = env_int("FNX_MTP_HEAD_Q4", 0);
+    if (q4_head != 0 && q4_head != 1) throw std::runtime_error("FNX_MTP_HEAD_Q4: expected 0 or 1");
     ck(cudaSetDevice(c.dev), "cudaSetDevice");
     CardW sink;   // Up counts bytes into a CardW
     sink.dev = c.dev;
@@ -1194,8 +1197,21 @@ void load_mtp_card(const Model& m, const MtpFiles& f, const CardW& c, const std:
     mc.mix_down = q8("hyper_connection_mixer.input_mix_weight_down.weight");
     mc.mix_up = q8("hyper_connection_mixer.input_mix_weight_up.weight");
     std::vector<int> rows(vocab.begin() + mc.dv0, vocab.begin() + mc.dv1);
-    mc.head = up.dense(up.rows(*m.g.find("output.weight"), rows));
-    for (const DW* d : {&mc.head, &w.wq, &w.wk, &w.wv, &w.wo, &w.idx_qk, &w.sh_gu, &w.sh_down, &mc.fc_emb, &mc.fc_hid})
+    if (q4_head) {
+        const Tensor& source = *m.g.find("output.weight");
+        const std::vector<uint8_t> packed = mtp_head_q4_rows(source, rows);
+        mc.head.type = T_Q4_0;
+        mc.head.n_in = (int) source.ne[0];
+        mc.head.n_out = (int) rows.size();
+        mc.head.row_bytes = (size_t) mc.head.n_in / 32 * 18;
+        mc.head.p = up.put<uint8_t>(packed.data(), packed.size());
+        std::fprintf(stderr, "fnx: card %d: Q4 draft head %zu rows, %.2f MiB (Q8 %.2f MiB); main head unchanged\n",
+                     c.dev, rows.size(), packed.size() / 1048576.0, rows.size() * source.row_bytes() / 1048576.0);
+    } else {
+        mc.head = up.dense(up.rows(*m.g.find("output.weight"), rows));
+        if (!mc.head.s.q) throw std::runtime_error("mtp: the output projection is not Q8_0");
+    }
+    for (const DW* d : {&w.wq, &w.wk, &w.wv, &w.wo, &w.idx_qk, &w.sh_gu, &w.sh_down, &mc.fc_emb, &mc.fc_hid})
         if (!d->s.q) throw std::runtime_error("mtp: a projection is not Q8_0");
 }
 
@@ -1206,6 +1222,7 @@ void load_mtp_card(const Model& m, const MtpFiles& f, const CardW& c, const std:
 // with the model). dir names where the layer comes from, so a Flash-Next runtime directory in a 27B config fails here
 Mtp::Mtp(const Model& m, const std::string& dir, const std::string& vocab_file) {
     if (dir != "nextn") throw std::runtime_error("mtp: the 27B's draft layer is the GGUF's own: its directory is \"nextn\", not \"" + dir + "\"");
+    if (env_int("FNX_MTP_HEAD_Q4", 0) != 0) throw std::runtime_error("FNX_MTP_HEAD_Q4 is currently for Flash-Next");
     if (vocab_file.empty()) throw std::runtime_error("mtp: the 27B needs a draft vocabulary file");
     {
         std::FILE* f = std::fopen(vocab_file.c_str(), "rb");
