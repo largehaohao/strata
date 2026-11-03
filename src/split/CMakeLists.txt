@@ -135,6 +135,22 @@ else()
   set_target_properties(split_moe_stage_test PROPERTIES CUDA_STANDARD 17 CUDA_ARCHITECTURES "${STRATA_SPLIT_ARCH}-real")
 endif()
 
+# Explicit IQ kernel comparison, with the engine's headers and arithmetic flags.
+add_executable(split_moe_iq_test EXCLUDE_FROM_ALL ${_sp}/tools/moe_iq_test.cu)
+list(GET STRATA_SPLIT_CARDS 0 _iq_cards)
+foreach(_prop INCLUDE_DIRECTORIES COMPILE_DEFINITIONS COMPILE_OPTIONS LINK_LIBRARIES)
+  get_target_property(_value strata-split-${_iq_cards} ${_prop})
+  if(_value)
+    set_property(TARGET split_moe_iq_test PROPERTY ${_prop} "${_value}")
+  endif()
+endforeach()
+if(_fnx_hip)
+  set_source_files_properties(${_sp}/tools/moe_iq_test.cu PROPERTIES LANGUAGE HIP)
+  set_target_properties(split_moe_iq_test PROPERTIES HIP_STANDARD 17 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${_fnx_hip_archs}")
+else()
+  set_target_properties(split_moe_iq_test PROPERTIES CUDA_STANDARD 17 CUDA_ARCHITECTURES "${STRATA_SPLIT_ARCH}-real")
+endif()
+
 # the CPU unit tests sFNX ships (split rule, ring plan, card checks, batch plan, rope, input parser): plain C++, no GPU
 if(STRATA_BUILD_TESTS)
   list(GET STRATA_SPLIT_CARDS 0 _n0)

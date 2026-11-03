@@ -25,6 +25,9 @@ not replaced. All new execution paths are opt-in.
 - `FNX_DECODE_TIMING=1` reports the existing verify, draft and launch timers.
   `FNX_PROFILE_EXIT=1` lets profiler exit callbacks write their traces. It is a
   diagnostic option; normal operation keeps the existing fast exit.
+- `FNX_IQ_REUSE=1` decodes an IQ2_S, IQ3_XXS or IQ3_S weight group once for
+  all token rows in an expert job. Its integer divisions, scaling and reduction
+  order match the existing Q8 dot product. Other weight types keep their path.
 
 `FNX_PF_ROWS=256` reduces prefill scratch compared with the existing default
 4096. This allowed the cold allocation to fall from 16 to 14 GiB. With staging,
@@ -55,12 +58,15 @@ uses a forced continuation.
 | Same, with matrix staging | 99.1 | 92.3 | 100.8 |
 | Staging, 14 GiB cold, prefill rows 256 | 109.0 | 99.6 | 110.8 |
 | Same, calibrated decode residency, two runs | 129.6–134.3 | 113.7–115.8 | 136.1–137.8 |
+| Same, IQ weight reuse, two runs | 130.0–141.4 | 110.2–120.1 | 139.3–145.2 |
 
 Values are tokens/s from the engine's reported decode time. The benchmark
 also records client time, time to first token, exact input/output token IDs,
 draft acceptance, binary SHA-256, source diff fingerprint and environment.
-Warmup is excluded. The calibrated split's weighted rate is 127.13 tokens/s.
-This does not establish an overall gain over the native engine.
+Warmup is excluded. The calibrated split's weighted rate is 127.13 tokens/s;
+with IQ reuse it is 129.76 tokens/s. This is a small end-to-end gain and needs
+more runs to separate it from run-to-run variation. It does not establish a
+general advantage over the native engine.
 
 The exact token records and the calibration profile are in
 [`bench/results/2026-11-03-rx7900xtx-tensor-parallel`](../bench/results/2026-11-03-rx7900xtx-tensor-parallel/).
@@ -78,19 +84,42 @@ that skipped staging for hot experts was slower on these tasks and was removed.
 Two gate/up kernel trials were also removed: a bounded persistent grid passed
 3072 exact direct/graph checks but was slower; cooperative loading of job
 descriptors passed 1024 checks but had no consistent benefit. Their experiment
-logs are retained; neither changes the shipped compute kernels.
+logs are retained. The retained IQ reuse kernel passed 1024 bit-for-bit checks
+on both cards, including T=1..16, direct launches, graph replay, changing job
+counts and output guards. All six 2048-token full-model runs match the earlier
+split outputs exactly. The kernel microbenchmark shows larger gains than the
+full engine: at 24 jobs its three IQ formats take about 62–67 us instead of
+118–126 us. The microbenchmark is not the decode acceptance result.
+
+Increasing native MTP to five drafts with a 0.30 confidence cutoff was slower
+(115.1 / 75.9 / 126.6 tokens/s). A fixed split draft limit of three produced
+132.9 / 116.0 / 136.1 tokens/s, with the same output IDs, without a clear gain.
+Neither setting is adopted by the reproduction recipe.
 
 The split loader already converts 675 dense/small tensors to Q8_0/F32 for this
 GGUF. Thus, split and the native engine do not have the same arithmetic or
 necessarily the same output tokens. The checks above compare split variants.
 They do not establish quality equivalence with the native BF16 path. The
-2048-token replies hit their length limit; they are not completed-code tests.
+2048-token performance replies hit their length limit.
+
+Separate completed-code tasks cover interval merging (316 checks),
+lexicographically smallest topological sorting (125 checks), and canonical
+uint64 varints (885 checks). Both the native engine and the saved pre-IQ split
+binary passed all 1326 checks. Their output code differs. These three tasks
+are limited functional evidence, not a broad quality evaluation. The reviewed
+outputs, prompts and reports are saved with the measurements; check them using
+`python3 tools/tp_code_quality.py <quality-output-directory>`. The checker
+executes Python and is intended only for reviewed outputs of these fixed tasks.
+The quality runs overlapped CPU compilation and are excluded from speed claims.
 
 A four-second ROCprofiler sample showed matrix staging at 23.15% and the
 window-sum peer kernel at 15.99% of summed kernel duration. This includes
 overlap and waiting across both cards; it is not a wall-time speedup estimate.
 The raw trace is retained with the experiment outputs. Profiler timings are
 excluded from the performance table.
+With IQ reuse, another sample still puts staging at 23.99% and peer window sums
+at 16.38% of summed kernel time. The IQ gate/up calls average about 76–82 us for
+seven-row windows; reducing this alone cannot close the remaining decode gap.
 
 ## Reproduce
 
@@ -145,9 +174,12 @@ context alone does not measure long-context decode.
   changing routes, mixed host/device pointer tables, contiguous weights,
   several strides and guard bytes.
 - Existing split Python suite: 52 tests passed.
+- IQ gate/up reuse: 1024 exact direct/graph checks passed on both physical cards;
+  the full engine builds and matches all six reference token sequences.
+- Both engines passed the three completed-code tasks described above.
 - CUDA has not been built or run here. No SYCL files are changed.
-- Remaining: the 200 tokens/s target, long-context acceptance, completed-code
-  quality checks, broader workload coverage and integration into launch policy.
+- Remaining: the 200 tokens/s target, long-context acceptance, broader quality
+  and workload coverage, and integration into launch policy.
 
 The implementation builds on Strata's existing sFNX split engine. Reference
 projects considered include [vLLM's custom all-reduce](https://github.com/vllm-project/vllm/blob/main/vllm/distributed/device_communicators/custom_all_reduce.py),

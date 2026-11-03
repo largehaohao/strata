@@ -271,6 +271,8 @@ __global__ void __launch_bounds__(MMVQ_THREADS) k_moe_gu(MoeW w, const Job* __re
     job_store<G, TT>(tmp, jb.n, live, row, jb.out, out, w.nrows);
 }
 
+#include "moe_iq_reuse.cuh"
+
 // down: one block per (job, rows_per_block rows). The block first makes its tokens' h = silu(gate) * up (gu rows
 // jb.y[j] of [gate (ffs) | up (ffs)]) as q8_1 in shared memory; thread (row, u) then dots its 32-column unit u of the
 // row with each token's h, and the block sums a row's units into out row jb.out[j]
@@ -491,6 +493,22 @@ void moe_launch(bool down, const MoeW& w, const Job* jobs, const int* njobs, int
     } else {
         if (moe_g<TA>(w.ncols) != 32) throw std::runtime_error("moe gate|up: only 32 lanes a row are compiled (rows of N columns)");
         const dim3 grid((w.nrows + MMVQ_THREADS / 32 - 1) / (MMVQ_THREADS / 32), njobs_max);
+        if constexpr (TA == GGML_TYPE_IQ2_S || TA == GGML_TYPE_IQ3_XXS || TA == GGML_TYPE_IQ3_S) {
+            static const long long reuse = env_int("FNX_IQ_REUSE", 0);
+            if (reuse != 0 && reuse != 1) throw std::runtime_error("FNX_IQ_REUSE: expected 0 or 1");
+            if (reuse) {
+#define FNX_IQR(t) case t: k_moe_gu_iq<TA, t><<<grid, MMVQ_THREADS, 0, s>>>(w, jobs, njobs, (const block_q8_1*) in, out); break
+                switch (T) {
+                    FNX_IQR(1); FNX_IQR(2); FNX_IQR(3); FNX_IQR(4);
+                    FNX_IQR(5); FNX_IQR(6); FNX_IQR(7); FNX_IQR(8);
+                    FNX_IQR(9); FNX_IQR(10); FNX_IQR(11); FNX_IQR(12);
+                    FNX_IQR(13); FNX_IQR(14); FNX_IQR(15); FNX_IQR(16);
+                    default: throw std::runtime_error("moe gate|up: T out of range");
+                }
+#undef FNX_IQR
+                return;
+            }
+        }
         gu_launch<TA, 32>(T, grid, s, w, jobs, njobs, (const block_q8_1*) in, out);
     }
 }
