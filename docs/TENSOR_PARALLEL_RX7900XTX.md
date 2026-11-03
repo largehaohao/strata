@@ -75,6 +75,15 @@ not replaced. All new execution paths are opt-in.
   80 blocks. The default remains 96-row groups. HIP HC timeouts use the device's
   wall-clock rate, since the previous cycle counter is unreliable on RDNA3.
 
+`FNX_STATIC_CACHE_FUSED_DN=64` fills missing down weights inside the IQ gate/up
+launch: 64 prefix blocks copy bytes while the remaining blocks compute the
+already resident gate/up matrices. The preceding cache-copy launch fills only
+gate/up, and kernel completion orders down reads. There is no additional stream,
+event or grid barrier. This requires the static cache and 16-lane IQ reuse;
+other expert types, prefill and the MTP layer keep their existing paths. Zero
+(the default) disables it; 1–256 copy blocks are accepted. All original integer
+operations, scaling and floating-point reduction order are retained.
+
 `FNX_PF_ROWS=256` reduces prefill scratch compared with the existing default
 4096. This allowed the cold allocation to fall from 16 to 14 GiB. With staging,
 a 32768 context and MTP, only about 288 MiB remained free per card at startup.
@@ -116,6 +125,7 @@ uses a forced continuation.
 | Same, 1024-slot cold cache, 16 GiB cold, two runs | 174.4–177.9 | 153.2–155.7 | 181.8–183.6 |
 | Same, release copied GGUF conversions, two runs | 177.7–178.0 | 156.1–156.2 | 183.6–183.8 |
 | Same, compact HC for 1–12 rows, two runs | 179.7–180.3 | 157.9–158.3 | 186.2–186.4 |
+| Same, fused down-weight copy in IQ gate/up, two runs | 181.9–182.2 | 158.9–159.1 | 188.8–189.0 |
 
 Values are tokens/s from the engine's reported decode time. The benchmark
 also records client time, time to first token, exact input/output token IDs,
@@ -186,6 +196,17 @@ sequences match and decode major faults were zero. See `bench-hc-hybrid` and
 `bench-hc-hybrid-control`. The complete-code tasks also matched their reviewed
 token IDs and passed all 1326 checks. The 494-token varint task measured
 203.95 tokens/s; the broader 2048-token panel still falls short of 200.
+
+Fusing down-weight copies into IQ gate/up measured **175.68 tokens/s** with
+64 copy blocks, versus **173.80** with fusion disabled in the same binary
+(**1.08%** higher). Every measured token matched and all six decode runs had
+zero major faults. See `bench-cache-fused64` and `bench-cache-fused-control`.
+The three complete-code tasks matched their reviewed token IDs and passed all
+1326 checks (`quality-cache-fused64`); varint measured 206.22 tokens/s. The
+broader panel still does not meet the target. Using the existing
+`FNX_RING_GRID=80` alongside fusion measured 176.27 tokens/s with identical
+outputs, only 0.33% above the default grid. This small difference is not treated
+as an established improvement and the reproduction recipe keeps the default.
 
 The exact token records and the calibration profile are in
 [`bench/results/2026-11-03-rx7900xtx-tensor-parallel`](../bench/results/2026-11-03-rx7900xtx-tensor-parallel/).
@@ -367,7 +388,7 @@ FNX_MOE_STAGE=0 FNX_PF_ROWS=256 \
 FNX_IQ_REUSE=1 FNX_IQ_GROUP=16 FNX_MOE_PRE_ROWS=1 \
 FNX_STATIC_HOST_CACHE=1 FNX_EMBED_WARM_AFTER_LOAD=1 \
 FNX_RELEASE_COPIED_WEIGHTS=1 \
-FNX_HC_ROW_GROUP=64 \
+FNX_HC_ROW_GROUP=64 FNX_STATIC_CACHE_FUSED_DN=64 \
 FNX_EXPERT_PROFILE="$PWD/bench/results/2026-11-03-rx7900xtx-tensor-parallel/swift-decode-routes.bin" \
 python3 tools/tp_decode_bench.py \
   --exe build-tensor-parralize/src/split/strata-split-2 \
@@ -423,6 +444,11 @@ context alone does not measure long-context decode.
   covering both lane groups and the fallback. Guard initialization is explicitly
   ordered on the compute stream.
 - Packed IQ signs: all 2048 exact direct/graph checks passed again on both cards.
+- Fused down copy: 3584 exact gate/up comparisons passed on both cards, including
+  1536 with down-byte and guard checks. These cover T=1..16, 1/32/64/256 copy
+  blocks, coherent and non-coherent host backing, nonzero global expert/slot
+  offsets, changing lists and host bytes, empty GU jobs with nonempty copies,
+  empty copies, and graph replay.
 - Cold decode cache: 2304 exact checks passed on both cards, with 160/256/1024 slots,
   four layer sizes, changing routes, eviction, zero/max jobs, all-hot/all-cold
   and mixed placement, coherent/non-coherent backing, guards and graph replay.

@@ -112,17 +112,36 @@ __device__ __forceinline__ float iq_dot32(const IqDot32& w, const block_q8_1& x)
     return d * sum;
 }
 
-template <ggml_type TA, int TT, int G = 32>
+template <ggml_type TA, int TT, int G = 32, bool COPY = false>
 __global__ void __launch_bounds__(MMVQ_THREADS) k_moe_gu_iq(
     MoeW w, const Job* __restrict__ jobs, const int* __restrict__ njobs,
-    const block_q8_1* __restrict__ y, float* __restrict__ out) {
-    const int ji = blockIdx.y;
+    const block_q8_1* __restrict__ y, float* __restrict__ out, CacheDownCopy copy = {}) {
+    int row_block = blockIdx.x, ji = blockIdx.y;
+    if constexpr (COPY) {
+        // Prefix blocks read RAM while the remaining blocks compute with the
+        // already resident gate/up weights. No grid barrier: kernel completion
+        // orders every copied down byte before the subsequent down launch.
+        if ((int) blockIdx.x < copy.blocks) {
+            const size_t per = copy.bytes / 16;
+            for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+                 i < (size_t) copy.list[0] * per; i += (size_t) copy.blocks * blockDim.x) {
+                const int g = copy.list[1 + i / per];
+                char* dst = copy.pool + (size_t) (copy.slots[g] - copy.slot0) * copy.slot_bytes + copy.offset;
+                reinterpret_cast<uint4*>(dst)[i % per] = reinterpret_cast<const uint4*>(copy.host[g])[i % per];
+            }
+            return;
+        }
+        const int rows = (w.nrows + MMVQ_THREADS / G - 1) / (MMVQ_THREADS / G);
+        const int block = blockIdx.x - copy.blocks;
+        row_block = block % rows;
+        ji = block / rows;
+    }
     if (ji >= *njobs) return;
     __shared__ Job jb;
     if (threadIdx.x == 0) jb = jobs[ji];
     __syncthreads();
     static_assert(G == 16 || G == 32, "IQ lanes per row");
-    const int row = blockIdx.x * (MMVQ_THREADS / G) + threadIdx.x / G;
+    const int row = row_block * (MMVQ_THREADS / G) + threadIdx.x / G;
     const bool live = row < w.nrows;
     const char* wr = moe_expert(w, jb.w) + (size_t) (live ? row : 0) * w.row_a;
     // A 16-lane row keeps both halves of the original 32-lane sums separately.

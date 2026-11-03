@@ -471,7 +471,7 @@ void gu_launch(int T, dim3 grid, cudaStream_t s, const MoeW& w, const Job* jobs,
 
 template <ggml_type TA>
 void moe_launch(bool down, const MoeW& w, const Job* jobs, const int* njobs, int njobs_max, const void* in, float* out,
-                cudaStream_t s, int T) {
+                cudaStream_t s, int T, const CacheDownCopy* copy = nullptr) {
     if (down) {
         if (!unit_ok<TA>(DN_U) || w.ncols / DN_U > DN_MAXB)
             throw std::runtime_error("moe_down: shape or type does not fit the units");
@@ -501,13 +501,21 @@ void moe_launch(bool down, const MoeW& w, const Job* jobs, const int* njobs, int
         const dim3 grid((w.nrows + MMVQ_THREADS / 32 - 1) / (MMVQ_THREADS / 32), njobs_max);
         if constexpr (TA == GGML_TYPE_IQ2_S || TA == GGML_TYPE_IQ3_XXS || TA == GGML_TYPE_IQ3_S) {
             static const long long reuse = env_int("FNX_IQ_REUSE", 0);
+            if (copy && !reuse) throw std::runtime_error("down copy requires FNX_IQ_REUSE=1");
             if (reuse != 0 && reuse != 1) throw std::runtime_error("FNX_IQ_REUSE: expected 0 or 1");
             if (reuse) {
                 static const long long group = env_int("FNX_IQ_GROUP", 32);
                 if (group != 16 && group != 32) throw std::runtime_error("FNX_IQ_GROUP: expected 16 or 32");
                 const dim3 grid16((w.nrows + 7) / 8, njobs_max);
+                if (copy && (group != 16 || copy->blocks < 1 || copy->blocks > 256 ||
+                             !copy->host || !copy->slots || !copy->list || !copy->pool ||
+                             !copy->bytes || copy->bytes % 16 || copy->offset % 16 || copy->slot_bytes % 16 ||
+                             copy->offset > copy->slot_bytes || copy->bytes > copy->slot_bytes - copy->offset))
+                    throw std::runtime_error("invalid IQ down copy descriptor/group");
+                const dim3 fused_grid(grid16.x * grid16.y + (copy ? copy->blocks : 0));
 #define FNX_IQR(t) case t: \
-    if (group == 16) k_moe_gu_iq<TA, t, 16><<<grid16, MMVQ_THREADS, 0, s>>>(w, jobs, njobs, (const block_q8_1*) in, out); \
+    if (copy) k_moe_gu_iq<TA, t, 16, true><<<fused_grid, MMVQ_THREADS, 0, s>>>(w, jobs, njobs, (const block_q8_1*) in, out, *copy); \
+    else if (group == 16) k_moe_gu_iq<TA, t, 16><<<grid16, MMVQ_THREADS, 0, s>>>(w, jobs, njobs, (const block_q8_1*) in, out); \
     else k_moe_gu_iq<TA, t><<<grid, MMVQ_THREADS, 0, s>>>(w, jobs, njobs, (const block_q8_1*) in, out); \
     break
                 switch (T) {

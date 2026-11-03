@@ -3,6 +3,7 @@
 #define FNX_KPART 99
 #include "../src/kernels.cu"
 #include <iostream>
+#include <memory>
 
 namespace fnx {
 std::vector<Q8Twin>& q8_twins() { static std::vector<Q8Twin> empty; return empty; }
@@ -12,12 +13,15 @@ void ck(cudaError_t e, const char* what) {
 
 template <ggml_type TA>
 void launch_test(int T, int cap, const MoeW& w, const Job* jobs, const int* njobs,
-                 const block_q8_1* x, float* out, cudaStream_t stream) {
+                 const block_q8_1* x, float* out, cudaStream_t stream, const CacheDownCopy* copy = nullptr) {
     const dim3 grid((w.nrows + 3) / 4, 48);
-    if (cap == 2) {
+    if (cap >= 2) {
         if constexpr (TA == GGML_TYPE_IQ2_S || TA == GGML_TYPE_IQ3_XXS || TA == GGML_TYPE_IQ3_S) {
             const dim3 grid16((w.nrows + 7) / 8, 48);
-#define GU16_CASE(t) case t: k_moe_gu_iq<TA, t, 16><<<grid16, MMVQ_THREADS, 0, stream>>>(w, jobs, njobs, x, out); break
+            const dim3 fused_grid(grid16.x * grid16.y + (copy ? copy->blocks : 0));
+#define GU16_CASE(t) case t: \
+    if (copy) k_moe_gu_iq<TA, t, 16, true><<<fused_grid, MMVQ_THREADS, 0, stream>>>(w, jobs, njobs, x, out, *copy); \
+    else k_moe_gu_iq<TA, t, 16><<<grid16, MMVQ_THREADS, 0, stream>>>(w, jobs, njobs, x, out); break
             switch (T) {
                 GU16_CASE(1); GU16_CASE(2); GU16_CASE(3); GU16_CASE(4);
                 GU16_CASE(5); GU16_CASE(6); GU16_CASE(7); GU16_CASE(8);
@@ -44,6 +48,62 @@ void launch_test(int T, int cap, const MoeW& w, const Job* jobs, const int* njob
 #undef GU_CASE
     ck(cudaGetLastError(), "gate/up launch");
 }
+
+// The down-copy branch uses global expert IDs and nonzero pool slot offsets.
+// Keep guard bytes around each slot and the complete allocation. Copy-list size
+// intentionally differs from GU job count, including copies with zero GU jobs.
+struct DownCopyTest {
+    static constexpr int count = 48, base = 5, slot0 = 17;
+    CacheDownCopy view;
+    char *host = nullptr, *pool = nullptr;
+    const char** table = nullptr;
+    int *slots = nullptr, *list = nullptr;
+    std::vector<unsigned char> expected, got;
+    DownCopyTest(int T, bool coherent) {
+        const size_t bytes = (1 + T % 3) * 4096 + 16;
+        const size_t stride = bytes + 256;
+#if FNX_HIP
+        ck(hipHostMalloc((void**) &host, count * bytes, coherent ? hipHostMallocCoherent : hipHostMallocNonCoherent), "down host");
+#else
+        ck(cudaMallocHost((void**) &host, count * bytes), "down host");
+#endif
+        expected.resize(count * stride + 256); got.resize(expected.size());
+        ck(cudaMalloc((void**) &pool, expected.size()), "down pool");
+        ck(cudaMalloc((void**) &table, (count + base) * sizeof(char*)), "down table");
+        ck(cudaMalloc((void**) &slots, (count + base) * sizeof(int)), "down slots");
+        ck(cudaMalloc((void**) &list, (count + 1) * sizeof(int)), "down list");
+        std::vector<const char*> ht(count + base);
+        for (int j = 0; j < count; ++j) ht[j + base] = host + j * bytes;
+        ck(cudaMemcpy(table, ht.data(), ht.size() * sizeof(char*), cudaMemcpyHostToDevice), "down table copy");
+        constexpr int blocks[] = {1, 32, 64, 256};
+        view = {table, slots, list, pool + 128, stride, 128, bytes, slot0, blocks[T % 4]};
+    }
+    void prepare(int rep, cudaStream_t stream) {
+        for (size_t j = 0; j < count * view.bytes; ++j) host[j] = (j * 11 + (j >> 8) * 19 + rep * 13) & 255;
+        constexpr int counts[] = {count, 0, 1, 7};
+        const int n = counts[rep % 4];
+        std::vector<int> hs(count + base, -1), hl(count + 1);
+        std::fill(expected.begin(), expected.end(), 0xB3);
+        hl[0] = n;
+        for (int j = 0; j < count; ++j) hs[base + j] = slot0 + (j * 5 + rep * 7) % count;
+        for (int j = 0; j < n; ++j) {
+            const int e = (j * 7 + rep * 11) % count;
+            hl[j + 1] = base + e;
+            std::memcpy(expected.data() + 128 + (hs[base + e] - slot0) * view.slot_bytes + view.offset,
+                        host + e * view.bytes, view.bytes);
+        }
+        ck(cudaMemcpy(slots, hs.data(), hs.size() * sizeof(int), cudaMemcpyHostToDevice), "down slots copy");
+        ck(cudaMemcpy(list, hl.data(), hl.size() * sizeof(int), cudaMemcpyHostToDevice), "down list copy");
+        ck(cudaMemsetAsync(pool, 0xB3, expected.size(), stream), "down guards");
+    }
+    void check() {
+        ck(cudaMemcpy(got.data(), pool, got.size(), cudaMemcpyDeviceToHost), "down read");
+        if (got != expected) throw std::runtime_error("fused down bytes or guards differ");
+    }
+    ~DownCopyTest() {
+        cudaFreeHost(host); cudaFree(pool); cudaFree(table); cudaFree(slots); cudaFree(list);
+    }
+};
 
 template <ggml_type TA>
 void run_type(int dev) {
@@ -81,16 +141,21 @@ void run_type(int dev) {
     ck(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
     std::vector<unsigned char> ref(output_bytes), got(output_bytes);
     for (int T = 1; T <= MAXT; ++T) {
-        for (int cap : {1, 2}) {
+        for (int cap : {1, 2, 3, 4}) {
+            if (cap >= 3 && TA != GGML_TYPE_IQ2_S && TA != GGML_TYPE_IQ3_XXS && TA != GGML_TYPE_IQ3_S) continue;
+            std::unique_ptr<DownCopyTest> dc;
+            if (cap >= 3) dc = std::make_unique<DownCopyTest>(T, cap == 3);
+            const CacheDownCopy* copy = dc ? &dc->view : nullptr;
             cudaGraph_t graph;
             cudaGraphExec_t exec;
             ck(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed), "capture");
-            launch_test<TA>(T, cap, w, dj, dn, dx, candidate, stream);
+            launch_test<TA>(T, cap, w, dj, dn, dx, candidate, stream, copy);
             ck(cudaStreamEndCapture(stream, &graph), "end capture");
             ck(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0), "instantiate");
             constexpr int counts[] = {0, 1, 7, experts};
             for (int rep = 0; rep < 8; ++rep) {
                 const int count = counts[rep % 4];
+                if (dc) dc->prepare(rep, stream);
                 std::vector<Job> jobs(experts);
                 for (int j = 0; j < experts; ++j) {
                     jobs[j].w = (j * 7 + rep * 11) % experts;
@@ -106,8 +171,9 @@ void run_type(int dev) {
                 ck(cudaMemsetAsync(candidate, 0xA5, output_bytes, stream), "candidate guard");
                 launch_test<TA>(T, 0, w, dj, dn, dx, baseline, stream);
                 if ((rep / 4) % 2) ck(cudaGraphLaunch(exec, stream), "graph replay");
-                else launch_test<TA>(T, cap, w, dj, dn, dx, candidate, stream);
+                else launch_test<TA>(T, cap, w, dj, dn, dx, candidate, stream, copy);
                 ck(cudaStreamSynchronize(stream), "wait");
+                if (dc) dc->check();
                 ck(cudaMemcpy(ref.data(), baseline, output_bytes, cudaMemcpyDeviceToHost), "reference read");
                 ck(cudaMemcpy(got.data(), candidate, output_bytes, cudaMemcpyDeviceToHost), "candidate read");
                 if (ref != got) throw std::runtime_error("gate/up bit mismatch or guard overwrite: type " +
@@ -157,5 +223,5 @@ int main() {
         fnx::run_type<GGML_TYPE_IQ3_S>(dev);
         fnx::run_type<GGML_TYPE_IQ4_XS>(dev);
     }
-    std::cout << "MoE gate/up: 2048 exact direct/graph checks passed\n";
+    std::cout << "MoE gate/up: 3584 exact direct/graph checks passed (1536 with down copies and guards)\n";
 }

@@ -283,10 +283,22 @@ void ple_post(float* R, const float* key, const float* value, const float* nk, c
 void router_route(const float* W, const float* x, float* logits, int T, int* topi, float* topw, Job* jobs_gu, Job* jobs_dn,
                   int* njobs, void* st, const ExpertCache* ec = nullptr, int layer = -1, int* list = nullptr, const Q8S* sh_gu = nullptr,
                   int sh_rows = 0, const void* sh_y = nullptr, float* sh_out = nullptr);
+// Down weights to fill beside IQ gate/up arithmetic. The preceding cache plan and
+// gate/up copy must complete first; the list/slots stay fixed until this launch
+// finishes. Bytes and offsets are 16-byte aligned. Only IQ reuse, group 16.
+struct CacheDownCopy {
+    const char* const* host = nullptr;
+    const int* slots = nullptr;
+    const int* list = nullptr;
+    char* pool = nullptr;
+    size_t slot_bytes = 0, offset = 0, bytes = 0;
+    int slot0 = 0, blocks = 0;
+};
 // gu rows of 2*ffs: [gate | up] (A: per-expert stacked rows, stride sa). sh_down (Q4_K experts only): the shared
 // expert's swiglu of sh_gu ([T][2 * sh_ffs]) and down (N rows) into sh_out (row stride N), in the same launch
 void moe_gate_up(const DW& A, size_t sa, const Job* jobs, const int* njobs, int njobs_max, const void* xq, float* gu, void* st,
-                 const Q8S* sh_down = nullptr, int sh_ffs = 0, const float* sh_gu = nullptr, float* sh_out = nullptr);
+                 const Q8S* sh_down = nullptr, int sh_ffs = 0, const float* sh_gu = nullptr, float* sh_out = nullptr,
+                 const CacheDownCopy* copy = nullptr);
 // the same for jobs of up to MAXT rows each, njobs_cap of them at most (the prompt path's)
 void moe_gate_up_jobs(const DW& A, size_t sa, const Job* jobs, const int* njobs, int njobs_cap, const void* xq, float* gu, void* st);
 // the same with BigJobs (njobs_cap of them at most)
@@ -299,9 +311,10 @@ void swiglu_h16(const float* gu, int ffs, int P, uint16_t* h16, void* st);
 void moe_down_mma(const DW& A, size_t sa, const BigJob* jobs, const int* njobs, int njobs_cap, const uint16_t* h16, float* part, void* st);
 // a decode window's layer with an ExpertCache (model.hpp): the experts router_route's plan listed copied in from RAM to
 // their new slots by a grid of the SMs (wide 16-byte reads; the MoE kernels' own reads over the link are latency-bound).
-// With jobs, the plan runs here first, a launch of its own (when router_route did not plan)
+// With jobs, the plan runs here first, a launch of its own (when router_route did not plan).
+// gu_only leaves the down copy to moe_gate_up with CacheDownCopy before any down read.
 void moe_cache(int layer, size_t gu_stride, size_t dn_stride, const ExpertCache& ec, int* list, void* st, const Job* jobs = nullptr,
-               const int* njobs = nullptr, bool padded = false);
+               const int* njobs = nullptr, bool padded = false, bool gu_only = false);
 // pool p's listed experts (list: device, its count then the experts' ids, each with its slot in ec.slot_of already) from
 // their host copies into their slots, one kernel: the arena's fill
 void cache_copy(const ExpertCache& ec, int p, const int* list, void* st);

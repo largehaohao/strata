@@ -71,6 +71,10 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         throw std::runtime_error("FNX_STATIC_CACHE_SLOTS: 0 or a multiple of 32 from 160 to 4096");
     if (static_slots && (env_int("FNX_STATIC_EXPERTS", 0) != 1 || m.resident.size() != NL || lanes != 1))
         throw std::runtime_error("FNX_STATIC_CACHE_SLOTS requires static experts and one lane");
+    const long long fused_dn = env_int("FNX_STATIC_CACHE_FUSED_DN", 0);
+    if (fused_dn < 0 || fused_dn > 256 ||
+        (fused_dn && (!static_slots || env_int("FNX_IQ_REUSE", 0) != 1 || env_int("FNX_IQ_GROUP", 32) != 16)))
+        throw std::runtime_error("FNX_STATIC_CACHE_FUSED_DN: 0..256 blocks, needs static cache and IQ reuse group 16");
     hc1_rows();   // FNX_HC1 checked now, not at the first hc read (inside a graph capture)
     pf_jobs_ = pf_c_ * TOPK / PF_JOB + NEXP;   // jobs of up to PF_JOB pairs per expert, at most
     set_prompt_rows(pf_c_);
@@ -933,6 +937,9 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
     // the slots as they were, so with it the plan runs after, in moe_cache)
     const bool static_live = b.static_cache.n_slots && lyr >= 0 && lyr < NL;
     const ExpertCache& ec = static_live ? b.static_cache : w.ec;
+    static const int fused_dn_blocks = (int) env_int("FNX_STATIC_CACHE_FUSED_DN", 0);
+    const bool fused_dn = static_live && fused_dn_blocks &&
+        (L.gu_e.type == T_IQ2_S || L.gu_e.type == T_IQ3_XXS || L.gu_e.type == T_IQ3_S);
     const bool live = (static_live || cache_live()) && lyr >= 0 && lyr < NL;
     const bool plan_in_router = live && !b.probe_cnt;
     router_route(L.router, b.mixed, b.logits, T, b.topi, b.topw, b.jobs_gu, b.jobs_dn, b.njobs, b.st, plan_in_router ? &ec : nullptr,
@@ -950,7 +957,7 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
             }
         }
         // the planned experts copied into their slots before the MoE kernels read the layer's tables
-        if (live) moe_cache(l, L.gu_e_stride, L.down_e_stride, ec, b.cache_list, b.st, plan_in_router ? nullptr : b.jobs_gu, b.njobs, static_live);
+        if (live) moe_cache(l, L.gu_e_stride, L.down_e_stride, ec, b.cache_list, b.st, plan_in_router ? nullptr : b.jobs_gu, b.njobs, static_live, fused_dn);
     }
     // MTP also calls ffn_half with a layer outside the main model's layer array.
     const unsigned char* hot = b.moe_stage_hot && lyr >= 0 && lyr < NL
@@ -961,8 +968,14 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
         down_source.ep = ec.ep_dn + lyr * NEXP;
     }
     const DW gu = stage_moe(gu_source, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.moe_stage, b.moe_stage_ep, b.st, hot);
+    CacheDownCopy copy;
+    if (fused_dn) {
+        const int p = ec.pool_of[lyr];
+        copy = {ec.host_dn, ec.slot_of, b.cache_list, ec.pool[p], ec.slot_bytes[p], ec.dn_off[p],
+                L.down_e_stride, ec.s0[p], fused_dn_blocks};
+    }
     if (sh_in) moe_gate_up(gu, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st, &L.sh_down.s, ffs, b.sh_gu, b.part + (size_t) P * N);
-    else moe_gate_up(gu, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st);
+    else moe_gate_up(gu, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st, nullptr, 0, nullptr, nullptr, fused_dn ? &copy : nullptr);
     const DW down = stage_moe(down_source, L.down_e_stride, b.jobs_dn, b.njobs, P, b.moe_stage, b.moe_stage_ep, b.st, hot);
     moe_down(down, L.down_e_stride, b.jobs_dn, b.njobs, P, b.gu, b.part, b.st);
     if (!sh_in) ck(cudaStreamWaitEvent(b.st, b.join, 0), "join wait");

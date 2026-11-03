@@ -1880,14 +1880,14 @@ void cache_copy(const ExpertCache& ec, int p, const int* list, void* st) {
     k_cache_copy<<<640, 256, 0, (cudaStream_t) st>>>(ec, p, list, ec.dn_off[p], ec.slot_bytes[p] - ec.dn_off[p]);
     ck_launch("cache_copy");
 }
-void moe_cache(int layer, size_t gu_stride, size_t dn_stride, const ExpertCache& ec, int* list, void* st, const Job* jobs, const int* njobs, bool padded) {
+void moe_cache(int layer, size_t gu_stride, size_t dn_stride, const ExpertCache& ec, int* list, void* st, const Job* jobs, const int* njobs, bool padded, bool gu_only) {
     const int p = ec.pool_of[layer];
     const bool fits = padded ? gu_stride <= ec.dn_off[p] && dn_stride <= ec.slot_bytes[p] - ec.dn_off[p]
                              : gu_stride == ec.dn_off[p] && ec.dn_off[p] + dn_stride == ec.slot_bytes[p];
     if (!fits || gu_stride % 16 || dn_stride % 16)
         throw std::runtime_error("moe_cache: the layer's experts do not fit its pool");
     if (jobs) k_cache_plan<<<1, 32, 0, (cudaStream_t) st>>>(jobs, njobs, layer, ec, list);
-    k_cache_copy<<<160, 256, 0, (cudaStream_t) st>>>(ec, p, list, gu_stride, dn_stride);
+    k_cache_copy<<<160, 256, 0, (cudaStream_t) st>>>(ec, p, list, gu_stride, gu_only ? 0 : dn_stride);
     ck_launch("moe_cache");
 }
 namespace {
@@ -2153,7 +2153,9 @@ void router_route(const float* W, const float* x, float* logits, int T, int* top
 #if FNX_KPART == 2
 namespace {
 void moe_mm(bool down, const DW& A, size_t sa, const Job* jobs, const int* njobs, int njobs_max, const void* in, void* out,
-            void* st, int tt = 0) {
+            void* st, int tt = 0, const CacheDownCopy* copy = nullptr) {
+    if (copy && (down || (A.type != T_IQ2_S && A.type != T_IQ3_XXS && A.type != T_IQ3_S)))
+        throw std::runtime_error("moe: down copy requires IQ gate/up");
     const int T = tt ? tt : njobs_max / TOPK;   // the most rows a job has
     const MoeW w{(const char*) A.p, sa, A.row_bytes, A.n_out, A.n_in, A.ep};
     cudaStream_t s = (cudaStream_t) st;
@@ -2168,9 +2170,9 @@ void moe_mm(bool down, const DW& A, size_t sa, const Job* jobs, const int* njobs
         case T_Q8_0: moe_launch<GGML_TYPE_Q8_0>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
         case T_IQ4_NL: moe_launch<GGML_TYPE_IQ4_NL>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
         case T_IQ4_XS: moe_launch<GGML_TYPE_IQ4_XS>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
-        case T_IQ3_S: moe_launch<GGML_TYPE_IQ3_S>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
-        case T_IQ3_XXS: moe_launch<GGML_TYPE_IQ3_XXS>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
-        case T_IQ2_S: moe_launch<GGML_TYPE_IQ2_S>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
+        case T_IQ3_S: moe_launch<GGML_TYPE_IQ3_S>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T, copy); break;
+        case T_IQ3_XXS: moe_launch<GGML_TYPE_IQ3_XXS>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T, copy); break;
+        case T_IQ2_S: moe_launch<GGML_TYPE_IQ2_S>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T, copy); break;
         default: throw std::runtime_error("moe: expert type " + std::to_string(A.type) + " not handled");
     }
     ck_launch(down ? "moe_down" : "moe_gate_up");
@@ -2195,9 +2197,10 @@ __global__ void k_swiglu_stacked(const float* gu, block_q8_1* hq, int ffs, int8_
 }  // namespace
 
 void moe_gate_up(const DW& A, size_t sa, const Job* jobs, const int* njobs, int njobs_max, const void* xq, float* gu, void* st,
-                 const Q8S* sh_down, int sh_ffs, const float* sh_gu, float* sh_out) {
+                 const Q8S* sh_down, int sh_ffs, const float* sh_gu, float* sh_out, const CacheDownCopy* copy) {
+    if (copy && sh_down) throw std::runtime_error("moe_gate_up: down copy cannot share Q4_K launch");
     if (!sh_down) {
-        moe_mm(false, A, sa, jobs, njobs, njobs_max, xq, gu, st);
+        moe_mm(false, A, sa, jobs, njobs, njobs_max, xq, gu, st, 0, copy);
         return;
     }
     if (A.type != T_Q4_K) throw std::runtime_error("moe_gate_up: the shared expert rides only in the Q4_K experts' launch");

@@ -1,0 +1,50 @@
+```python
+def merge_intervals(intervals):
+    """
+    Merge overlapping closed intervals.
+    
+    Args:
+        intervals: An iterable of (start, end) pairs of integers.
+        
+    Returns:
+        A sorted list of tuples representing merged intervals.
+        
+    Raises:
+        ValueError: If any interval has start > end.
+    """
+    # Convert to list to avoid mutating input and allow multiple passes
+    interval_list = list(intervals)
+    
+    # Validate intervals
+    for start, end in interval_list:
+        if start > end:
+            raise ValueError(f"Invalid interval: start ({start}) > end ({end})")
+    
+    if not interval_list:
+        return []
+    
+    # Sort by start, then by end
+    sorted_intervals = sorted(interval_list, key=lambda x: (x[0], x[1]))
+    
+    merged = []
+    current_start, current_end = sorted_intervals[0]
+    
+    for start, end in sorted_intervals[1:]:
+        # Check if intervals overlap (including shared endpoints)
+        # For closed intervals, [a,b] and [c,d] overlap if c <= b
+        # We do NOT merge disjoint adjacent integer intervals, so (1,2) and (3,4) remain separate.
+        # (1,2) and (3,4): 3 > 2, so they don't overlap.
+        # (1,2) and (2,3): 2 <= 2, so they overlap and merge to (1,3).
+        if start <= current_end:
+            # Overlapping, extend the current interval
+            current_end = max(current_end, end)
+        else:
+            # Non-overlapping, add current interval and start new one
+            merged.append((current_start, current_end))
+            current_start, current_end = start, end
+    
+    # Add the last interval
+    merged.append((current_start, current_end))
+    
+    return merged
+```<|im_end|>
