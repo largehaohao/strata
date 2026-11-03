@@ -2303,8 +2303,22 @@ void q8s_launch(const Q8Segs& g, int rows, int cols, const block_q8_1* y, int T,
 template <bool SEG>
 void q8s_run(const Q8Segs& g, int rows, int cols, const void* y, int T, void* st) {
     if (cols % 16) throw std::runtime_error("q8s_gemv: columns must be a multiple of 16");
+    static const int row_group = [] {
+        const long long n = env_int("FNX_Q8S_ROW_GROUP", 0);
+        if (n != 0 && n != 1 && n != 2 && n != 4)
+            throw std::runtime_error("FNX_Q8S_ROW_GROUP: expected 0, 1, 2 or 4");
+        return (int) n;
+    }();
     const block_q8_1* yq = (const block_q8_1*) y;
     cudaStream_t s = (cudaStream_t) st;
+    // Optional large-matrix override; small projections retain their existing dispatch.
+    if (rows >= 8192 && row_group) {
+        if (row_group == 1) q8s_launch<1, SEG>(g, rows, cols, yq, T, s);
+        else if (row_group == 2) q8s_launch<2, SEG>(g, rows, cols, yq, T, s);
+        else q8s_launch<4, SEG>(g, rows, cols, yq, T, s);
+        ck_launch("q8s_gemv row group");
+        return;
+    }
     // rows per warp: four for big matrices (activation loads shared by more rows), one when that leaves few blocks. The
     // segmented variant only for its one use, q/k/v (8192 rows and more): fewer kernels to compile
     if constexpr (SEG) {

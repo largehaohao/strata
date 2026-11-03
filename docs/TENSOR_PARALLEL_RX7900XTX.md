@@ -88,6 +88,11 @@ not replaced. All new execution paths are opt-in.
   checks residency across the selected compact kernels and caps their grid at
   80 blocks. The default remains 96-row groups. HIP HC timeouts use the device's
   wall-clock rate, since the previous cycle counter is unreliable on RDNA3.
+- `FNX_Q8S_ROW_GROUP=2` gives each warp two output rows for Q8 split-layout
+  matrices with at least 8192 rows, including segmented attention projections.
+  Smaller projections keep their original dispatch. Zero (the default) keeps
+  all original choices; 1, 2 and 4 are accepted overrides. Integer operations,
+  scaling and each row's reduction order are unchanged.
 
 `FNX_STATIC_CACHE_FUSED_DN=64` fills missing down weights inside the IQ gate/up
 launch: 64 prefix blocks copy bytes while the remaining blocks compute the
@@ -142,6 +147,7 @@ uses a forced continuation.
 | Same, fused down-weight copy in IQ gate/up, two runs | 181.9–182.2 | 158.9–159.1 | 188.8–189.0 |
 | Same, two cache pools within the existing byte budget, two runs | 184.2–184.5 | 160.6–160.7 | 192.9–193.2 |
 | Same, context-sized KV pool and 15.5 GiB cold backing, two runs | 186.5–186.8 | 161.5–162.0 | 196.0–196.3 |
+| Same, two-row groups for large Q8 projections, two runs | 189.0–189.7 | 164.7–165.0 | 198.6–198.7 |
 
 Values are tokens/s from the engine's reported decode time. The benchmark
 also records client time, time to first token, exact input/output token IDs,
@@ -255,6 +261,14 @@ and 317.8 ms. This short list-generation check verifies operation near the
 context boundary; its 202.98 tokens/s is not the acceptance panel result.
 See `near-context-kv-context`, `near-context-kv-control`, and
 `kv-context-checks.json`. The configured 204800 context remains untested.
+
+Two-row Q8 groups measured **183.14 tokens/s**, against **180.71** with the
+original dispatch in the same binary (**1.34%** higher). All six output token
+sequences match and decode major faults are zero. See `bench-q8-group2` and
+`bench-q8-group-control`. These gains are specific to the tested shapes and
+hardware; the option does not change defaults on other backends.
+The reviewed code tasks also retain their exact token IDs and pass all 1326
+checks (`quality-q8-group2`); the varint task measured 212.60 tokens/s.
 
 The exact token records and the calibration profile are in
 [`bench/results/2026-11-03-rx7900xtx-tensor-parallel`](../bench/results/2026-11-03-rx7900xtx-tensor-parallel/).
@@ -438,6 +452,7 @@ FNX_IQ_REUSE=1 FNX_IQ_GROUP=16 FNX_MOE_PRE_ROWS=1 \
 FNX_STATIC_HOST_CACHE=1 FNX_EMBED_WARM_AFTER_LOAD=1 \
 FNX_RELEASE_COPIED_WEIGHTS=1 FNX_KV_CONTEXT_ONLY=1 \
 FNX_HC_ROW_GROUP=64 FNX_STATIC_CACHE_FUSED_DN=64 \
+FNX_Q8S_ROW_GROUP=2 \
 FNX_EXPERT_PROFILE="$PWD/bench/results/2026-11-03-rx7900xtx-tensor-parallel/swift-decode-routes.bin" \
 python3 tools/tp_decode_bench.py \
   --exe build-tensor-parralize/src/split/strata-split-2 \
@@ -513,6 +528,9 @@ context alone does not measure long-context decode.
 - Context-sized int8 KV: the complete panel and reviewed code tasks match
   their reference token IDs, with 1326 code checks passing. A real 32688-token
   input plus 64-token generation matches the original pool at context 32768.
+- Q8 row groups: 6144 bit-exact direct/graph comparisons passed on both cards
+  across settings 0/1/2/4, T=1..16, packed/split activations, segmented and plain
+  matrices, uneven final rows, changed/zero inputs and output guards.
 - CUDA has not been built or run here. No SYCL files are changed.
 - Remaining: the 200 tokens/s target, long-context acceptance, broader quality
   and workload coverage, and integration into launch policy.

@@ -135,11 +135,11 @@ else()
   set_target_properties(split_moe_stage_test PROPERTIES CUDA_STANDARD 17 CUDA_ARCHITECTURES "${STRATA_SPLIT_ARCH}-real")
 endif()
 
-# Explicit MoE kernel comparisons, with the engine's headers and arithmetic flags.
+# Explicit kernel comparisons, with the engine's headers and arithmetic flags.
 list(GET STRATA_SPLIT_CARDS 0 _moe_cards)
-foreach(_kind iq down cache)
-  set(_target split_moe_${_kind}_test)
-  set(_source ${_sp}/tools/moe_${_kind}_test.cu)
+foreach(_kind moe_iq moe_down moe_cache dense_q8)
+  set(_target split_${_kind}_test)
+  set(_source ${_sp}/tools/${_kind}_test.cu)
   add_executable(${_target} EXCLUDE_FROM_ALL ${_source})
   foreach(_prop INCLUDE_DIRECTORIES COMPILE_DEFINITIONS COMPILE_OPTIONS LINK_LIBRARIES)
     get_target_property(_value strata-split-${_moe_cards} ${_prop})
