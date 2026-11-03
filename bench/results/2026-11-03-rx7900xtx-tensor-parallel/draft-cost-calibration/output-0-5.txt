@@ -1,0 +1,113 @@
+```python
+"""
+Directed Graph Library with topological sorting, cycle detection,
+strongly connected components, and shortest paths for nonnegative weights.
+
+Complexity Analysis:
+- Topological Sort (Kahn's algorithm): O(V + E)
+- Cycle Detection (via topological sort): O(V + E)
+- Strongly Connected Components (Kosaraju's algorithm): O(V + E)
+- Shortest Paths (Dijkstra's algorithm): O((V + E) log V) with binary heap
+
+Invariants:
+1. All nodes in the graph are unique.
+2. Edges are directed: (u, v) means edge from u to v.
+3. Edge weights are nonnegative for shortest path algorithms.
+4. Topological sort is only valid for DAGs (no cycles).
+5. SCCs partition all nodes into maximal strongly connected subgraphs.
+6. Dijkstra's algorithm requires nonnegative edge weights.
+"""
+
+import heapq
+from collections import defaultdict, deque
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+
+class DirectedGraph:
+    """
+    A directed graph supporting:
+    - Adding nodes and edges
+    - Topological sorting (Kahn's algorithm)
+    - Cycle detection
+    - Strongly connected components (Kosaraju's algorithm)
+    - Shortest paths with nonnegative weights (Dijkstra's algorithm)
+    """
+
+    def __init__(self):
+        # Adjacency list: node -> list of (neighbor, weight)
+        self._adj: Dict[Any, List[Tuple[Any, float]]] = defaultdict(list)
+        # Set of all nodes
+        self._nodes: Set[Any] = set()
+        # Reverse adjacency list for Kosaraju's algorithm
+        self._rev_adj: Dict[Any, List[Any]] = defaultdict(list)
+
+    def add_node(self, node: Any) -> None:
+        """Add a node to the graph."""
+        self._nodes.add(node)
+        # Ensure the node exists in adjacency lists
+        if node not in self._adj:
+            self._adj[node] = []
+        if node not in self._rev_adj:
+            self._rev_adj[node] = []
+
+    def add_edge(self, u: Any, v: Any, weight: float = 1.0) -> None:
+        """
+        Add a directed edge from u to v with given weight.
+        Automatically adds nodes u and v if they don't exist.
+        
+        Invariant: weight must be nonnegative for shortest path algorithms.
+        """
+        if weight < 0:
+            raise ValueError("Edge weights must be nonnegative for shortest path algorithms.")
+        self.add_node(u)
+        self.add_node(v)
+        self._adj[u].append((v, weight))
+        self._rev_adj[v].append(u)
+
+    def get_nodes(self) -> Set[Any]:
+        """Return all nodes in the graph."""
+        return set(self._nodes)
+
+    def get_neighbors(self, node: Any) -> List[Tuple[Any, float]]:
+        """Return list of (neighbor, weight) for outgoing edges from node."""
+        return list(self._adj.get(node, []))
+
+    def get_in_neighbors(self, node: Any) -> List[Any]:
+        """Return list of incoming neighbors for node."""
+        return list(self._rev_adj.get(node, []))
+
+    def has_node(self, node: Any) -> bool:
+        """Check if node exists in the graph."""
+        return node in self._nodes
+
+    def has_edge(self, u: Any, v: Any) -> bool:
+        """Check if directed edge from u to v exists."""
+        for neighbor, _ in self._adj.get(u, []):
+            if neighbor == v:
+                return True
+        return False
+
+    def get_edge_weight(self, u: Any, v: Any) -> Optional[float]:
+        """Return the weight of edge from u to v, or None if edge doesn't exist."""
+        for neighbor, weight in self._adj.get(u, []):
+            if neighbor == v:
+                return weight
+        return None
+
+    def topological_sort(self) -> List[Any]:
+        """
+        Perform topological sort using Kahn's algorithm.
+        
+        Returns:
+            List of nodes in topological order.
+        
+        Raises:
+            ValueError: If the graph contains a cycle.
+        
+        Complexity: O(V + E)
+        """
+        # Compute in-degrees
+        in_degree: Dict[Any, int] = {node: 0 for node in self._nodes}
+        for u in self._adj:
+            for v, _ in self._adj[u]:
+                in_degree[v

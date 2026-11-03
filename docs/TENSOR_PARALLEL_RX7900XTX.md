@@ -1,8 +1,11 @@
 # Dual RX 7900 XTX decode experiments
 
-Work in progress on `tensor-parralize`, based on main
-`ffa80d73133ea5c548aefe57889a16e8085a938f`. The target is **200 tokens/s for one
-request on Swift-1.5 IQ3_S**. This target has **not** been reached.
+Implemented on `tensor-parralize`, based on main
+`ffa80d73133ea5c548aefe57889a16e8085a938f`. The defined single-request panel on
+Swift-1.5 IQ3_S reached **200.88 tokens/s** across two independent engine runs
+(**200.93** and **200.83**). Each run contains code, prose and edit prompts,
+2048 output tokens each, repeated twice, with context 32768 and warmup excluded.
+This is a weighted panel result, not a 200 tokens/s minimum for every prompt.
 
 Main already contains tensor parallelism in `src/split`. These changes make
 that engine usable with this model on two 24 GiB cards and a 64 GiB host, then
@@ -104,8 +107,8 @@ not replaced. All new execution paths are opt-in.
   borrow the allocation as before and may allocate additional scratch if
   needed. At the tested prefill size, net savings are 744 MiB per card.
 
-`FNX_STATIC_CACHE_FUSED_DN=64` fills missing down weights inside the IQ gate/up
-launch: 64 prefix blocks copy bytes while the remaining blocks compute the
+`FNX_STATIC_CACHE_FUSED_DN=16` fills missing down weights inside the IQ gate/up
+launch: 16 prefix blocks copy bytes while the remaining blocks compute the
 already resident gate/up matrices. The preceding cache-copy launch fills only
 gate/up, and kernel completion orders down reads. There is no additional stream,
 event or grid barrier. This requires the static cache and 16-lane IQ reuse;
@@ -138,6 +141,13 @@ head. The Flash-Next HIP Q4 reader uses eight lanes per output row for large
 matrices. This changes draft predictions and can change acceptance; it is
 not an exact replacement for the draft head's arithmetic. On these cards,
 each draft head shrinks from 137.87 to 72.99 MiB.
+
+`FNX_MTP_LAST_HEAD=1` computes only the last output-head row in a single-request
+MTP window. The earlier rows still update the complete draft hidden state;
+only their unused vocabulary projections and argmax work are skipped. The
+last row stays in its original buffers for penalties, sampling and host
+readback. The option requires a Q4 draft head, defaults to zero, and leaves
+the separate batched-lane path unchanged.
 
 ## Measurements so far
 
@@ -177,6 +187,8 @@ uses a forced continuation.
 | Same, BF16-derived Q4 draft experts, two runs | 196.0–196.4 | 167.5–167.7 | 200.7–201.3 |
 | Same, logged GDN rollback and 14 GiB cold backing, two runs | 205.8–206.2 | 173.3–173.7 | 212.6–213.2 |
 | Same, Q4 draft head and 13.875 GiB cold backing, two runs | 205.3–205.8 | 177.9–178.5 | 214.0–214.4 |
+| Same, 32 copy blocks and last-row draft head, four passes in two independent runs | 207.1–208.4 | 179.6–180.0 | 216.7–217.4 |
+| Same, 16 copy blocks, four passes in two independent runs | 208.1–209.0 | 179.9–180.4 | 217.8–217.9 |
 
 Values are tokens/s from the engine's reported decode time. The benchmark
 also records client time, time to first token, exact input/output token IDs,
@@ -204,7 +216,7 @@ Keeping cold-only staging with these same cache/refresh flags measured
 identical token IDs. The reproduction recipe therefore uses direct reads.
 The same short prompts' prefill times fell from about 590 / 702 / 888 ms to
 200 / 208 / 285 ms on the second pass. These are measurements of this workload,
-not a general prefill throughput claim. The **200 tokens/s target remains open**.
+not a general prefill throughput claim. At this step the 200 tokens/s target was still open.
 The separate two-pass native comparison measured 127.53 tokens/s weighted,
 versus 147.60 for the cached split (15.7% higher for these tasks). Native output
 and draft acceptance can vary across repeated greedy requests; split/native
@@ -246,7 +258,7 @@ the flag off in the same binary (1.33% higher). All six measured output token
 sequences match and decode major faults were zero. See `bench-hc-hybrid` and
 `bench-hc-hybrid-control`. The complete-code tasks also matched their reviewed
 token IDs and passed all 1326 checks. The 494-token varint task measured
-203.95 tokens/s; the broader 2048-token panel still falls short of 200.
+203.95 tokens/s; at this step the broader 2048-token panel was still below 200.
 
 Fusing down-weight copies into IQ gate/up measured **175.68 tokens/s** with
 64 copy blocks, versus **173.80** with fusion disabled in the same binary
@@ -271,7 +283,7 @@ and 460800 down bytes. Startup/warmup left 146 MiB free on each card. All six
 output token sequences match and decode major faults are zero. The reviewed
 code tasks also match and pass all 1326 checks; varint measured 208.30 tokens/s.
 See `bench-cache-groups2`, `bench-cache-groups-control`, and
-`quality-cache-groups2`. The broader 200 tokens/s target remains open.
+`quality-cache-groups2`. The broader 200 tokens/s target was still open at this step.
 
 Sizing the KV pool to the requested context, then reducing cold backing to
 15.5 GiB, measured **180.30 tokens/s** versus **178.37** with the preceding
@@ -311,7 +323,7 @@ held-out checks were not used to select expert residency. See `bench-mtp-q4`,
 `quality-mtp-q4`, `heldout-mtp-q2`, `heldout-mtp-q4`, and `mtp-q4-conversion.json`.
 Raising the Q4 draft limit from six to eight measured 186.70 tokens/s, with
 identical target outputs; the recipe retains six (`bench-mtp-q4-spec8`). The
-broader 200 tokens/s target remains open.
+broader 200 tokens/s target was still open at this step.
 
 Logged GDN rollback with the preceding 15.5 GiB cold backing measured
 **189.85 tokens/s**. Startup/warmup left 828 MiB free per card. Moving another
@@ -323,7 +335,7 @@ reference; all six measured requests have zero decode major faults. The
 14 GiB recipe leaves 68 MiB free per card. See `bench-gdn-replay-ram15p5`,
 `bench-gdn-replay-ram14`, and `bench-gdn-replay-control`.
 The three reviewed code tasks retain their token IDs and pass all 1326 checks
-(`quality-gdn-replay`); varint measured 228.30 tokens/s. The full panel remains
+(`quality-gdn-replay`); varint measured 228.30 tokens/s. At this step the full panel was still
 below 200 tokens/s.
 A real 32688-token input plus 64 generated tokens also matches the same-binary
 full-snapshot control exactly: prefill/decode took 45.66 s/271.0 ms, versus
@@ -339,10 +351,46 @@ match and decode major faults are zero. Accepted draft counts changed from
 across tasks. Startup/warmup left 64 MiB free on each card. See
 `bench-mtp-head-q4-ram13p875` and `bench-mtp-head-q4-control`. The reviewed
 code tasks also keep their token IDs and pass all 1326 checks; varint measured
-238.28 tokens/s (`quality-mtp-head-q4`). The full panel remains below 200.
+238.28 tokens/s (`quality-mtp-head-q4`). At this step the full panel was below 200.
 The near-context input/output IDs and both additional Chinese replies also
 match their earlier references, with zero decode major faults. See
 `near-context-mtp-head-q4`, `heldout-mtp-head-q4`, and `mtp-head-checks.json`.
+
+Retuning the fused-copy launch from 64 to 32 blocks measured **199.71 tokens/s**
+versus **198.18** with the preceding setting in the same exploratory binary.
+With 32 copy blocks, the final-row-only draft head then measured **200.25**
+versus **199.70** with the option off in the same final binary (+0.28%). An
+independent repeat measured **200.26**. All target IDs and draft acceptance
+counts stayed identical; these are small gains on this hardware and workload.
+See `bench-head-q4-fused32`, `bench-draft-cost-control`, `bench-mtp-last-head`,
+`bench-mtp-last-head-control`, and `bench-mtp-last-head-repeat`.
+
+The final recipe uses 16 copy blocks. Its two independently started panels
+measured **200.93** and **200.83 tokens/s**, or **200.88** over all 24,576 output
+tokens and 122.34 seconds of reported decode time. All twelve measured requests
+retain the reference input/output IDs, finish reasons and draft acceptance
+counts, with zero decode major faults. No compile or profiler ran alongside
+these panels. See `bench-mtp-last-head-fused16{,-repeat}` and
+`acceptance-200.json`. Prose remains about 180 tokens/s; the 200 target is the
+aggregate panel rate, not a per-task lower bound. The margin over 200 is small.
+
+The final recipe also retains the reviewed code outputs (1326 checks passed),
+the 32688-token input plus 64-token generation, and both additional Chinese
+1024-token replies. A same-binary sampled comparison with fixed seed 20261104,
+temperature 0.7, top-k 20, top-p 0.9 and repeat/frequency/presence penalties
+also preserves every output token and draft acceptance count. These checks
+are functional evidence; their short decode rates are not part of acceptance.
+See `quality-mtp-last-head`, `near-context-mtp-last-head`,
+`heldout-mtp-last-head`, `sampling-mtp-last-head{,-control}`, and
+`mtp-last-head-checks.json`.
+
+A timing-derived adaptive-draft experiment was rejected. Five independent
+calibration prompts gave round/row/draft-call costs of 10.91/1.273/0.598 ms.
+Those values with draft limit eight measured 196.01 tokens/s, versus 198.18
+with the existing costs and limit six in the same binary. Output tokens were
+unchanged. The added cost knobs and instrumentation were removed; the patch,
+fit and raw runs remain in `draft-cost-deferred.patch`, `draft-cost-fit.json`,
+`draft-cost-calibration`, and `bench-draft-calibrated-k8`.
 
 The exact token records and the calibration profile are in
 [`bench/results/2026-11-03-rx7900xtx-tensor-parallel`](../bench/results/2026-11-03-rx7900xtx-tensor-parallel/).
@@ -508,6 +556,19 @@ accepted recipe.
 
 ## Reproduce
 
+On the measured host, with the retained binary and converted MTP pack:
+
+```sh
+cd /home/john/Strata
+bash bench/results/2026-11-03-rx7900xtx-tensor-parallel/reproduce-200.sh /tmp/strata-tp-new-run
+```
+
+The directory must be new. This runs the benchmark in a child process.
+The script supports `TP_EXE`, `TP_MODEL`, `TP_MTP` and `TP_TOKENIZER` overrides.
+The final binary SHA-256 is
+`b051993f8a7793706ee848959226d99876263aa0c9d98630e981d88b2db5da3e`.
+It is also retained at `build-tensor-parralize-baseline/strata-split-mtp-last-head`.
+
 Build the split target using the installed ROCm SDK and its compiler:
 
 ```sh
@@ -542,10 +603,10 @@ FNX_MOE_STAGE=0 FNX_PF_ROWS=256 \
 FNX_IQ_REUSE=1 FNX_IQ_GROUP=16 FNX_MOE_PRE_ROWS=1 \
 FNX_STATIC_HOST_CACHE=1 FNX_EMBED_WARM_AFTER_LOAD=1 \
 FNX_RELEASE_COPIED_WEIGHTS=1 FNX_KV_CONTEXT_ONLY=1 \
-FNX_HC_ROW_GROUP=64 FNX_STATIC_CACHE_FUSED_DN=64 \
+FNX_HC_ROW_GROUP=64 FNX_STATIC_CACHE_FUSED_DN=16 \
 FNX_Q8S_ROW_GROUP=2 \
 FNX_GDN_REPLAY=1 FNX_BATCH_DRAFTS=0 \
-FNX_MTP_EXPERTS=q4_0 FNX_MTP_HEAD_Q4=1 \
+FNX_MTP_EXPERTS=q4_0 FNX_MTP_HEAD_Q4=1 FNX_MTP_LAST_HEAD=1 \
 FNX_EXPERT_PROFILE="$PWD/bench/results/2026-11-03-rx7900xtx-tensor-parallel/swift-decode-routes.bin" \
 python3 tools/tp_decode_bench.py \
   --exe build-tensor-parralize/src/split/strata-split-2 \
@@ -641,9 +702,15 @@ context alone does not measure long-context decode.
   eight-lane sums are compared with the original 32-lane Q4 reader with a
   2e-5 relative/absolute tolerance; different reduction groups need not be
   bit-identical. Full-model target token comparisons are exact.
+- Last-row draft head: 384 additional bit-exact last-row/full-window comparisons
+  passed on both cards, T=1..16, two shapes, changed/zero inputs, direct/graph
+  execution and guard bytes. Together with the original Q4 product checks,
+  the GPU test now passes 768 checks. Full-model greedy and seeded sampled
+  output/acceptance comparisons are exact; the final recipe passes all 1326
+  reviewed code checks and the near-context/Chinese checks described above.
 - CUDA has not been built or run here. No SYCL files are changed.
-- Remaining: the 200 tokens/s target, long-context acceptance, broader quality
-  and workload coverage, and integration into launch policy.
+- Outside this acceptance: performance at the configured 204800 context, broader
+  quality and workload coverage, concurrent serving, and integration into launch policy.
 
 The implementation builds on Strata's existing sFNX split engine. Reference
 projects considered include [vLLM's custom all-reduce](https://github.com/vllm-project/vllm/blob/main/vllm/distributed/device_communicators/custom_all_reduce.py),

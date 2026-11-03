@@ -1,0 +1,3 @@
+card 0: 384 Q4 direct/graph checks
+card 1: 384 Q4 direct/graph checks
+PASS 768 Q4 head products, exact last-row comparisons and guards

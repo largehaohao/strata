@@ -23,6 +23,9 @@ int run(int rows, int cols) {
     }
     TestMem mem;auto* w=mem.alloc<uint8_t>(weights.size());auto* x=mem.alloc<block_q8_1>(MAXT*nb);
     auto* jobs=mem.alloc<Job>(1);auto* out=mem.alloc<float>(count);auto* ref=mem.alloc<float>(count);
+    auto* last_jobs=mem.alloc<Job>(1);auto* last_out=mem.alloc<float>(rows+2*pad);
+    Job last_job{};last_job.n=1;
+    ck(cudaMemcpy(last_jobs,&last_job,sizeof last_job,cudaMemcpyHostToDevice),"last job");
     ck(cudaMemcpy(w,weights.data(),weights.size(),cudaMemcpyHostToDevice),"weights");
     DW dw;dw.p=w;dw.type=T_Q4_0;dw.n_in=cols;dw.n_out=rows;dw.row_bytes=nb*18;
     cudaStream_t st;ck(cudaStreamCreateWithFlags(&st,cudaStreamNonBlocking),"stream");
@@ -36,6 +39,11 @@ int run(int rows, int cols) {
         cudaGraph_t graph;cudaGraphExec_t exec;
         ck(cudaStreamBeginCapture(st,cudaStreamCaptureModeRelaxed),"capture");launch();
         ck(cudaStreamEndCapture(st,&graph),"end capture");ck(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0),"instantiate");
+        auto last_launch=[&]{mmvq(dw,0,last_jobs,nullptr,1,x+(size_t)job.y[T-1]*nb,last_out+pad,rows,st);};
+        cudaGraph_t last_graph;cudaGraphExec_t last_exec;
+        ck(cudaStreamBeginCapture(st,cudaStreamCaptureModeRelaxed),"last capture");last_launch();
+        ck(cudaStreamEndCapture(st,&last_graph),"last capture end");
+        ck(cudaGraphInstantiate(&last_exec,last_graph,nullptr,nullptr,0),"last instantiate");
         for(int rep=0;rep<3;++rep){
             for(size_t k=0;k<input.size();++k){
                 float sum=0;const float d=__half2float(__ushort_as_half(0x2800+(k%11)*27));
@@ -57,9 +65,25 @@ int run(int rows, int cols) {
                         throw std::runtime_error("Q4 head product mismatch");
                 }
                 ++checks;
+                // The final input row, computed alone, must have exactly the
+                // same logits as its original full-window result (output row 0
+                // because the test job's output indexes are reversed).
+                const size_t tail_bytes=(size_t)(rows+2*pad)*4;
+                ck(cudaMemsetAsync(last_out,0xA5,tail_bytes,st),"last guard");
+                if(replay)ck(cudaGraphLaunch(last_exec,st),"last replay");else last_launch();
+                ck(cudaStreamSynchronize(st),"last wait");
+                std::vector<unsigned char> tail(tail_bytes);
+                ck(cudaMemcpy(tail.data(),last_out,tail_bytes,cudaMemcpyDeviceToHost),"last output");
+                if(std::memcmp(tail.data()+pad*4,b.data()+pad,(size_t)rows*4))
+                    throw std::runtime_error("last-row logits differ from full window");
+                for(size_t i=0;i<tail.size();++i)
+                    if((i<pad*4 || i>=(size_t)(pad+rows)*4) && tail[i]!=0xA5)
+                        throw std::runtime_error("last-row guard overwritten");
+                ++checks;
             }
         }
         ck(cudaGraphExecDestroy(exec),"destroy exec");ck(cudaGraphDestroy(graph),"destroy graph");
+        ck(cudaGraphExecDestroy(last_exec),"destroy last exec");ck(cudaGraphDestroy(last_graph),"destroy last graph");
     }
     ck(cudaStreamDestroy(st),"destroy stream");return checks;
 }
@@ -67,5 +91,5 @@ int run(int rows, int cols) {
 int main(){try{int total=0;for(int dev=0;dev<2;++dev){fnx::ck(cudaSetDevice(dev),"device");int n=0;
     for(auto shape:{std::make_pair(8197,2560),std::make_pair(257,320)})n+=fnx::run(shape.first,shape.second);
     total+=n;std::cout<<"card "<<dev<<": "<<n<<" Q4 direct/graph checks\n";}
-    std::cout<<"PASS "<<total<<" Q4 head products and guards\n";
+    std::cout<<"PASS "<<total<<" Q4 head products, exact last-row comparisons and guards\n";
 }catch(const std::exception&e){std::cerr<<e.what()<<std::endl;return 1;}}

@@ -1,0 +1,123 @@
+{
+  "status": "passed",
+  "target_tps": 200,
+  "weighted_decode_tps": 200.8811436885427,
+  "panels": [
+    {
+      "directory": "bench-mtp-last-head-fused16",
+      "weighted_decode_tps": 200.9281152197161,
+      "total_tokens": 12288,
+      "total_decode_ms": 61156.2,
+      "runs": [
+        {
+          "case": "code",
+          "rep": 0,
+          "tokens": 2048,
+          "decode_ms": 9804.8,
+          "decode_tps": 208.87728459530027
+        },
+        {
+          "case": "prose",
+          "rep": 0,
+          "tokens": 2048,
+          "decode_ms": 11350.6,
+          "decode_tps": 180.43099043222384
+        },
+        {
+          "case": "edit",
+          "rep": 0,
+          "tokens": 2048,
+          "decode_ms": 9400.2,
+          "decode_tps": 217.86770494244803
+        },
+        {
+          "case": "code",
+          "rep": 1,
+          "tokens": 2048,
+          "decode_ms": 9822.9,
+          "decode_tps": 208.49240041128385
+        },
+        {
+          "case": "prose",
+          "rep": 1,
+          "tokens": 2048,
+          "decode_ms": 11372.6,
+          "decode_tps": 180.08195135676976
+        },
+        {
+          "case": "edit",
+          "rep": 1,
+          "tokens": 2048,
+          "decode_ms": 9405.1,
+          "decode_tps": 217.75419719088578
+        }
+      ]
+    },
+    {
+      "directory": "bench-mtp-last-head-fused16-repeat",
+      "weighted_decode_tps": 200.83419411357067,
+      "total_tokens": 12288,
+      "total_decode_ms": 61184.8,
+      "runs": [
+        {
+          "case": "code",
+          "rep": 0,
+          "tokens": 2048,
+          "decode_ms": 9796.7,
+          "decode_tps": 209.04998621984953
+        },
+        {
+          "case": "prose",
+          "rep": 0,
+          "tokens": 2048,
+          "decode_ms": 11381.5,
+          "decode_tps": 179.94113253964767
+        },
+        {
+          "case": "edit",
+          "rep": 0,
+          "tokens": 2048,
+          "decode_ms": 9397.0,
+          "decode_tps": 217.9418963498989
+        },
+        {
+          "case": "code",
+          "rep": 1,
+          "tokens": 2048,
+          "decode_ms": 9840.2,
+          "decode_tps": 208.12585110058737
+        },
+        {
+          "case": "prose",
+          "rep": 1,
+          "tokens": 2048,
+          "decode_ms": 11365.7,
+          "decode_tps": 180.19127726404884
+        },
+        {
+          "case": "edit",
+          "rep": 1,
+          "tokens": 2048,
+          "decode_ms": 9403.7,
+          "decode_tps": 217.78661590650486
+        }
+      ]
+    }
+  ],
+  "definition": "Total generated tokens / total engine decode time. Warmup excluded. Independent engine process per panel. No concurrent compile or profiler.",
+  "model": "Installed Swift-1.5 IQ3_S; target weights unchanged",
+  "workload": "One request at a time; greedy; thinking off; short code, prose and edit prompts; 2048 output tokens each; two passes per panel",
+  "context": 32768,
+  "cards": "2 x RX 7900 XTX gfx1100, 24 GiB each",
+  "binary_sha256": "b051993f8a7793706ee848959226d99876263aa0c9d98630e981d88b2db5da3e",
+  "source_patch_sha256": "d7db090632877b7adde617ebae02218291e7b56872444d7c547466e651dc7b1a",
+  "source_base": "a82d4e240dfd5ab4136ec96cba6ffff4dd1ba358",
+  "profile_sha256": "ddea494adbf54a18f0d56c373b1e01e2ae05d40e25129bd07448dfeae4700f54",
+  "checks": "mtp-last-head-checks.json",
+  "limitations": [
+    "This is a weighted panel result, not a 200 tokens/s minimum for every prompt.",
+    "The configured 204800 context and concurrent serving are not validated by this recipe.",
+    "Split and native engine arithmetic differ. Exact-output checks compare split variants.",
+    "CUDA is not built or tested. New execution paths remain opt-in."
+  ]
+}

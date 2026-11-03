@@ -1,0 +1,158 @@
+{
+  "scope": "diagnostic calibration prompts; weighted affine fit to rows 2..9 with at least 10 calls per request; not acceptance throughput",
+  "verify_base_ms": 10.312892751469924,
+  "per_draft_row_ms": 1.272550401101391,
+  "mean_draft_call_ms": 0.5979932358318099,
+  "round_with_first_draft_ms": 10.910885987301734,
+  "requests": [
+    {
+      "case": "rust_parser",
+      "verify_base_ms": 10.521647863694318,
+      "per_draft_row_ms": 1.2367680434350024,
+      "points": [
+        {
+          "rows": 4,
+          "count": 43,
+          "verify_ms": 619.731351,
+          "commit_ms": 2.231866
+        },
+        {
+          "rows": 5,
+          "count": 63,
+          "verify_ms": 958.121025,
+          "commit_ms": 3.189776
+        },
+        {
+          "rows": 6,
+          "count": 112,
+          "verify_ms": 1862.721637,
+          "commit_ms": 4.762307
+        },
+        {
+          "rows": 7,
+          "count": 47,
+          "verify_ms": 847.165235,
+          "commit_ms": 2.880804
+        }
+      ]
+    },
+    {
+      "case": "go_workers",
+      "verify_base_ms": 9.94670682347248,
+      "per_draft_row_ms": 1.3209711821951913,
+      "points": [
+        {
+          "rows": 4,
+          "count": 24,
+          "verify_ms": 335.786427,
+          "commit_ms": 0.692465
+        },
+        {
+          "rows": 5,
+          "count": 105,
+          "verify_ms": 1591.100113,
+          "commit_ms": 3.060509
+        },
+        {
+          "rows": 6,
+          "count": 104,
+          "verify_ms": 1717.682805,
+          "commit_ms": 5.838692
+        },
+        {
+          "rows": 7,
+          "count": 27,
+          "verify_ms": 480.402843,
+          "commit_ms": 2.400088
+        }
+      ]
+    },
+    {
+      "case": "sql_report",
+      "verify_base_ms": 11.683010618152597,
+      "per_draft_row_ms": 1.028830666601744,
+      "points": [
+        {
+          "rows": 4,
+          "count": 22,
+          "verify_ms": 323.123837,
+          "commit_ms": 0.897216
+        },
+        {
+          "rows": 5,
+          "count": 81,
+          "verify_ms": 1278.636783,
+          "commit_ms": 2.700304
+        },
+        {
+          "rows": 6,
+          "count": 100,
+          "verify_ms": 1676.348321,
+          "commit_ms": 5.747906
+        },
+        {
+          "rows": 7,
+          "count": 36,
+          "verify_ms": 641.104491,
+          "commit_ms": 1.567397
+        }
+      ]
+    },
+    {
+      "case": "chinese_systems",
+      "verify_base_ms": 10.897373648294378,
+      "per_draft_row_ms": 1.0518513893115446,
+      "points": [
+        {
+          "rows": 3,
+          "count": 111,
+          "verify_ms": 1432.751338,
+          "commit_ms": 3.881373
+        },
+        {
+          "rows": 4,
+          "count": 211,
+          "verify_ms": 2970.671835,
+          "commit_ms": 7.469479
+        },
+        {
+          "rows": 5,
+          "count": 70,
+          "verify_ms": 1048.072268,
+          "commit_ms": 2.775504
+        }
+      ]
+    },
+    {
+      "case": "algorithm",
+      "verify_base_ms": 9.408998220417237,
+      "per_draft_row_ms": 1.4583541321105322,
+      "points": [
+        {
+          "rows": 4,
+          "count": 30,
+          "verify_ms": 422.663113,
+          "commit_ms": 0.546547
+        },
+        {
+          "rows": 5,
+          "count": 77,
+          "verify_ms": 1149.31047,
+          "commit_ms": 2.515362
+        },
+        {
+          "rows": 6,
+          "count": 91,
+          "verify_ms": 1531.242882,
+          "commit_ms": 3.143769
+        },
+        {
+          "rows": 7,
+          "count": 51,
+          "verify_ms": 922.04754,
+          "commit_ms": 1.603313
+        }
+      ]
+    }
+  ]
+}

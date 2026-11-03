@@ -1265,8 +1265,17 @@ void Engine::enqueue_rows(const std::vector<int>& lanes, const std::vector<int>&
 
 namespace fnx {
 
+static bool mtp_last_head() {
+    static const long long value = env_int("FNX_MTP_LAST_HEAD", 0);
+    if (value != 0 && value != 1) throw std::runtime_error("FNX_MTP_LAST_HEAD: expected 0 or 1");
+    return value == 1;
+}
+
 void Engine::mtp_attach(const Mtp& mtp) {
     if (mtp.cards.size() != (size_t) NCARD) throw std::runtime_error("mtp_attach: the draft layer is not on every card");
+    if (mtp_last_head())
+        for (const MtpCard& card : mtp.cards)
+            if (card.head.type != T_Q4_0) throw std::runtime_error("FNX_MTP_LAST_HEAD requires a Q4 draft head");
     mtp_ = &mtp;
     for (int c = 0; c < NCARD; ++c) {
         CardBuf& b = *cb_[c];
@@ -1365,9 +1374,19 @@ void Engine::mtp_enqueue(int T) {
         const MtpCard& mc = mtp_->cards[c];
         ck(cudaSetDevice(b.dev), "set");
         hc_read(b.mtp_R, b.bo_f, b.inj_f, mc.mix_norm, mc.mix_down, mc.mix_up, nullptr, eps, b.mixed, b.inj_a, b.hcs, b.ring.err, T, b.st, b.xq);
-        dense(mc.head, b.xq, b.mtp_logits, b, T);
-        penalize_row(b.mtp_logits + (size_t) (T - 1) * (mc.dv1 - mc.dv0), mc.dv1 - mc.dv0, b.mtp_pen, b.mtp_pen_par, b.st);
-        argmax(b.mtp_logits, mc.dv1 - mc.dv0, T, mc.dv0, b.mtp_bv, b.mtp_bi, b.am_keys, b.ring.err, b.st);
+        if (mtp_last_head() && T > 1) {
+            // draft_rows consumes only the final row. Keep its original output
+            // slot for penalties, argmax, sampled candidates and host readback.
+            const int last = T - 1, nv = mc.dv1 - mc.dv0;
+            float* logits = b.mtp_logits + (size_t) last * nv;
+            dense(mc.head, (const uint8_t*) b.xq + (size_t) last * q8_1_bytes(N), logits, b, 1);
+            penalize_row(logits, nv, b.mtp_pen, b.mtp_pen_par, b.st);
+            argmax(logits, nv, 1, mc.dv0, b.mtp_bv + last, b.mtp_bi + last, b.am_keys + last, b.ring.err, b.st);
+        } else {
+            dense(mc.head, b.xq, b.mtp_logits, b, T);
+            penalize_row(b.mtp_logits + (size_t) (T - 1) * (mc.dv1 - mc.dv0), mc.dv1 - mc.dv0, b.mtp_pen, b.mtp_pen_par, b.st);
+            argmax(b.mtp_logits, mc.dv1 - mc.dv0, T, mc.dv0, b.mtp_bv, b.mtp_bi, b.am_keys, b.ring.err, b.st);
+        }
     }
 }
 
