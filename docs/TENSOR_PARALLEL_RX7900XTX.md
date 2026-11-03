@@ -207,6 +207,9 @@ broader panel still does not meet the target. Using the existing
 `FNX_RING_GRID=80` alongside fusion measured 176.27 tokens/s with identical
 outputs, only 0.33% above the default grid. This small difference is not treated
 as an established improvement and the reproduction recipe keeps the default.
+Increasing the fused copy prefix to 128 blocks measured 175.30 tokens/s,
+with every token matching. It did not improve over 64 blocks, which remains
+the recommended setting (`bench-cache-fused128`).
 
 The exact token records and the calibration profile are in
 [`bench/results/2026-11-03-rx7900xtx-tensor-parallel`](../bench/results/2026-11-03-rx7900xtx-tensor-parallel/).
