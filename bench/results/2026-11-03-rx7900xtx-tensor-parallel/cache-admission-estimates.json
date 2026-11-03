@@ -1,0 +1,54 @@
+{
+  "scope": "Offline quality-route simulation, not measured performance. Direct host reads may cost more than their nominal bytes.",
+  "results": [
+    {
+      "policy": "always",
+      "hits": 19253,
+      "copy_GiB": 12.61516809463501,
+      "direct_GiB": 0.0,
+      "combined_GiB": 12.61516809463501
+    },
+    {
+      "policy": "seen2",
+      "hits": 17990,
+      "copy_GiB": 8.897459506988525,
+      "direct_GiB": 4.975259304046631,
+      "combined_GiB": 13.872718811035156
+    },
+    {
+      "policy": "seen3",
+      "hits": 16612,
+      "copy_GiB": 6.385958194732666,
+      "direct_GiB": 8.863353729248047,
+      "combined_GiB": 15.249311923980713
+    },
+    {
+      "policy": "ghost512",
+      "hits": 16781,
+      "copy_GiB": 4.154562950134277,
+      "direct_GiB": 10.931777954101562,
+      "combined_GiB": 15.08634090423584
+    },
+    {
+      "policy": "ghost1024",
+      "hits": 17091,
+      "copy_GiB": 4.869592189788818,
+      "direct_GiB": 9.906315803527832,
+      "combined_GiB": 14.77590799331665
+    },
+    {
+      "policy": "ghost2048",
+      "hits": 17423,
+      "copy_GiB": 6.027579307556152,
+      "direct_GiB": 8.419501781463623,
+      "combined_GiB": 14.447081089019775
+    },
+    {
+      "policy": "ghost4096",
+      "hits": 17940,
+      "copy_GiB": 8.628618717193604,
+      "direct_GiB": 5.2928924560546875,
+      "combined_GiB": 13.921511173248291
+    }
+  ]
+}

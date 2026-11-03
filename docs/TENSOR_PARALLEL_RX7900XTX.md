@@ -323,6 +323,17 @@ The HC watchdog now uses the wall clock and has a bounded missing-arrival
 test. Other device watchdogs still need a separate correction; reported decode
 rates use host timing and GPU events, not those watchdog counters.
 
+A diagnostic trace of the final HC/cache/release binary is summarized in
+`profile-hc-hybrid-summary.txt`. In its first two seconds (decode only), summed
+kernel durations were 28.3% ring waits, 17.6% Q8 projections, 12.1% cold-cache
+copies and 8.4% HC. These percentages include overlapping kernels and waits,
+and tracing substantially increases host launch overhead. They are not shares
+of recoverable wall time. The existing `CardPool` already launches each card's
+single-request and MTP graphs in parallel. Copy/compute overlap remains a
+candidate for investigation. Simple two-hit/ghost admission simulations moved
+more host bytes than the existing CLOCK policy, so those policies were rejected
+before implementation (`cache-admission-estimates.json`).
+
 ## Reproduce
 
 Build the split target using the installed ROCm SDK and its compiler:
