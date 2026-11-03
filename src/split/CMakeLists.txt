@@ -217,3 +217,8 @@ add_executable(split_gguf_release_test EXCLUDE_FROM_ALL ${_sp}/tools/gguf_releas
 target_compile_definitions(split_gguf_release_test PRIVATE FNX_27B=0)
 target_link_libraries(split_gguf_release_test PRIVATE Threads::Threads)
 set_target_properties(split_gguf_release_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+
+# Host-only sizing checks for optional grouped static-cache slots.
+add_executable(split_static_cache_layout_test EXCLUDE_FROM_ALL ${_sp}/tools/static_cache_layout_test.cpp)
+target_include_directories(split_static_cache_layout_test PRIVATE ${_sp}/src)
+set_target_properties(split_static_cache_layout_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)

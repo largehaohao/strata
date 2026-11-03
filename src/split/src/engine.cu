@@ -71,6 +71,9 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         throw std::runtime_error("FNX_STATIC_CACHE_SLOTS: 0 or a multiple of 32 from 160 to 4096");
     if (static_slots && (env_int("FNX_STATIC_EXPERTS", 0) != 1 || m.resident.size() != NL || lanes != 1))
         throw std::runtime_error("FNX_STATIC_CACHE_SLOTS requires static experts and one lane");
+    const long long static_groups = env_int("FNX_STATIC_CACHE_GROUPS", 1);
+    if ((static_groups != 1 && static_groups != 2) || (static_groups == 2 && !static_slots))
+        throw std::runtime_error("FNX_STATIC_CACHE_GROUPS: 1 or 2, grouping needs a static cache");
     const long long fused_dn = env_int("FNX_STATIC_CACHE_FUSED_DN", 0);
     if (fused_dn < 0 || fused_dn > 256 ||
         (fused_dn && (!static_slots || env_int("FNX_IQ_REUSE", 0) != 1 || env_int("FNX_IQ_GROUP", 32) != 16)))
@@ -198,7 +201,7 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
             b->dense[T] = dalloc<Job>(1);
             ck(cudaMemcpy(b->dense[T], &j, sizeof j, cudaMemcpyHostToDevice), "dense job");
         }
-        if (static_slots) b->static_cache = static_decode_cache(m, w, (int) static_slots);
+        if (static_slots) b->static_cache = static_decode_cache(m, w, (int) static_slots, (int) static_groups);
         if (w.ec.n_slots || b->static_cache.n_slots) b->cache_list = dalloc<int>(1 + P);
         b->gu = dalloc<float>((size_t) (P + MAXT) * 2 * ffs);
         b->part = dalloc<float>((size_t) (P + MAXT) * N);

@@ -27,6 +27,15 @@ not replaced. All new execution paths are opt-in.
   Decode owns separate pointer tables, so prefill keeps the immutable model
   placement and needs no additional staging allocation. The cache persists
   across requests. Its VRAM allocation is additional to the fixed hot weights.
+- `FNX_STATIC_CACHE_GROUPS=2` divides the cold cache into two pools, using
+  the lower and upper halves of distinct expert byte sizes. Each pool retains
+  enough slots for a complete decode window; extra slots are assigned in
+  32-slot groups in proportion to the number of layers sharing the pool.
+  Independent gate/up and down maxima determine each pool's stride. Total
+  allocation cannot exceed the one-pool byte budget, and slot count is capped
+  at twice the requested count. The default is one pool; a budget too small
+  for two complete windows is rejected before allocation. This is a heuristic
+  for these weights, not a universal cache-size recommendation.
 - `FNX_MOE_STAGE=1` copies each selected expert matrix into reusable VRAM
   scratch before its quantized dot products. Gate/up and down reuse the same
   scratch in stream order. Copies preserve every weight byte. The normal
@@ -126,6 +135,7 @@ uses a forced continuation.
 | Same, release copied GGUF conversions, two runs | 177.7–178.0 | 156.1–156.2 | 183.6–183.8 |
 | Same, compact HC for 1–12 rows, two runs | 179.7–180.3 | 157.9–158.3 | 186.2–186.4 |
 | Same, fused down-weight copy in IQ gate/up, two runs | 181.9–182.2 | 158.9–159.1 | 188.8–189.0 |
+| Same, two cache pools within the existing byte budget, two runs | 184.2–184.5 | 160.6–160.7 | 192.9–193.2 |
 
 Values are tokens/s from the engine's reported decode time. The benchmark
 also records client time, time to first token, exact input/output token IDs,
@@ -210,6 +220,17 @@ as an established improvement and the reproduction recipe keeps the default.
 Increasing the fused copy prefix to 128 blocks measured 175.30 tokens/s,
 with every token matching. It did not improve over 64 blocks, which remains
 the recommended setting (`bench-cache-fused128`).
+
+Two cache pools measured **178.27 tokens/s**, against **175.81** with one
+pool in the same binary (**1.40%** higher). The requested 1024-slot byte budget
+now holds 896 smaller and 288 larger slots (1184 total), using 1295 MiB per card
+versus 1300 MiB. The smaller pool serves 37 layers with 627200 gate/up and
+460800 down bytes per slot; the larger serves 11 layers with 870400 gate/up
+and 460800 down bytes. Startup/warmup left 146 MiB free on each card. All six
+output token sequences match and decode major faults are zero. The reviewed
+code tasks also match and pass all 1326 checks; varint measured 208.30 tokens/s.
+See `bench-cache-groups2`, `bench-cache-groups-control`, and
+`quality-cache-groups2`. The broader 200 tokens/s target remains open.
 
 The exact token records and the calibration profile are in
 [`bench/results/2026-11-03-rx7900xtx-tensor-parallel`](../bench/results/2026-11-03-rx7900xtx-tensor-parallel/).
@@ -387,6 +408,7 @@ tokenizer directory. Set the SDK library paths for the child process:
 export LD_LIBRARY_PATH="$PWD/.venv/lib/python3.12/site-packages/_rocm_sdk_core/lib:$PWD/.venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx110X_dgpu/lib"
 HIP_VISIBLE_DEVICES=0,1 HSA_FORCE_FINE_GRAIN_PCIE=1 \
 FNX_STATIC_EXPERTS=1 FNX_EXPERT_RAM_GIB=16 FNX_STATIC_CACHE_SLOTS=1024 \
+FNX_STATIC_CACHE_GROUPS=2 \
 FNX_MOE_STAGE=0 FNX_PF_ROWS=256 \
 FNX_IQ_REUSE=1 FNX_IQ_GROUP=16 FNX_MOE_PRE_ROWS=1 \
 FNX_STATIC_HOST_CACHE=1 FNX_EMBED_WARM_AFTER_LOAD=1 \
@@ -457,6 +479,12 @@ context alone does not measure long-context decode.
   and mixed placement, coherent/non-coherent backing, guards and graph replay.
 - Down precompute: 512 exact direct/graph comparisons passed on both cards,
   including T=1..16, changing routes/job counts, IQ4_NL and Q4_0, and guards.
+- Grouped cache: 3840 byte-for-byte direct/graph checks passed on both cards,
+  including single/two-pool layouts, nonzero pool offsets, evictions, hot/cold
+  patterns, immutable backing tables and all pool/output guards. Host layout
+  checks passed normally and under ASan/UBSan: 384 generated layouts, overflow
+  and invalid-input rejection, full-window capacity, memory/slot bounds and
+  order-independent layer assignment.
 - Both engines passed the three completed-code tasks described above.
 - CUDA has not been built or run here. No SYCL files are changed.
 - Remaining: the 200 tokens/s target, long-context acceptance, broader quality
