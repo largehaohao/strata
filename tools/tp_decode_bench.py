@@ -32,6 +32,20 @@ def sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def process_faults(pid):
+    """Linux counters for the launched process, excluding child processes."""
+    try:
+        # comm is parenthesized and can contain spaces or parentheses.
+        fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
+        return {'minor': int(fields[7]), 'major': int(fields[9])}
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def fault_delta(before, after):
+    return {k: after[k] - before[k] for k in before} if before is not None and after is not None else None
+
+
 def tokenizer(path):
     path = Path(path)
     meta = json.loads((path / 'tokenizer.json').read_text())
@@ -104,6 +118,8 @@ def measure(a):
     manifest = {'status': 'running', 'command': cmd, 'env': safe_env, 'source': source_info(),
                 'binary_sha256': sha(Path(cmd[0]).read_bytes()), 'cases': cases,
                 'prefix_sha256': sha(prefix.encode()), 'runs': [],
+                'fault_counter_scope': 'Linux counters of the launched process; wrapper child processes are excluded. '
+                                       'Decode fault deltas start when the client receives the first token.',
                 'metric': 'decode_tps = DONE generated / DONE decode_ms * 1000; '
                           'client_decode_tps excludes first token; warmup excluded from weighted rate'}
 
@@ -154,6 +170,7 @@ def measure(a):
                     ids = tok.encode(rendered, parse_special=True)
                     cap = 16 if name == 'warmup' else a.tokens
                     first, output = None, []
+                    faults_before, faults_first = process_faults(proc.pid), None
                     start = time.perf_counter()
                     proc.stdin.write(f'GEN {cap} temperature=0 ' + ','.join(map(str, ids)) + '\n')
                     proc.stdin.flush()
@@ -162,6 +179,7 @@ def measure(a):
                         if msg.startswith('T '):
                             if first is None:
                                 first = time.perf_counter()
+                                faults_first = process_faults(proc.pid)
                             output.append(int(msg.split()[1]))
                         elif msg.startswith('DONE '):
                             end = time.perf_counter()
@@ -178,6 +196,9 @@ def measure(a):
                                       'client_decode_tps': max(0, n - 1) / (end - first) if first and end > first else 0,
                                       'finish': fields[5], 'accepted': int(fields[6]), 'offered': int(fields[7]),
                                       'ids': output, 'input_ids': ids, 'input_sha256': sha(rendered.encode())}
+                            faults_end = process_faults(proc.pid)
+                            result['request_faults'] = fault_delta(faults_before, faults_end)
+                            result['decode_faults_after_first_token'] = fault_delta(faults_first, faults_end)
                             (a.out / f'output-{rep}-{case_index}.txt').write_text(tok.decode(output))
                             manifest['runs'].append(result)
                             save()

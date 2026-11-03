@@ -32,6 +32,16 @@ not replaced. All new execution paths are opt-in.
   copies only host-resident experts. Hot experts keep their VRAM pointers.
   The main layer index is now passed explicitly to the FFN helper; MTP uses
   -1 and does not index the main model's residency table.
+- `FNX_STATIC_HOST_CACHE=1` uses HIP's non-coherent pinned allocation for the
+  immutable cold expert banks, allowing GPU caching. CPU writes finish during
+  load, before the GPU commands read the banks; inference never modifies them.
+  It does not change the allocation of communication buffers. This is HIP-only;
+  the flag is not combined with `hipHostMallocMapped`, which would override it.
+  See [HIP host-memory coherence](https://rocm.docs.amd.com/projects/HIP/en/docs-6.2.0/how-to/programming_manual.html#host-memory).
+- `FNX_EMBED_WARM_AFTER_LOAD=1` refreshes the host embedding mappings after
+  bulk expert reads, which can evict unlocked pages. It reports page residency
+  before and after the refresh. This moves work to startup; it does not change
+  the request, output or model arithmetic.
 
 `FNX_PF_ROWS=256` reduces prefill scratch compared with the existing default
 4096. This allowed the cold allocation to fall from 16 to 14 GiB. With staging,
@@ -64,6 +74,8 @@ uses a forced continuation.
 | Same, calibrated decode residency, two runs | 129.6–134.3 | 113.7–115.8 | 136.1–137.8 |
 | Same, IQ weight reuse, two runs | 130.0–141.4 | 110.2–120.1 | 139.3–145.2 |
 | IQ reuse plus cold-only staging, two runs | 133.7–149.1 | 111.0–124.9 | 142.6–150.5 |
+| Same, embedding refresh after load, two runs | 148.1–149.0 | 123.7–125.0 | 149.6–150.4 |
+| Cached host weights, direct reads, embedding refresh, two runs | 155.7–156.1 | 131.5–131.6 | 158.3–158.7 |
 
 Values are tokens/s from the engine's reported decode time. The benchmark
 also records client time, time to first token, exact input/output token IDs,
@@ -78,6 +90,20 @@ These differences between runs are material: for example, the code task's
 verify GPU time was 12.24 s on the first pass and 12.16 s on the second, while
 verify wall time fell from 13.78 to 12.21 s. The unlocked PLE table and host-side
 first-use work need separate investigation. Both passes remain in the results.
+Refreshing the embeddings measured 139.93 tokens/s across two passes. At the
+end of bulk loading, the PLE mapping had 25914 of 27465 MiB resident; the refresh
+restored almost all pages in 0.76 s. The first-pass code task then took 12.29 s
+for verify, of which 12.16 s was GPU time. This supports page residency as one
+source of the earlier first-pass overhead; it is not a GPU kernel speedup.
+
+Cached host weights with decode staging disabled measured **147.60 tokens/s**
+weighted across two passes. All six output token sequences match the reference.
+Keeping cold-only staging with these same cache/refresh flags measured
+148.7 / 124.6 / 150.0 tokens/s (weighted 140.07) in a separate pass, also with
+identical token IDs. The reproduction recipe therefore uses direct reads.
+The same short prompts' prefill times fell from about 590 / 702 / 888 ms to
+200 / 208 / 285 ms on the second pass. These are measurements of this workload,
+not a general prefill throughput claim. The **200 tokens/s target remains open**.
 
 The exact token records and the calibration profile are in
 [`bench/results/2026-11-03-rx7900xtx-tensor-parallel`](../bench/results/2026-11-03-rx7900xtx-tensor-parallel/).
@@ -131,6 +157,8 @@ executes Python and is intended only for reviewed outputs of these fixed tasks.
 The quality runs overlapped CPU compilation and are excluded from speed claims.
 The IQ-reuse/cold-only binary was then run on the same tasks. It produced
 exactly the reviewed split token sequences and passed all 1326 checks too.
+The cached direct-read/embedding-refresh binary also reproduced those exact
+token sequences and passed all 1326 checks (`quality-hostcache`).
 
 A four-second ROCprofiler sample showed matrix staging at 23.15% and the
 window-sum peer kernel at 15.99% of summed kernel duration. This includes
@@ -160,8 +188,8 @@ tokenizer directory. Set the SDK library paths for the child process:
 ```sh
 export LD_LIBRARY_PATH="$PWD/.venv/lib/python3.12/site-packages/_rocm_sdk_core/lib:$PWD/.venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx110X_dgpu/lib"
 HIP_VISIBLE_DEVICES=0,1 HSA_FORCE_FINE_GRAIN_PCIE=1 \
-FNX_STATIC_EXPERTS=1 FNX_EXPERT_RAM_GIB=14 FNX_MOE_STAGE=1 FNX_PF_ROWS=256 \
-FNX_IQ_REUSE=1 FNX_MOE_STAGE_COLD_ONLY=1 \
+FNX_STATIC_EXPERTS=1 FNX_EXPERT_RAM_GIB=14 FNX_MOE_STAGE=0 FNX_PF_ROWS=256 \
+FNX_IQ_REUSE=1 FNX_STATIC_HOST_CACHE=1 FNX_EMBED_WARM_AFTER_LOAD=1 \
 FNX_EXPERT_PROFILE="$PWD/bench/results/2026-11-03-rx7900xtx-tensor-parallel/swift-decode-routes.bin" \
 python3 tools/tp_decode_bench.py \
   --exe build-tensor-parralize/src/split/strata-split-2 \
@@ -196,7 +224,11 @@ context alone does not measure long-context decode.
   changing routes, mixed host/device pointer tables, contiguous weights,
   hot-pointer bypass, several strides and guard bytes. Full-model startup
   and nine cold-only benchmark outputs also match the reference token IDs.
+- Extended host-memory checks: 1440 direct/graph checks passed on both cards,
+  including coherent and non-coherent allocations, changing CPU contents,
+  all-hot/all-cold masks and guard bytes.
 - Existing split Python suite: 52 tests passed.
+- Existing split serving/fallback Python suite: 25 tests passed.
 - IQ gate/up reuse: 1024 exact direct/graph checks passed on both physical cards;
   the full engine builds and matches all six reference token sequences.
 - Both engines passed the three completed-code tasks described above.

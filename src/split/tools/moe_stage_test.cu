@@ -9,6 +9,11 @@ void ck(cudaError_t e, const char* what) {
 }
 #include "moe_stage.cuh"
 using namespace fnx;
+#if defined(__HIP_PLATFORM_AMD__)
+constexpr int HOST_MODES = 2;
+#else
+constexpr int HOST_MODES = 1;
+#endif
 
 int main() {
     int devices = 0;
@@ -16,8 +21,9 @@ int main() {
     if (devices < 2) throw std::runtime_error("this validation requires two physical devices");
     for (int dev = 0; dev < 2; ++dev) {
         ck(cudaSetDevice(dev), "device");
+      for (int host_mode = 0; host_mode < HOST_MODES; ++host_mode) {
         for (size_t stride : {size_t(256), size_t(1056), size_t(32800)}) {
-          for (int mode = 0; mode < 3; ++mode) {
+          for (int mode = 0; mode < 5; ++mode) {
             constexpr int count = MAXT * TOPK;
             const size_t bytes = NEXP * stride, scratch_bytes = count * stride + 256;
             char *host = nullptr, *gpu = nullptr, *scratch = nullptr;
@@ -25,7 +31,11 @@ int main() {
             Job* jobs = nullptr;
             int* njobs = nullptr;
             unsigned char* hot = nullptr;
-            ck(cudaHostAlloc((void**)&host, bytes, cudaHostAllocMapped), "host");
+            unsigned flags = cudaHostAllocMapped;
+#if defined(__HIP_PLATFORM_AMD__)
+            if (host_mode) flags = hipHostMallocNonCoherent;
+#endif
+            ck(cudaHostAlloc((void**)&host, bytes, flags), "host");
             void* mapped = nullptr;
             ck(cudaHostGetDevicePointer(&mapped, host, 0), "mapped");
             ck(cudaMalloc((void**)&gpu, bytes), "gpu");
@@ -38,16 +48,16 @@ int main() {
             cudaStream_t stream;
             ck(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
             std::vector<const char*> pointers(NEXP);
-            for (int e = 0; e < NEXP; ++e) pointers[e] = (e % 2 ? (char*) mapped : gpu) + e * stride;
+            for (int e = 0; e < NEXP; ++e) pointers[e] = (mode == 3 ? gpu : mode == 4 ? (char*) mapped : e % 2 ? (char*) mapped : gpu) + e * stride;
             ck(cudaMemcpy(ep, pointers.data(), NEXP * sizeof(char*), cudaMemcpyHostToDevice), "pointers");
             std::vector<unsigned char> hot_mask(NEXP);
-            for (int e = 0; e < NEXP; ++e) hot_mask[e] = e % 2 == 0;
+            for (int e = 0; e < NEXP; ++e) hot_mask[e] = mode == 3 ? 1 : mode == 4 ? 0 : e % 2 == 0;
             ck(cudaMemcpy(hot, hot_mask.data(), NEXP, cudaMemcpyHostToDevice), "hot mask copy");
             DW w{}; w.p = gpu; w.ep = mode == 1 ? nullptr : ep;
             cudaGraph_t graph;
             cudaGraphExec_t exec;
             ck(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed), "capture");
-            stage_moe(w, stride, jobs, njobs, count, scratch, staged_ep, stream, mode == 2 ? hot : nullptr);
+            stage_moe(w, stride, jobs, njobs, count, scratch, staged_ep, stream, mode >= 2 ? hot : nullptr);
             ck(cudaStreamEndCapture(stream, &graph), "end capture");
             ck(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0), "instantiate");
             for (int rep = 0; rep < 24; ++rep) {
@@ -60,7 +70,7 @@ int main() {
                 ck(cudaMemcpy(njobs, &n, sizeof(int), cudaMemcpyHostToDevice), "job count");
                 ck(cudaMemset(scratch, 0xA5, scratch_bytes), "guard");
                 if (rep % 2) ck(cudaGraphLaunch(exec, stream), "replay");
-                else stage_moe(w, stride, jobs, njobs, count, scratch, staged_ep, stream, mode == 2 ? hot : nullptr);
+                else stage_moe(w, stride, jobs, njobs, count, scratch, staged_ep, stream, mode >= 2 ? hot : nullptr);
                 ck(cudaStreamSynchronize(stream), "wait");
                 std::vector<unsigned char> got(scratch_bytes);
                 ck(cudaMemcpy(got.data(), scratch, scratch_bytes, cudaMemcpyDeviceToHost), "read scratch");
@@ -68,7 +78,7 @@ int main() {
                 ck(cudaMemcpy(at.data(), staged_ep, NEXP * sizeof(char*), cudaMemcpyDeviceToHost), "read pointers");
                 for (int j = 0; j < n; ++j) {
                     const int e = js[j].w;
-                    const bool skip = mode == 2 && hot_mask[e];
+                    const bool skip = mode >= 2 && hot_mask[e];
                     if (at[e] != (skip ? pointers[e] : scratch + j * stride)) throw std::runtime_error("stale pointer");
                     for (size_t k = 0; k < stride; ++k)
                         if (got[j * stride + k] != (skip ? 0xA5 : (unsigned char)host[e * stride + k])) throw std::runtime_error("weight mismatch");
@@ -82,6 +92,7 @@ int main() {
             ck(cudaFreeHost(host), "free host");
           }
         }
+      }
     }
-    std::cout << "MoE staging: two physical GPUs, 432 direct/graph checks passed\n";
+    std::cout << "MoE staging: two physical GPUs, " << 720 * HOST_MODES << " direct/graph checks passed\n";
 }

@@ -237,6 +237,16 @@ void lock_in_ram(const Tensor& t) {
                                      "; run with RLIMIT_MEMLOCK raised (systemd-run -p LimitMEMLOCK=infinity)");
 }
 
+size_t resident_bytes(const Tensor& t) {
+    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    const uintptr_t begin = (uintptr_t) t.data / page * page;
+    const size_t bytes = (uintptr_t) t.data + t.nbytes - begin;
+    std::vector<unsigned char> pages((bytes + page - 1) / page);
+    if (mincore((void*) begin, bytes, pages.data()) != 0)
+        throw std::runtime_error("embedding mincore: " + std::string(std::strerror(errno)));
+    return (size_t) std::count_if(pages.begin(), pages.end(), [](unsigned char p) { return p & 1; }) * page;
+}
+
 // the stager's groups for load_card: group l every tensor of layer l, group NL the output head's. The head is read
 // through the page cache: the draft layer (Mtp) takes its rows of output.weight from the mapping after the load
 std::vector<Stager::Group> stage_groups(const Gguf& g) {
@@ -318,7 +328,15 @@ struct Up {
         void* cold = nullptr;
         void* cold_device = nullptr;
         if (plan.cold) {
-            ck(cudaHostAlloc(&cold, plan.cold * stride, cudaHostAllocMapped), "static experts: cold host allocation");
+            unsigned flags = cudaHostAllocMapped;
+#if FNX_HIP
+            // Immutable weights need no CPU/GPU rendezvous inside a kernel.
+            // Do not combine NonCoherent with Mapped: Mapped would override it.
+            if (env_flag("FNX_STATIC_HOST_CACHE")) flags = hipHostMallocNonCoherent;
+#else
+            if (env_flag("FNX_STATIC_HOST_CACHE")) throw std::runtime_error("FNX_STATIC_HOST_CACHE requires HIP");
+#endif
+            ck(cudaHostAlloc(&cold, plan.cold * stride, flags), "static experts: cold host allocation");
             ck(cudaHostGetDevicePointer(&cold_device, cold, 0), "static experts: cold mapped pointer");
             c.host_bytes += plan.cold * stride;
         }
@@ -1364,7 +1382,7 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
     {   // the host gathers its rows every window: a row read from the disk costs milliseconds, so keep it in RAM
         const auto t0 = std::chrono::steady_clock::now();
         lock_in_ram(*tok_embd);
-        std::fprintf(stderr, "27b: %s (%.1f GB) locked in RAM in %.1f s\n", tok_embd->name.c_str(), tok_embd->nbytes / 1e9,
+        std::fprintf(stderr, "27b: %s (%.1f GB) prefaulted in RAM in %.1f s\n", tok_embd->name.c_str(), tok_embd->nbytes / 1e9,
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     }
 #else
@@ -1377,7 +1395,7 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
     {
         const auto t0 = std::chrono::steady_clock::now();
         for (const Tensor* t : {tok_embd, ple_table}) lock_in_ram(*t);
-        std::fprintf(stderr, "fnx: %s and %s (%.1f GB) locked in RAM in %.1f s\n", tok_embd->name.c_str(), ple_table->name.c_str(),
+        std::fprintf(stderr, "fnx: %s and %s (%.1f GB) prefaulted in RAM in %.1f s\n", tok_embd->name.c_str(), ple_table->name.c_str(),
                      (tok_embd->nbytes + ple_table->nbytes) / 1e9, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     }
     for (int64_t v : g.ia(p + "ple.layer_multipliers")) ple_mult.push_back((uint64_t) v);
@@ -1519,6 +1537,20 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
     if (cache < 0.05 * (disk + cache)) std::snprintf(rate, sizeof rate, " at %.2f GB/s", disk / st.read_seconds());
     std::fprintf(stderr, "fnx: weights read in %.1f s of reading (%.1f GB from the disk%s, %.1f GB from the page cache), placed in %.1f s\n",
                  st.read_seconds(), disk, rate, cache, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    if (env_flag("FNX_EMBED_WARM_AFTER_LOAD")) {
+        // Streaming the expert tensors can evict unlocked embedding pages read
+        // before load_card. Refresh only after those bulk reads have finished.
+        for (const Tensor* t : {tok_embd, ple_table}) {
+            if (!t) continue;
+            const size_t before = resident_bytes(*t);
+            const auto start = std::chrono::steady_clock::now();
+            lock_in_ram(*t);
+            const size_t after = resident_bytes(*t);
+            std::fprintf(stderr, "fnx: embedding refresh %s: resident %zu -> %zu / %zu MiB in %.2f s\n",
+                         t->name.c_str(), before >> 20, after >> 20, t->nbytes >> 20,
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+        }
+    }
 }
 
 void Model::choose_residency() {
