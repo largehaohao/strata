@@ -220,7 +220,7 @@ void qsa_index(const float* y, const float* qn, const float* kn, uint16_t* ring,
                float eps, Rope base, void* st);
 // the scores and the selection of rows whose query is in q
 void qsa_select(const float* q, const uint16_t* pooled, const KvPages& g, float* scores, int* cells, int* n_cells, int max_pools, const int* pos0, int T,
-                int card, void* st);
+                int card, void* st, int selection_stride = 0);
 // the same with the decode path's scores (qsa's), for a batched window's T rows of their own lanes (lr)
 void qsa_select_lanes(const float* q, const uint16_t* pooled, const KvPages& g, float* scores, int* cells, int* n_cells, int max_pools,
                       const LaneRows& lr, int T, int card, void* st);
@@ -244,7 +244,7 @@ int attn_rows();   // the most rows one attn call takes
 // indices (n_cells[t] = -1: every owned position up to the row's). The cards' partials are merged on the ring: out
 // gets this card's NQH / NCARD heads (heads card * NQH / NCARD ..), gated
 void attn(const float* qg, const uint16_t* kc, const uint16_t* vc, const KvPages& g, float* out, const AttRing& ar, const unsigned* tag, int call,
-          const int* pos0, int T, float* scratch, void* st, const int* cells = nullptr, const int* n_cells = nullptr);
+          const int* pos0, int T, float* scratch, void* st, const int* cells = nullptr, const int* n_cells = nullptr, int selection_stride = 0);
 // attn in two parts, for a window of several sequences: attn_part_lanes the partials of its T rows, each at its lane's
 // position on its lane's pages (lr; cells / n_cells and qg indexed by the row), attn_finish the merge across the cards
 void attn_part_lanes(const float* qg, const uint16_t* kc, const uint16_t* vc, const KvPages& g, const LaneRows& lr, int T, float* scratch,
@@ -259,6 +259,8 @@ void qsa_proj(const uint16_t* wq, const uint16_t* wk, const float* x, float* y, 
 size_t attn_prompt_block_floats(int C);   // one block of part (one slot of recv)
 void attn_prompt(const float* qg, const uint16_t* kc, const uint16_t* vc, const KvPages& g, const int* pos0, const int* cells, const int* n_cells,
                  int card, int C, int r0, int T, float* part, void* st);   // rows r0 .. r0 + T - 1 of the C
+void attn_prompt_heads(const float* qg, const uint16_t* kc, const uint16_t* vc, const KvPages& g, const int* pos0,
+                       const int* cells, const int* n_cells, int card, int C, float* part, float* out, void* st);
 void attn_prompt_merge(const float* own, const float* recv, const float* qg, float* out, int C, int card, void* st);
 // the rows of the window's positions this card owns (block j on card j % NCARD) = k/v (both KV heads) rounded to f16, or
 // quantized to int8 (g.q8)
@@ -292,9 +294,10 @@ void ple_post(float* R, const float* key, const float* value, const float* nk, c
 void router_route(const float* W, const float* x, float* logits, int T, int* topi, float* topw, Job* jobs_gu, Job* jobs_dn,
                   int* njobs, void* st, const ExpertCache* ec = nullptr, int layer = -1, int* list = nullptr, const Q8S* sh_gu = nullptr,
                   int sh_rows = 0, const void* sh_y = nullptr, float* sh_out = nullptr);
-// Down weights to fill beside IQ gate/up arithmetic. The preceding cache plan and
-// gate/up copy must complete first; the list/slots stay fixed until this launch
-// finishes. Bytes and offsets are 16-byte aligned. Only IQ reuse, group 16.
+// Down weights to fill beside IQ gate/up arithmetic. The preceding cache plan
+// must complete first; GU is already resident or filled by CacheGateUpCopy below.
+// The list/slots stay fixed until this launch finishes. Bytes and offsets are
+// 16-byte aligned. Only IQ reuse, group 16.
 struct CacheDownCopy {
     const char* const* host = nullptr;
     const int* slots = nullptr;
@@ -303,11 +306,20 @@ struct CacheDownCopy {
     size_t slot_bytes = 0, offset = 0, bytes = 0;
     int slot0 = 0, blocks = 0;
 };
+// Gate/up misses from the same completed cache plan. Each listed expert must
+// have exactly one GU job and a writable A.ep slot. Its complete rows are filled
+// by that job's compute blocks; no other launch may consume them until this one
+// completes. Requires CacheDownCopy and IQ reuse group 16; no MoE staging.
+struct CacheGateUpCopy {
+    const char* const* host = nullptr;
+    const int* list = nullptr;
+    int layer = -1;
+};
 // gu rows of 2*ffs: [gate | up] (A: per-expert stacked rows, stride sa). sh_down (Q4_K experts only): the shared
 // expert's swiglu of sh_gu ([T][2 * sh_ffs]) and down (N rows) into sh_out (row stride N), in the same launch
 void moe_gate_up(const DW& A, size_t sa, const Job* jobs, const int* njobs, int njobs_max, const void* xq, float* gu, void* st,
                  const Q8S* sh_down = nullptr, int sh_ffs = 0, const float* sh_gu = nullptr, float* sh_out = nullptr,
-                 const CacheDownCopy* copy = nullptr);
+                 const CacheDownCopy* copy = nullptr, const CacheGateUpCopy* gu_copy = nullptr);
 // the same for jobs of up to MAXT rows each, njobs_cap of them at most (the prompt path's)
 void moe_gate_up_jobs(const DW& A, size_t sa, const Job* jobs, const int* njobs, int njobs_cap, const void* xq, float* gu, void* st);
 // the same with BigJobs (njobs_cap of them at most)
@@ -322,8 +334,10 @@ void moe_down_mma(const DW& A, size_t sa, const BigJob* jobs, const int* njobs, 
 // their new slots by a grid of the SMs (wide 16-byte reads; the MoE kernels' own reads over the link are latency-bound).
 // With jobs, the plan runs here first, a launch of its own (when router_route did not plan).
 // gu_only leaves the down copy to moe_gate_up with CacheDownCopy before any down read.
+// defer_gu also leaves GU to CacheGateUpCopy; it requires gu_only. The plan and
+// shape validation still run here, including when the prefetch probe is enabled.
 void moe_cache(int layer, size_t gu_stride, size_t dn_stride, const ExpertCache& ec, int* list, void* st, const Job* jobs = nullptr,
-               const int* njobs = nullptr, bool padded = false, bool gu_only = false);
+               const int* njobs = nullptr, bool padded = false, bool gu_only = false, bool defer_gu = false);
 // pool p's listed experts (list: device, its count then the experts' ids, each with its slot in ec.slot_of already) from
 // their host copies into their slots, one kernel: the arena's fill
 void cache_copy(const ExpertCache& ec, int p, const int* list, void* st);

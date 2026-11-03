@@ -116,6 +116,7 @@ int main() {
                 checks += fnx::run_dense<false>(shape.first, shape.second);
                 checks += fnx::run_dense<true>(shape.first, shape.second);
             }
+            if (fnx::attn_head_split()) checks += fnx::run_dense<true>(6656, 2560);
             total += checks; std::cout << "card " << dev << ": " << checks << " exact direct/graph checks\n";
         }
         std::cout << "PASS " << total << " dense Q8 checks\n";

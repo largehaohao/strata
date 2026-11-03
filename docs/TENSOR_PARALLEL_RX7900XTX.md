@@ -716,3 +716,127 @@ The implementation builds on Strata's existing sFNX split engine. Reference
 projects considered include [vLLM's custom all-reduce](https://github.com/vllm-project/vllm/blob/main/vllm/distributed/device_communicators/custom_all_reduce.py),
 [Paiton](https://github.com/Eliovp-BV/paiton-vllm-plugin), and
 [Strata dual 3090](https://github.com/q8atnight/strata-dual-3090).
+
+
+## Exact attention head partitioning and shared KV cache (November 4)
+
+The follow-up target is 220 tokens/s on the same single-request Swift IQ3_S
+panel. It has **not yet been reached**. The opt-in candidates below preserve
+the target model, full 32768 context capacity, generated tokens and draft
+acceptance. Results are weighted generated tokens / engine decode time, with
+warmup excluded; each panel has code/prose/edit, 2048 output tokens, two repeats.
+
+| Configuration | Weighted tokens/s | Observation |
+| --- | ---: | --- |
+| Fresh cfc7 baseline | 200.35 | Original accepted recipe |
+| Attention head partitioning, original RAM budget | 206.54 | All token IDs exact |
+| Head partitioning, 13.5 GiB expert RAM | 207.57 | Saved VRAM holds more fixed experts |
+| Head partitioning, later control | 208.10 | All token IDs exact |
+| Shared KV suffix, automatic cache pool | 209.20 | Independent process, no decode major faults |
+| Shared KV suffix, pool 1 | 209.24 | No material difference from automatic selection |
+| V5 binary with both new features disabled | 201.14 | Original recipe; all IDs exact, no decode major faults |
+
+`FNX_ATTN_HEAD_SPLIT=1` gives each card twelve query heads and one KV head.
+Within that head, both original position partitions are retained, including
+merge order. The existing page layout stores the two virtual partitions in
+its two head slots, so page sizes and KV capacity are unchanged. The compact
+Q/K/V projections save about 224 MiB per card and remove peer attention merge.
+Prefill deliberately retains the original full-matrix GEMM shapes and leading
+dimensions: compact GEMM shapes changed reduction order and failed token
+identity. Unowned projection rows are zero-filled in the existing staging
+buffer, then owned outputs are gathered. This costs no persistent extra buffer.
+The feature requires the two-card Flash-Next HIP build, one lane and
+`FNX_BATCH_DRAFTS=0`; other attention layouts retain the original path.
+
+`FNX_STATIC_CACHE_ARENA=1` makes one allocation serve both the KV page pool and
+one static expert cache pool. Initially 16 KV pages are reserved; unused suffix
+pages hold additional host-backed cache entries. Before KV grows, existing
+arena lending logic evicts intersecting entries back to their immutable host
+pointers, waits for completion and zeros the newly exposed pages. Returning
+pages leaves empty CLOCK slots that fill on demand. Even at maximum context,
+the original cache slot budget remains available. The default placement adds
+218 slots per card in this configuration. The model's original `FNX_ARENA`
+placement remains disabled; static hot experts never move to host memory.
+`FNX_STATIC_CACHE_ARENA_BASE_PAGES` can select a prefix from 1 to the allocated
+KV capacity. `FNX_STATIC_CACHE_ARENA_POOL=-1` selects the pool with most slots;
+0 or 1 select an existing pool explicitly. Static cache and one lane are required.
+
+Evidence is under `bench/results/2026-11-04-rx7900xtx-decode220/`.
+`candidate-v5.patch` records the tested implementation before further tuning.
+`run-heads-experiment.sh` carries the same benchmark inputs and permits
+`TP_EXE`/`TP_EXPERT_RAM_GIB` overrides; it does not replace the accepted
+`reproduce-200.sh` recipe. The V5 binary is
+`build-tensor-parralize-baseline/strata-split-static-kv-v5`, SHA256
+`898a2a7f50be02dd3a40e38bcd041ec7f4ee73db7a429044ca9d0e2de2ca0c53`.
+The automatic-pool V4 repeat uses SHA256
+`1906db9a24ccb1838e9c0ca1ddeb736b78d6c974e1e06c2c59bafb2bda62a2a7`.
+The first V4 panel had decode major faults after compilation and is not used
+as performance evidence; the subsequent process had none.
+
+Validation so far:
+
+- 21504 exact attention/append comparisons on both cards: every T=1..16,
+  both merge orders, F16/int8 KV, page boundaries and graph replay.
+- 192 exact prompt GEMM comparisons preserving original shapes. Naive compact
+  shapes failed 40 of 192 corresponding comparisons and were discarded.
+- 21945 host shared-region layout checks; 6144 exact GPU cache comparisons,
+  including 2304 lending/returning cases, both pools, non-aligned slot counts,
+  coherent/non-coherent backing, fixed hot entries, guards and graph replay.
+- The three reviewed code tasks match the reference output and pass all 1326
+  checks. Both Chinese prompts (1024 outputs), 32688-input/64-output context
+  boundary, fixed seeded sampling with penalties, and forced arena churn all
+  match their reference tokens. The near-context run grows the pool through
+  16, 80, 144 and 172 pages, lending all 218 extra slots. See
+  `static-kv-v5-validation.json` and `validate-static-kv-v5.sh`.
+
+Peer ring batches of 2 and 4 passed 2880 exact checks but measured 207.76 and
+207.63 against the 208.10 original-path control, so the implementation was
+removed. `HIP_FORCE_DEV_KERNARG=1` and `HSA_ENABLE_SDMA=0` also showed no material
+gain. Speculation limits 4 and 5 measured 203.09 and 206.96, so the limit remains
+6. These are measured local outcomes, not general recommendations for other
+models or machines. CUDA, concurrent serving and the production 204800-context
+configuration remain outside this new validation.
+
+### Gate/up cache fill in the expert compute launch (V7)
+
+`FNX_STATIC_CACHE_FUSED_GU=1` fills a cold IQ expert's gate/up rows in the
+thread block that computes those rows. Coalesced reads from the immutable host
+backing populate both the VRAM cache slot and shared memory; that block then
+uses the shared copy. Hot jobs can start immediately. The original integer
+dots, per-lane floating-point accumulation and reduction order are unchanged.
+The existing down-copy prefix remains in the same launch. Kernel completion
+publishes all copied bytes before subsequent down work or later cache hits.
+
+This path requires the static expert cache, `FNX_STATIC_CACHE_FUSED_DN>0`,
+`FNX_MOE_STAGE=0`, IQ reuse with 16 lanes per row, and two-card HIP Flash-Next.
+IQ2_S, IQ3_XXS and IQ3_S gate/up weights are supported. Other quantizations and
+MTP keep their existing paths. Deferred GU copy still runs the cache planner
+when prefetch probing is enabled. The feature is disabled by default.
+
+On the full six-request panel, the V7 candidate measured **210.93794 tokens/s**
+versus **209.34024** with only this flag disabled in the same binary, a 0.76%
+improvement. All six requests improved; all output IDs and draft acceptance
+matched, and both processes had zero decode major faults. The 220 target
+remains unmet. The binary is
+`build-tensor-parralize-baseline/strata-split-gu-cache-v7`, SHA256
+`3cad60618315c9fbe249f38731b655c821997246fc27b7244b40bdbaebd0cffe`.
+See `run-gu-cache-v7.sh`, `gu-cache-v7-same-binary.json`,
+`validate-gu-cache-v7.sh` and `gu-cache-v7-validation.json` in the November 4
+evidence directory.
+
+Validation includes 12288 exact GPU gate/up, cache-byte, down-copy and guard
+comparisons across both cards, all T=1..16, all three IQ formats, coherent and
+non-coherent host backing, partial final row groups, changing routes/weights,
+and graph replay. The existing 6144 GPU cache checks also passed. The three
+reviewed code tasks pass all 1326 checks and match their reference outputs.
+The 32688-input/64-output context boundary, two 1024-token Chinese generations,
+fixed seeded sampling with penalties, forced cache churn, and prefetch-probe
+output prefixes all match the reference.
+
+The following alternatives were measured and retained only as scratch
+experiments: fusing cache copy with shared-expert down had no end-to-end gain;
+reading newly copied GU rows from global memory had no consistent advantage
+over shared memory; a per-block-flag HC barrier was slower than the existing
+atomic barrier; raising compact HC's grid from 80 to 96 blocks was slower.
+An exact INT8 WMMA dense-Q8 prototype passed 864 direct/graph comparisons,
+but regressed the common seven-token shapes and was not integrated.

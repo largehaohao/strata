@@ -252,6 +252,9 @@ private:
     // FNX_ARENA: pages [0, arena_base_) are the K/V pool's own, [arena_base_, arena_w_) borrowed from the arena pool's
     // slots (the coldest first), up to arena_cap_ (the pool keeps 2 MAXT TOPK slots on every card); all 0 without one
     int arena_base_ = 0, arena_w_ = 0, arena_cap_ = 0;
+    bool static_arena_ = false;   // unused K/V pages hold only host-backed static-cache entries
+    ExpertCache& arena_cache(int c);
+    const ExpertCache& arena_cache(int c) const;
     std::chrono::steady_clock::time_point arena_last_lend_{};
     void arena_fill(int c, cudaStream_t st);   // card c's arena pool slots from the experts' host copies, the tables (on st)
     size_t arena_slot_off(int c) const;     // where card c's arena pool slots start in its pool allocation

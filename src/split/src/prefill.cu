@@ -11,6 +11,7 @@
 #include "engine.hpp"
 #include "engine_impl.hpp"
 #include "env.hpp"
+#include "attn_head_split.hpp"
 #include "pf_ring_plan.hpp"
 #if FNX_HIP
 #include "hip/rccl.h"
@@ -437,6 +438,27 @@ void pf_dense_xh(Engine::Pf& p, const Q8S& w, int rows, int cols, int C, float* 
         pf_gemm(p, p.wh, nr, cols, p.xh, C, out + r0, ldo, s);
     }
 }
+// A head shard keeps the original prompt GEMM's row slices, output stride and
+// row offsets. Changing those shapes can select a different BLAS reduction and
+// perturb greedy decoding. Missing heads are zero-filled in the existing staging
+// buffer; after each original-shape product, only the owned rows are retained.
+void pf_dense_head_xh(Engine::Pf& p, const Q8S& w, int rows, int full_rows, int first, int cols,
+                      int C, float* out, cudaStream_t s) {
+    const int slice = (int) std::min<size_t>(full_rows, PF_WH / cols / 128 * 128);
+    for (int r0 = 0; r0 < full_rows; r0 += slice) {
+        const int nr = std::min(slice, full_rows - r0);
+        const int lo = std::max(first, r0), hi = std::min(first + rows, r0 + nr);
+        if (hi <= lo) continue;
+        ckc(cudaMemsetAsync(p.wh, 0, (size_t) nr * cols * sizeof(__half), s), "head weight padding");
+        k_q8s_f16<<<grid_for((size_t) (hi - lo) * cols), 256, 0, s>>>(w.q + (size_t) (lo - first) * cols,
+            w.d + (size_t) (lo - first) * cols / 32, (size_t) (hi - lo) * cols, p.wh + (size_t) (lo - r0) * cols);
+        pf_gemm(p, p.wh, nr, cols, p.xh, C, out + r0, full_rows, s);
+    }
+    ckc(cudaMemcpy2DAsync(p.xf, (size_t) rows * sizeof(float), out + first, (size_t) full_rows * sizeof(float),
+        (size_t) rows * sizeof(float), C, cudaMemcpyDeviceToDevice, s), "head projection gather");
+    ckc(cudaMemcpyAsync(out, p.xf, (size_t) C * rows * sizeof(float), cudaMemcpyDeviceToDevice, s), "head projection compact");
+}
+
 // the same from x (f32, C rows of cols), converted into p.xh first
 void pf_dense(Engine::Pf& p, const Q8S& w, int rows, int cols, const float* x, int C, float* out, int ldo, cudaStream_t s) {
     k_f32_f16<<<grid_for((size_t) C * cols), 256, 0, s>>>(x, (size_t) C * cols, p.xh);
@@ -662,8 +684,8 @@ void Engine::prefill_alloc() {
             p->att = a.take<float>((size_t) pf_c_ * w.nq * HD);
             p->yidx = a.take<float>((size_t) pf_c_ * qsa_rows());
             p->qidx = a.take<float>((size_t) pf_c_ * 512);
-            p->cells = a.take<int>((size_t) pf_c_ * qsa_maxsel());
-            p->ncells = a.take<int>(pf_c_);
+            p->cells = a.take<int>((size_t) attn_position_partitions() * pf_c_ * qsa_maxsel());
+            p->ncells = a.take<int>(attn_position_partitions() * pf_c_);
             if (const char* qr = std::getenv("FNX_PF_QSA_ROWS")) {
                 char* end = nullptr;
                 const long v = std::strtol(qr, &end, 10);
@@ -971,9 +993,15 @@ void Engine::prefill_draft(int C, int set) {
             pf_dense(p, L.idx_qk.s, qsa_rows(), N, p.mixed, C, p.yidx, qsa_rows(), s);
         }
         qsa_index(p.yidx, L.idx_qn, L.idx_kn, b.mtp_qsa_ring, b.mtp_qsa_pooled, b.pg, p.qidx, p.ctl, C, eps, rope_of(b.mrope), s);
-        pf_dense(p, L.wk.s, NKVH * HD, N, p.mixed, C, p.k, NKVH * HD, s);
-        pf_dense(p, L.wv.s, NKVH * HD, N, p.mixed, C, p.v, NKVH * HD, s);
-        attn_prep(nullptr, p.k, L.q_norm, L.k_norm, 0, NKVH, p.ctl, C, eps, rope_of(b.mrope), s);
+        if (attn_head_split()) {
+            k_f32_f16<<<grid_for((size_t) C * N), 256, 0, s>>>(p.mixed, (size_t) C * N, p.xh);
+            pf_dense_head_xh(p, L.wk.s, L.wk.n_out, NKVH * HD, c * HD, N, C, p.k, s);
+            pf_dense_head_xh(p, L.wv.s, L.wv.n_out, NKVH * HD, c * HD, N, C, p.v, s);
+        } else {
+            pf_dense(p, L.wk.s, L.wk.n_out, N, p.mixed, C, p.k, L.wk.n_out, s);
+            pf_dense(p, L.wv.s, L.wv.n_out, N, p.mixed, C, p.v, L.wv.n_out, s);
+        }
+        attn_prep(nullptr, p.k, L.q_norm, L.k_norm, 0, attn_projected_kv_heads(), p.ctl, C, eps, rope_of(b.mrope), s);
         kv_append(p.k, p.v, b.mtp_kc, b.mtp_vc, b.pg, b.att_ring.card, C, p.ctl, s);
         ckc(cudaGetLastError(), "draft layer (prompt)");
     }
@@ -1206,10 +1234,17 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
                 } else {
                     finish_att(c, b, w, p, l);   // the previous chunk's, before qg is this chunk's
                     // mixed to f16 again (finish_att's wo used xh), then k and v from that
-                    pf_dense(p, L.wq.s, NQH * 2 * HD, N, p.mixed, C, p.qg, NQH * 2 * HD, s);
-                    pf_dense_xh(p, L.wk.s, NKVH * HD, N, C, p.k, NKVH * HD, s);
-                    pf_dense_xh(p, L.wv.s, NKVH * HD, N, C, p.v, NKVH * HD, s);
-                    attn_prep(p.qg, p.k, L.q_norm, L.k_norm, NQH, NKVH, p.ctl, C, eps, rope_of(b.mrope), s);
+                    if (attn_head_split()) {
+                        k_f32_f16<<<grid_for((size_t) C * N), 256, 0, s>>>(p.mixed, (size_t) C * N, p.xh);
+                        pf_dense_head_xh(p, L.wq.s, L.wq.n_out, NQH * 2 * HD, w.q0 * 2 * HD, N, C, p.qg, s);
+                        pf_dense_head_xh(p, L.wk.s, L.wk.n_out, NKVH * HD, w.kv0 * HD, N, C, p.k, s);
+                        pf_dense_head_xh(p, L.wv.s, L.wv.n_out, NKVH * HD, w.kv0 * HD, N, C, p.v, s);
+                    } else {
+                        pf_dense(p, L.wq.s, L.wq.n_out, N, p.mixed, C, p.qg, L.wq.n_out, s);
+                        pf_dense_xh(p, L.wk.s, L.wk.n_out, N, C, p.k, L.wk.n_out, s);
+                        pf_dense_xh(p, L.wv.s, L.wv.n_out, N, C, p.v, L.wv.n_out, s);
+                    }
+                    attn_prep(p.qg, p.k, L.q_norm, L.k_norm, attn_projected_q_heads(), attn_projected_kv_heads(), p.ctl, C, eps, rope_of(b.mrope), s);
                     kv_append(p.k, p.v, b.kc[l], b.vc[l], b.pg, b.att_ring.card, C, p.ctl, s);
                     // the indexer: bf16 projections as f32 (llama.cpp's choice past 8 rows on a V100)
                     k_bf16_f32<<<grid_for((size_t) 512 * N), 256, 0, s>>>(L.idx_wq, (size_t) 512 * N, p.widx);
@@ -1223,17 +1258,21 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
                         const int r0 = g * AR, Tg = std::min(AR, C - r0);
                         const int* gctl = p.ctl + 2 + 2 * (r0 / MAXT);
                         qsa_select(p.qidx + (size_t) r0 * 512, b.qsa_pooled[l], b.pg, p.scores, p.cells + (size_t) r0 * qsa_maxsel(),
-                                   p.ncells + r0, max_ctx_ / 4, gctl, Tg, b.att_ring.card, s);
+                                   p.ncells + r0, max_ctx_ / 4, gctl, Tg, b.att_ring.card, s, C);
                         if (!p.attn_dec) continue;
-                        attn(p.qg + (size_t) r0 * NQH * 2 * HD, b.kc[l], b.vc[l], b.pg, p.att + (size_t) r0 * w.nq * HD, b.att_ring,
+                        attn(p.qg + (size_t) r0 * attn_projected_q_heads() * 2 * HD, b.kc[l], b.vc[l], b.pg, p.att + (size_t) r0 * w.nq * HD, b.att_ring,
                              (const unsigned*) (gctl + 1), 128 + l, gctl, Tg, b.att_part, s, p.cells + (size_t) r0 * qsa_maxsel(),
-                             p.ncells + r0);
+                             p.ncells + r0, C);
                     }
-                    if (!p.attn_dec && p.overlap) {
+                    if (!p.attn_dec && p.overlap && !attn_head_split()) {
                         pf_attn_start(p, b, b.kc[l], b.vc[l], c, C, j & 1, s);   // merged by finish_att
                         p.att_pend = j, p.att_pend_rows = C;
                     } else {
-                        if (!p.attn_dec) pf_attention(p, b, b.kc[l], b.vc[l], c, C, s);
+                        if (!p.attn_dec) {
+                            if (attn_head_split()) attn_prompt_heads(p.qg, b.kc[l], b.vc[l], b.pg, p.ctl, p.cells, p.ncells,
+                                c, C, p.apart[0], p.att, s);
+                            else pf_attention(p, b, b.kc[l], b.vc[l], c, C, s);
+                        }
                         pf_dense(p, L.wo.s, N, w.nq * HD, p.att, C, p.bo_a, N, s);
                     }
                 }
@@ -1242,7 +1281,7 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
             each([&](int c, CardBuf& b, const CardW&, Pf& p) {
                 if (p.ring_sm) ring_sum(p.ring, p.bo_a, C, (const unsigned*) (p.ctl + 1), 2 * l, b.st);
                 else if (p.overlap) {
-                    if (!is_attn(l) || p.attn_dec) ring_async(c, b, p, p.bo_a, nullptr, j, p.ev_ra[j], C);   // else finish_att's
+                    if (!is_attn(l) || p.attn_dec || attn_head_split()) ring_async(c, b, p, p.bo_a, nullptr, j, p.ev_ra[j], C);   // else finish_att's
                 } else pf_ring(p, c, p.bo_a, C, nullptr, b.ring.err, b.st);
             });
         }

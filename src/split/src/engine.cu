@@ -4,6 +4,7 @@
 #include "engine.hpp"
 #include "engine_parts.hpp"
 #include "env.hpp"
+#include "attn_head_split.hpp"
 #include "peer_probe.hpp"
 
 #include <cuda_runtime.h>
@@ -31,6 +32,7 @@ namespace fnx {
 
 
 Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
+    attn_head_check_runtime(lanes, batch_drafts() != BatchDrafts::off);
     // the 27B build's settings: this Flash-Next engine has none of what they set, so one given is a mistake, not a
     // run of the default
     for (const char* k : {"FNX_PF_SKIP", "FNX_PF_SKIP_CONFIRM", "FNX_PF_SCORE_MIB", "FNX_PF_WINDOWS", "FNX_PF_SCORES",
@@ -78,6 +80,14 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
     if (fused_dn < 0 || fused_dn > 256 ||
         (fused_dn && (!static_slots || env_int("FNX_IQ_REUSE", 0) != 1 || env_int("FNX_IQ_GROUP", 32) != 16)))
         throw std::runtime_error("FNX_STATIC_CACHE_FUSED_DN: 0..256 blocks, needs static cache and IQ reuse group 16");
+    const long long fused_gu = env_int("FNX_STATIC_CACHE_FUSED_GU", 0);
+    if (fused_gu != 0 && fused_gu != 1)
+        throw std::runtime_error("FNX_STATIC_CACHE_FUSED_GU: expected 0 or 1");
+    if (fused_gu && (!fused_dn || env_flag("FNX_MOE_STAGE")))
+        throw std::runtime_error("FNX_STATIC_CACHE_FUSED_GU requires fused down copy and FNX_MOE_STAGE=0");
+#if !(FNX_HIP && FNX_NCARD == 2 && !FNX_27B)
+    if (fused_gu) throw std::runtime_error("FNX_STATIC_CACHE_FUSED_GU requires the two-card Flash-Next HIP build");
+#endif
     const long long replay = env_int("FNX_GDN_REPLAY", 0);
     if (replay != 0 && replay != 1) throw std::runtime_error("FNX_GDN_REPLAY: expected 0 or 1");
     if (replay) {
@@ -117,6 +127,23 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         std::fprintf(stderr, "fnx: int8 K/V: %d context pages (%d positions) for requested context %d; spare capacity expansion disabled\n",
                      ctx_pages, ctx_pages * KVP_POS, max_ctx);
     int n_pages = ctx_pages + extra_pages;
+    const long long static_arena = env_int("FNX_STATIC_CACHE_ARENA", 0);
+    if (static_arena != 0 && static_arena != 1)
+        throw std::runtime_error("FNX_STATIC_CACHE_ARENA: expected 0 or 1");
+    if (static_arena) {
+#if FNX_HIP && FNX_NCARD == 2 && !FNX_27B
+        if (!static_slots || lanes != 1 || m.arena)
+            throw std::runtime_error("FNX_STATIC_CACHE_ARENA requires a static decode cache, one lane and FNX_ARENA=0");
+        const long long base = env_int("FNX_STATIC_CACHE_ARENA_BASE_PAGES", std::min(n_pages, 16));
+        if (base < 1 || base > n_pages)
+            throw std::runtime_error("FNX_STATIC_CACHE_ARENA_BASE_PAGES: outside the K/V page capacity");
+        static_arena_ = true;
+        arena_base_ = arena_w_ = (int) base;
+        arena_cap_ = n_pages;
+#else
+        throw std::runtime_error("FNX_STATIC_CACHE_ARENA requires the two-card Flash-Next HIP build");
+#endif
+    }
     // FNX_PEER (AMD only; hip/peer_policy.hpp has the rules: 0 host exchange, 1 try the peer push, unset the build's default): every directed pair is probed at start
     // (kernel stores into the peer, a full read-back compare on both sides, a flag round trip); any failure leaves the host exchange for the whole run with one line.
     // FNX_PEER_PARTS: 1 the window sums, 2 the attention merge, 3 both (the default)
@@ -226,7 +253,11 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
             b->dense[T] = dalloc<Job>(1);
             ck(cudaMemcpy(b->dense[T], &j, sizeof j, cudaMemcpyHostToDevice), "dense job");
         }
-        if (static_slots) b->static_cache = static_decode_cache(m, w, (int) static_slots, (int) static_groups);
+        if (static_slots) {
+            const size_t page = kvp_page(c) * sizeof(uint16_t);
+            b->static_cache = static_decode_cache(m, w, (int) static_slots, (int) static_groups,
+                static_arena_ ? (size_t) n_pages * page : 0, static_arena_ ? arena_slot_off(c) : 0);
+        }
         if (w.ec.n_slots || b->static_cache.n_slots) b->cache_list = dalloc<int>(1 + P);
         b->gu = dalloc<float>((size_t) (P + MAXT) * 2 * ffs);
         b->part = dalloc<float>((size_t) (P + MAXT) * N);
@@ -275,8 +306,8 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         b->qsa_y = dalloc<float>((size_t) MAXT * qsa_rows());
         b->qsa_q = dalloc<float>((size_t) MAXT * 512);
         b->qsa_scores = dalloc<float>((size_t) MAXT * (max_ctx / 4));
-        b->qsa_cells = dalloc<int>((size_t) MAXT * qsa_maxsel());
-        b->qsa_ncells = dalloc<int>(MAXT);
+        b->qsa_cells = dalloc<int>((size_t) attn_position_partitions() * MAXT * qsa_maxsel());
+        b->qsa_ncells = dalloc<int>(attn_position_partitions() * MAXT);
         const size_t snap_floats = (size_t) (gdn_replay_ ? 1 : MAXT - 1) * w.nv() * HS * HS;
         const size_t update_floats = gdn_replay_ ? (size_t) (MAXT - 2) * w.nv() * GDN_REPLAY_STRIDE : 0;
         int n_rec = 0;
@@ -425,7 +456,11 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         ck(cudaSetDevice(b->dev), "cudaSetDevice");
         // the K/V pool and lane 0's page table (pages taken as it grows); with an arena the pool is its start and
         // n_pages counts the pages it can grow to
-        if (m.arena) {
+        if (static_arena_) {
+            ExpertCache& ec = b->static_cache;
+            b->n_pages = arena_cap_;
+            b->pool = reinterpret_cast<uint16_t*>(ec.pool[ec.arena_pool] - arena_slot_off(c));
+        } else if (m.arena) {
             ExpertCache& ec = m.cards[c].ec;
             const int p = ec.arena_pool;
             b->n_pages = arena_cap_;
@@ -467,11 +502,11 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
     }
     for (CardBuf* b : cb_) { ck(cudaSetDevice(b->dev), "set"); ck(cudaDeviceSynchronize(), "init sync"); }
     lanes_.emplace_back();
-    for (int i = m.arena ? arena_base_ : cb_[0]->n_pages; i-- > 0;) free_pages_.push_back(i);   // taken from the back: low pages first
-    if (m.arena) {
+    for (int i = arena_cap_ ? arena_base_ : cb_[0]->n_pages; i-- > 0;) free_pages_.push_back(i);   // taken from the back: low pages first
+    if (arena_cap_) {
         std::string per;
         for (int c = 0; c < NCARD; ++c) {
-            const ExpertCache& ec = m.cards[c].ec;
+            const ExpertCache& ec = arena_cache(c);
             const int p = ec.arena_pool;
             char buf[96];
             std::snprintf(buf, sizeof buf, "%s%d x %.2f MiB (%.1f GiB)", c ? ", " : "", ec.n[p], ec.slot_bytes[p] / 1048576.0,
@@ -510,6 +545,13 @@ void Engine::tags_room(unsigned n) {
 
 // an arena's K/V pool grows by at least this many pages a lend (64: ~12k positions f16), so lends stay rare
 constexpr int ARENA_STEP = 64;
+
+ExpertCache& Engine::arena_cache(int c) {
+    return static_arena_ ? cb_[c]->static_cache : m_.cards[c].ec;
+}
+const ExpertCache& Engine::arena_cache(int c) const {
+    return static_arena_ ? cb_[c]->static_cache : m_.cards[c].ec;
+}
 
 size_t Engine::arena_slot_off(int c) const {
     return ((size_t) arena_base_ * kvp_page(c) * sizeof(uint16_t) + 255) & ~(size_t) 255;
@@ -565,7 +607,7 @@ void Engine::arena_fill(int c, cudaStream_t st) {
 }
 
 int Engine::arena_slots_for(int c, int w) const {
-    const ExpertCache& ec = m_.cards[c].ec;
+    const ExpertCache& ec = arena_cache(c);
     const long need = (long) w * (long) (kvp_page(c) * sizeof(uint16_t)) - (long) arena_slot_off(c);
     if (need <= 0) return 0;
     const long sb = (long) ec.slot_bytes[ec.arena_pool];
@@ -583,7 +625,7 @@ std::vector<int> Engine::arena_lent() const {
 // the hottest first (the profile's score), copied in from its host copy (the card idle). Nothing lent then means every
 // expert is in a slot, which the plan's early return relies on (cache_plan, moe.cuh)
 void Engine::arena_refill(int c, int from, int to) {
-    ExpertCache& ec = m_.cards[c].ec;
+    ExpertCache& ec = arena_cache(c);
     const CardW& w = m_.cards[c];
     const int p = ec.arena_pool, s0 = ec.s0[p];
     std::vector<int> slot_of((size_t) NL * NEXP);
@@ -619,7 +661,7 @@ void Engine::arena_refill(int c, int from, int to) {
 }
 
 // lending: the slots' experts to RAM (their tables first), then K/V may write there; giving back: the pages are free,
-// the slots come back and are filled again at once (arena_refill). Every card idle first: a window or a prompt pass in
+// model-arena slots refill immediately; static-cache slots refill on demand. Every card idle first: a window or a prompt pass in
 // flight may read a slot being lent, or a page being given back
 void Engine::arena_set(int w) {
     if (w == arena_w_) return;
@@ -627,14 +669,15 @@ void Engine::arena_set(int w) {
     const auto t0 = std::chrono::steady_clock::now();
     for (int c = 0; c < NCARD; ++c) {
         CardBuf& b = *cb_[c];
-        const ExpertCache& ec = m_.cards[c].ec;
+        const ExpertCache& ec = arena_cache(c);
         ck(cudaSetDevice(b.dev), "set");
         ck(cudaDeviceSynchronize(), "arena: cards idle");
         const int from = arena_slots_for(c, arena_w_), to = arena_slots_for(c, w);
-        if (to > ec.n[ec.arena_pool] - 2 * MAXT * TOPK) throw std::runtime_error("arena: card " + std::to_string(c) + " would keep too few slots");
+        const int keep = (static_arena_ ? 1 : 2) * MAXT * TOPK;
+        if (to > ec.n[ec.arena_pool] - keep) throw std::runtime_error("arena: card " + std::to_string(c) + " would keep too few slots");
         arena_slots(ec, from, to, b.st);
         ck(cudaStreamSynchronize(b.st), "arena: slots");
-        if (to < from) arena_refill(c, from, to);
+        if (to < from && !static_arena_) arena_refill(c, from, to);
     }
     if (w > arena_w_) {
         for (int pg = arena_w_; pg < w; ++pg) free_pages_.push_back(pg);
@@ -656,7 +699,7 @@ void Engine::arena_set(int w) {
     std::string per;
     double gib = 0;
     for (int c = 0; c < NCARD; ++c) {
-        const ExpertCache& ec = m_.cards[c].ec;
+        const ExpertCache& ec = arena_cache(c);
         per += (c ? " / " : "") + std::to_string(now[(size_t) c]);
         gib = std::max(gib, (double) now[(size_t) c] * ec.slot_bytes[ec.arena_pool] / (1ull << 30));
     }
@@ -942,7 +985,7 @@ void Engine::attention(int T, CardBuf& b, const CardW& w, const LayerW& L, uint1
     qsa(L.idx_wq, L.idx_wk, b.mixed, b.qsa_y, L.idx_qn, L.idx_kn, qsa_ring, qsa_pooled, b.pg, b.qsa_q, b.qsa_scores, b.qsa_cells,
         b.qsa_ncells, max_ctx_ / 4, ctl, T, m_.eps, rope_of(b.mrope), b.att_ring.card, b.st);
     if (L.wq.s.q && L.wk.s.q && L.wv.s.q && L.wq.n_in == L.wk.n_in && L.wq.n_in == L.wv.n_in &&
-        L.wq.n_out + L.wk.n_out + L.wv.n_out >= 8192) {   // q, k and v in one launch (compiled for 8192 rows and more)
+        (L.wq.n_out + L.wk.n_out + L.wv.n_out >= 8192 || attn_head_split())) {   // q, k and v in one launch (compiled for 8192 rows and more)
         const Q8S ws[3] = {L.wq.s, L.wk.s, L.wv.s};
         const int rows[3] = {L.wq.n_out, L.wk.n_out, L.wv.n_out};
         float* const outs[3] = {b.qg, b.k, b.v};
@@ -982,6 +1025,8 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
     static const int fused_dn_blocks = (int) env_int("FNX_STATIC_CACHE_FUSED_DN", 0);
     const bool fused_dn = static_live && fused_dn_blocks &&
         (L.gu_e.type == T_IQ2_S || L.gu_e.type == T_IQ3_XXS || L.gu_e.type == T_IQ3_S);
+    static const bool fused_gu_enabled = env_int("FNX_STATIC_CACHE_FUSED_GU", 0) == 1;
+    const bool fused_gu = fused_dn && fused_gu_enabled;
     const bool live = (static_live || cache_live()) && lyr >= 0 && lyr < NL;
     const bool plan_in_router = live && !b.probe_cnt;
     router_route(L.router, b.mixed, b.logits, T, b.topi, b.topw, b.jobs_gu, b.jobs_dn, b.njobs, b.st, plan_in_router ? &ec : nullptr,
@@ -999,7 +1044,7 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
             }
         }
         // the planned experts copied into their slots before the MoE kernels read the layer's tables
-        if (live) moe_cache(l, L.gu_e_stride, L.down_e_stride, ec, b.cache_list, b.st, plan_in_router ? nullptr : b.jobs_gu, b.njobs, static_live, fused_dn);
+        if (live) moe_cache(l, L.gu_e_stride, L.down_e_stride, ec, b.cache_list, b.st, plan_in_router ? nullptr : b.jobs_gu, b.njobs, static_live, fused_dn, fused_gu);
     }
     // MTP also calls ffn_half with a layer outside the main model's layer array.
     const unsigned char* hot = b.moe_stage_hot && lyr >= 0 && lyr < NL
@@ -1011,13 +1056,15 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
     }
     const DW gu = stage_moe(gu_source, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.moe_stage, b.moe_stage_ep, b.st, hot);
     CacheDownCopy copy;
+    const CacheGateUpCopy gu_copy{ec.host_gu, b.cache_list, lyr};
     if (fused_dn) {
         const int p = ec.pool_of[lyr];
         copy = {ec.host_dn, ec.slot_of, b.cache_list, ec.pool[p], ec.slot_bytes[p], ec.dn_off[p],
                 L.down_e_stride, ec.s0[p], fused_dn_blocks};
     }
     if (sh_in) moe_gate_up(gu, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st, &L.sh_down.s, ffs, b.sh_gu, b.part + (size_t) P * N);
-    else moe_gate_up(gu, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st, nullptr, 0, nullptr, nullptr, fused_dn ? &copy : nullptr);
+    else moe_gate_up(gu, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st, nullptr, 0, nullptr, nullptr,
+                     fused_dn ? &copy : nullptr, fused_gu ? &gu_copy : nullptr);
     const DW down = stage_moe(down_source, L.down_e_stride, b.jobs_dn, b.njobs, P, b.moe_stage, b.moe_stage_ep, b.st, hot);
     moe_down(down, L.down_e_stride, b.jobs_dn, b.njobs, P, b.gu, b.part, b.st);
     if (!sh_in) ck(cudaStreamWaitEvent(b.st, b.join, 0), "join wait");
@@ -1150,9 +1197,9 @@ void Engine::enqueue_batch(const std::vector<int>& lanes) {
                     pg.pt = LD.pt;
                     qsa_index(b.qsa_y + (size_t) r * qsa_rows(), L.idx_qn, L.idx_kn, LD.ring[l], b.qsa_pooled[l], pg, b.qsa_q + (size_t) r * 512,
                               LD.ctl, 1, eps, rope_of(LD.mrope), b.st);
-                    attn_prep(b.qg + (size_t) r * NQH * 2 * HD, b.k + (size_t) r * NKVH * HD, L.q_norm, L.k_norm, NQH, NKVH, LD.ctl, 1, eps,
+                    attn_prep(b.qg + (size_t) r * attn_projected_q_heads() * 2 * HD, b.k + (size_t) r * attn_projected_kv_heads() * HD, L.q_norm, L.k_norm, attn_projected_q_heads(), attn_projected_kv_heads(), LD.ctl, 1, eps,
                               rope_of(LD.mrope), b.st);
-                    kv_append(b.k + (size_t) r * NKVH * HD, b.v + (size_t) r * NKVH * HD, b.kc[l], b.vc[l], pg, b.att_ring.card, 1, LD.ctl,
+                    kv_append(b.k + (size_t) r * attn_projected_kv_heads() * HD, b.v + (size_t) r * attn_projected_kv_heads() * HD, b.kc[l], b.vc[l], pg, b.att_ring.card, 1, LD.ctl,
                               b.st);
                 }
                 // every row's selection and attention partials at once, each on its lane's position and pages
@@ -1237,9 +1284,9 @@ void Engine::enqueue_rows(const std::vector<int>& lanes, const std::vector<int>&
                     const int k = counts[(size_t) i];
                     qsa_index(b.qsa_y + r * qsa_rows(), L.idx_qn, L.idx_kn, LD.ring[l], b.qsa_pooled[l], pg, b.qsa_q + r * 512, LD.ctl, k, eps,
                               rope_of(LD.mrope), b.st);
-                    attn_prep(b.qg + r * NQH * 2 * HD, b.k + r * NKVH * HD, L.q_norm, L.k_norm, NQH, NKVH, LD.ctl, k, eps,
+                    attn_prep(b.qg + r * attn_projected_q_heads() * 2 * HD, b.k + r * attn_projected_kv_heads() * HD, L.q_norm, L.k_norm, attn_projected_q_heads(), attn_projected_kv_heads(), LD.ctl, k, eps,
                               rope_of(LD.mrope), b.st);
-                    kv_append(b.k + r * NKVH * HD, b.v + r * NKVH * HD, b.kc[l], b.vc[l], pg, b.att_ring.card, k, LD.ctl, b.st);
+                    kv_append(b.k + r * attn_projected_kv_heads() * HD, b.v + r * attn_projected_kv_heads() * HD, b.kc[l], b.vc[l], pg, b.att_ring.card, k, LD.ctl, b.st);
                 }
                 const LaneRows lr{b.lane_rows[(size_t) T], b.lane_rows[(size_t) T] + MAXT};
                 qsa_select_lanes(b.qsa_q, b.qsa_pooled[l], b.pg, b.qsa_scores, b.qsa_cells, b.qsa_ncells, mp, lr, T, b.att_ring.card, b.st);
@@ -1427,8 +1474,8 @@ void Engine::mtp_enqueue_lanes(const std::vector<DraftReq>& reqs, int T) {
             const int k = reqs[(size_t) i].T;
             const int* lc = b.mtp_lctl + 2 * i;
             qsa_index(b.qsa_y + r * qsa_rows(), L.idx_qn, L.idx_kn, LD.mtp_ring, b.mtp_qsa_pooled, pg, b.qsa_q + r * 512, lc, k, eps, rope_of(LD.mrope), b.st);
-            attn_prep(b.qg + r * NQH * 2 * HD, b.k + r * NKVH * HD, L.q_norm, L.k_norm, NQH, NKVH, lc, k, eps, rope_of(LD.mrope), b.st);
-            kv_append(b.k + r * NKVH * HD, b.v + r * NKVH * HD, b.mtp_kc, b.mtp_vc, pg, b.att_ring.card, k, lc, b.st);
+            attn_prep(b.qg + r * attn_projected_q_heads() * 2 * HD, b.k + r * attn_projected_kv_heads() * HD, L.q_norm, L.k_norm, attn_projected_q_heads(), attn_projected_kv_heads(), lc, k, eps, rope_of(LD.mrope), b.st);
+            kv_append(b.k + r * attn_projected_kv_heads() * HD, b.v + r * attn_projected_kv_heads() * HD, b.mtp_kc, b.mtp_vc, pg, b.att_ring.card, k, lc, b.st);
         }
         const LaneRows lr{b.mtp_lane_rows, b.mtp_lane_rows + MAXT};
         qsa_select_lanes(b.qsa_q, b.mtp_qsa_pooled, b.pg, b.qsa_scores, b.qsa_cells, b.qsa_ncells, mp, lr, T, b.att_ring.card, b.st);

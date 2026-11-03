@@ -137,7 +137,11 @@ endif()
 
 # Explicit kernel comparisons, with the engine's headers and arithmetic flags.
 list(GET STRATA_SPLIT_CARDS 0 _moe_cards)
-foreach(_kind moe_iq moe_down moe_cache dense_q8 mtp_head_gpu)
+set(_fnx_kernel_checks moe_iq moe_down moe_cache dense_q8 mtp_head_gpu)
+if(_fnx_hip AND _moe_cards EQUAL 2)
+  list(APPEND _fnx_kernel_checks attn_heads moe_cache_gu)
+endif()
+foreach(_kind ${_fnx_kernel_checks})
   set(_target split_${_kind}_test)
   set(_source ${_sp}/tools/${_kind}_test.cu)
   add_executable(${_target} EXCLUDE_FROM_ALL ${_source})
@@ -235,3 +239,14 @@ set_target_properties(split_gguf_release_test PROPERTIES CXX_STANDARD 17 CXX_STA
 add_executable(split_static_cache_layout_test EXCLUDE_FROM_ALL ${_sp}/tools/static_cache_layout_test.cpp)
 target_include_directories(split_static_cache_layout_test PRIVATE ${_sp}/src)
 set_target_properties(split_static_cache_layout_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+
+# Host-only validation for the opt-in attention geometry and environment parsing.
+add_executable(split_attn_head_config_test EXCLUDE_FROM_ALL ${_sp}/tools/attn_head_config_test.cpp)
+target_include_directories(split_attn_head_config_test PRIVATE ${_sp}/src)
+target_compile_definitions(split_attn_head_config_test PRIVATE FNX_NCARD=${_moe_cards} FNX_27B=0 FNX_HIP=$<BOOL:${_fnx_hip}>)
+set_target_properties(split_attn_head_config_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+
+# Verify shared-region sizing before allocating or lending any GPU slots.
+add_executable(split_static_kv_cache_test EXCLUDE_FROM_ALL ${_sp}/tools/static_kv_cache_test.cpp)
+target_include_directories(split_static_kv_cache_test PRIVATE ${_sp}/src)
+set_target_properties(split_static_kv_cache_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)

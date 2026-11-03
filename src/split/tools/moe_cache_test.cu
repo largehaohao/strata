@@ -2,7 +2,7 @@
 #define FNX_KPART 0
 #include "../src/kernels.cu"
 #include <iostream>
-#include "../src/static_cache_layout.hpp"
+#include "../src/static_kv_cache.hpp"
 
 namespace fnx {
 void ck(cudaError_t e, const char* what) {
@@ -17,15 +17,17 @@ __global__ void read_cached(ExpertCache ec, int layer, const Job* jobs, const in
         out[j * stride + i] = i < gu_bytes ? ec.ep_gu[g][i] : ec.ep_dn[g][i - gu_bytes];
 }
 
-void run_cache(int dev, int slots, int pattern, bool coherent, int groups = 1) {
+void run_cache(int dev, int slots, int pattern, bool coherent, int groups = 1, bool shared_kv = false, int pool_hint = -1) {
     constexpr int layers = 4, experts = layers * NEXP, capacity = MAXT * TOPK;
     constexpr size_t gu_max = 448, dn_max = 224, stride = gu_max + dn_max, guard = 256;
     std::vector<StaticCacheShape> shapes;
     for (int l = 0; l < layers; ++l) shapes.push_back({(size_t) 256 + l * 64, (size_t) 128 + l * 32});
-    const auto layout = static_cache_layout(shapes, slots, groups, capacity);
+    const auto plan = static_kv_cache_plan(static_cache_layout(shapes, slots, groups, capacity),
+                                            shared_kv ? 65536 : 0, shared_kv ? 4096 : 0, pool_hint);
+    const auto& layout = plan.cache;
     slots = layout.slots;
     ExpertCache ec;
-    ec.n_slots = slots; ec.n_pools = (int) layout.pools.size();
+    ec.n_slots = slots; ec.n_pools = (int) layout.pools.size(); ec.arena_pool = plan.pool;
     for (int p = 0; p < ec.n_pools; ++p) {
         ec.s0[p] = layout.pools[p].start; ec.n[p] = layout.pools[p].slots;
         ec.dn_off[p] = layout.pools[p].gu; ec.slot_bytes[p] = layout.pools[p].stride();
@@ -71,8 +73,9 @@ void run_cache(int dev, int slots, int pattern, bool coherent, int groups = 1) {
     ec.lent = (int*) alloc(EC_POOLS * sizeof(int));
     std::vector<char*> pools;
     for (int p = 0; p < ec.n_pools; ++p) {
-        char* pool = (char*) alloc(ec.n[p] * ec.slot_bytes[p] + 2 * guard);
-        pools.push_back(pool); ec.pool[p] = pool + guard;
+        const size_t prefix = p == plan.pool ? plan.prefix_bytes : 0;
+        char* pool = (char*) alloc(prefix + ec.n[p] * ec.slot_bytes[p] + 2 * guard);
+        pools.push_back(pool); ec.pool[p] = pool + guard + prefix;
     }
     int* list = (int*) alloc((capacity + 1) * sizeof(int));
     Job* jobs = (Job*) alloc(capacity * sizeof(Job));
@@ -84,8 +87,10 @@ void run_cache(int dev, int slots, int pattern, bool coherent, int groups = 1) {
                           std::make_pair((void*) ec.lent, EC_POOLS * sizeof(int))})
         ck(cudaMemsetAsync(p.first, 0, p.second, stream), "cache reset");
     ck(cudaMemcpyAsync(ec.hand, ec.s0, EC_POOLS * sizeof(int), cudaMemcpyHostToDevice, stream), "initial hands");
-    for (int p = 0; p < ec.n_pools; ++p)
-        ck(cudaMemsetAsync(pools[p], 0xA5, ec.n[p] * ec.slot_bytes[p] + 2 * guard, stream), "pool guards");
+    for (int p = 0; p < ec.n_pools; ++p) {
+        const size_t prefix = p == plan.pool ? plan.prefix_bytes : 0;
+        ck(cudaMemsetAsync(pools[p], 0xA5, prefix + ec.n[p] * ec.slot_bytes[p] + 2 * guard, stream), "pool guards");
+    }
     ck(cudaStreamSynchronize(stream), "reset wait");
     auto launch = [&](int layer) {
         const int gb = 256 + layer * 64, db = 128 + layer * 32;
@@ -101,7 +106,17 @@ void run_cache(int dev, int slots, int pattern, bool coherent, int groups = 1) {
     std::vector<unsigned char> got(capacity * stride + guard), expected(got.size()), guards(guard * 2);
     std::vector<int> now(experts), owner(slots);
     std::vector<const char*> ep_gu(experts), ep_dn(experts), backing(experts);
+    int lent = 0;
     for (int rep = 0; rep < 64; ++rep) {
+        if (shared_kv) {
+            const int sizes[] = {0, plan.extra_slots, plan.extra_slots / 2, 1, plan.extra_slots, 0};
+            const int next = sizes[rep % 6];
+            arena_slots(ec, lent, next, stream);
+            lent = next;
+            // K/V may overwrite every byte of a lent slot. Neither direct launches
+            // nor captured graphs may read/write these slots until they are returned.
+            ck(cudaMemsetAsync(ec.pool[ec.arena_pool], 0xC7, (size_t) lent * ec.slot_bytes[ec.arena_pool], stream), "K/V writes");
+        }
         const int layer = rep % layers, counts[] = {0, 1, 7, capacity};
         const int n = counts[(rep / layers) % 4], gb = 256 + layer * 64, db = 128 + layer * 32;
         std::vector<Job> js(capacity);
@@ -125,6 +140,15 @@ void run_cache(int dev, int slots, int pattern, bool coherent, int groups = 1) {
             if (!std::all_of(guards.begin(), guards.end(), [](unsigned char b) { return b == 0xA5; }))
                 throw std::runtime_error("cache pool guard overwritten");
         }
+        if (shared_kv) {
+            std::vector<unsigned char> kv(plan.prefix_bytes + guard), borrowed((size_t) lent * ec.slot_bytes[ec.arena_pool]);
+            ck(cudaMemcpy(kv.data(), pools[ec.arena_pool], kv.size(), cudaMemcpyDeviceToHost), "K/V prefix");
+            if (!std::all_of(kv.begin(), kv.end(), [](unsigned char b) { return b == 0xA5; }))
+                throw std::runtime_error("K/V prefix overwritten");
+            if (!borrowed.empty()) ck(cudaMemcpy(borrowed.data(), ec.pool[ec.arena_pool], borrowed.size(), cudaMemcpyDeviceToHost), "lent K/V slots");
+            if (!std::all_of(borrowed.begin(), borrowed.end(), [](unsigned char b) { return b == 0xC7; }))
+                throw std::runtime_error("cache wrote a lent K/V slot");
+        }
         ck(cudaMemcpy(now.data(), ec.slot_of, experts * sizeof(int), cudaMemcpyDeviceToHost), "read places");
         ck(cudaMemcpy(owner.data(), ec.owner, slots * sizeof(int), cudaMemcpyDeviceToHost), "read owners");
         ck(cudaMemcpy(ep_gu.data(), ec.ep_gu, experts * sizeof(char*), cudaMemcpyDeviceToHost), "read gate/up table");
@@ -133,7 +157,7 @@ void run_cache(int dev, int slots, int pattern, bool coherent, int groups = 1) {
             const int s = now[g];
             if ((places[g] == -2 && s != -2) || s >= slots || s < -2) throw std::runtime_error("invalid cache place");
             const int p = ec.pool_of[g / NEXP];
-            if (s >= 0 && (s < ec.s0[p] || s >= ec.s0[p] + ec.n[p])) throw std::runtime_error("expert placed in wrong pool");
+            if (s >= 0 && (s < ec.s0[p] + (p == ec.arena_pool ? lent : 0) || s >= ec.s0[p] + ec.n[p])) throw std::runtime_error("expert placed in wrong pool");
             const char* eg = s < 0 ? gu[g] : ec.pool[p] + (s - ec.s0[p]) * ec.slot_bytes[p];
             const char* ed = s < 0 ? dn[g] : eg + ec.dn_off[p];
             if (ep_gu[g] != eg || ep_dn[g] != ed || (s >= 0 && owner[s] != g))
@@ -148,7 +172,7 @@ void run_cache(int dev, int slots, int pattern, bool coherent, int groups = 1) {
     cudaStreamDestroy(stream);
     for (void* p : device) cudaFree(p);
     cudaFreeHost(host);
-    std::cout << "card " << dev << " slots " << slots << " pools " << ec.n_pools << " pattern " << pattern << " coherent " << coherent << ": 64 checks passed\n";
+    std::cout << "card " << dev << " slots " << slots << " pools " << ec.n_pools << " pattern " << pattern << " coherent " << coherent << " shared K/V " << shared_kv << ": 64 checks passed\n";
 }
 } // namespace fnx
 
@@ -161,6 +185,10 @@ int main() {
             fnx::run_cache(dev, slots, pattern, coherent);
         for (int slots : {352, 1024}) for (int pattern : {0, 1, 2}) for (bool coherent : {false, true})
             fnx::run_cache(dev, slots, pattern, coherent, 2);
+        for (int groups : {1, 2}) for (int pattern : {0, 1, 2}) for (bool coherent : {false, true})
+            fnx::run_cache(dev, 352, pattern, coherent, groups, true);
+        for (int pattern : {0, 1, 2}) for (bool coherent : {false, true})
+            fnx::run_cache(dev, 352, pattern, coherent, 2, true, 1);
     }
-    std::cout << "Static decode cache: 3840 exact direct/graph checks passed\n";
+    std::cout << "Static decode cache: 6144 exact direct/graph checks passed (2304 with K/V lending)\n";
 }

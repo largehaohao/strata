@@ -113,7 +113,8 @@ def measure(a):
     safe_env = {k: v for k, v in env.items()
                 if (k.startswith(('FNX_', 'STRATA_')) or k in
                     ('HIP_VISIBLE_DEVICES', 'CUDA_VISIBLE_DEVICES', 'HSA_FORCE_FINE_GRAIN_PCIE',
-                     'LD_LIBRARY_PATH', 'HIP_FORCE_DEV_KERNARG'))
+                     'LD_LIBRARY_PATH', 'HIP_FORCE_DEV_KERNARG', 'HSA_ENABLE_SDMA',
+                     'HSA_ENABLE_INTERRUPT'))
                 and not any(word in k.upper() for word in ('API_KEY', 'PASSWORD', 'SECRET', 'ACCESS_TOKEN'))}
     manifest = {'status': 'running', 'command': cmd, 'env': safe_env, 'source': source_info(),
                 'binary_sha256': sha(Path(cmd[0]).read_bytes()), 'cases': cases,

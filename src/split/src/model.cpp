@@ -1,6 +1,7 @@
 #include "model.hpp"
 #include "card_check.hpp"
 #include "env.hpp"
+#include "attn_head_split.hpp"
 #include "rope_gguf.hpp"
 #include "static_experts.hpp"
 #include "mtp_head_q4.hpp"
@@ -870,6 +871,7 @@ void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resid
     std::vector<int> qrows_all, kvrows_all;
     for (int i = 0; i < NQH * 2 * HD; ++i) qrows_all.push_back(i);
     for (int i = 0; i < NKVH * HD; ++i) kvrows_all.push_back(i);
+    if (attn_head_split()) qrows_all = qrows, kvrows_all = kvrows;
     c.L.resize(NL);
     std::vector<const char*> hgu(host_experts ? (size_t) NL * NEXP : 0), hdn(hgu.size());   // the experts' host copies
     for (int l = 0; l < NL; ++l) {
@@ -1146,6 +1148,7 @@ void load_mtp_card(const Model& m, const MtpFiles& f, const CardW& c, const std:
     std::vector<int> qrows_all, kvrows_all;
     for (int i = 0; i < NQH * 2 * HD; ++i) qrows_all.push_back(i);
     for (int i = 0; i < NKVH * HD; ++i) kvrows_all.push_back(i);
+    if (attn_head_split()) qrows_all = qrows, kvrows_all = kvrows;
     LayerW& w = mc.L;
     const char* hp[2] = {"attn_hyper_connection.", "mlp_hyper_connection."};
     for (int h = 0; h < 2; ++h) {
