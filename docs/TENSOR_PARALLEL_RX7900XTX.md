@@ -76,6 +76,11 @@ not replaced. All new execution paths are opt-in.
   Metadata remains, but released tensors have null data and cannot be staged
   again without reloading. Staging scratch is destroyed before the optional
   embedding refresh, regardless of this flag.
+- `FNX_KV_CONTEXT_ONLY=1` sizes the plain int8 KV pool for the requested
+  context plus the existing page and lane margins. The default still expands
+  the int8 pool to the FP16 byte budget. This option leaves the logical context
+  limit and KV quantization unchanged and rejects the shared arena. At context
+  32768 it saves about 195 MiB per card, making room for more fixed hot experts.
 - `FNX_HC_ROW_GROUP=64` selects a 512-thread HC layout for windows of 1–12
   tokens on gfx1100. Larger windows retain the original 768-thread layout.
   The grids have separate barrier counters, including during graph replay;
@@ -136,6 +141,7 @@ uses a forced continuation.
 | Same, compact HC for 1–12 rows, two runs | 179.7–180.3 | 157.9–158.3 | 186.2–186.4 |
 | Same, fused down-weight copy in IQ gate/up, two runs | 181.9–182.2 | 158.9–159.1 | 188.8–189.0 |
 | Same, two cache pools within the existing byte budget, two runs | 184.2–184.5 | 160.6–160.7 | 192.9–193.2 |
+| Same, context-sized KV pool and 15.5 GiB cold backing, two runs | 186.5–186.8 | 161.5–162.0 | 196.0–196.3 |
 
 Values are tokens/s from the engine's reported decode time. The benchmark
 also records client time, time to first token, exact input/output token IDs,
@@ -231,6 +237,24 @@ output token sequences match and decode major faults are zero. The reviewed
 code tasks also match and pass all 1326 checks; varint measured 208.30 tokens/s.
 See `bench-cache-groups2`, `bench-cache-groups-control`, and
 `quality-cache-groups2`. The broader 200 tokens/s target remains open.
+
+Sizing the KV pool to the requested context, then reducing cold backing to
+15.5 GiB, measured **180.30 tokens/s** versus **178.37** with the preceding
+recipe in the same binary (**1.08%** higher). The pool holds 172 pages (33024
+positions), compared with 307 pages before. Startup/warmup left 86 MiB free
+per card. All six output sequences match and decode major faults are zero;
+the three reviewed code tasks also match and pass all 1326 checks. See
+`bench-kv-context-ram15p5`, `bench-kv-context-control`, and
+`quality-kv-context-ram15p5`.
+
+A separate capacity check used an actual 32688-token input followed by 64
+generated tokens, with a 32768 logical limit. Both recipes completed with
+identical input and output token IDs, without decode major faults. The new
+recipe took 47.59 s to prefill and 315.3 ms to decode; the control took 48.57 s
+and 317.8 ms. This short list-generation check verifies operation near the
+context boundary; its 202.98 tokens/s is not the acceptance panel result.
+See `near-context-kv-context`, `near-context-kv-control`, and
+`kv-context-checks.json`. The configured 204800 context remains untested.
 
 The exact token records and the calibration profile are in
 [`bench/results/2026-11-03-rx7900xtx-tensor-parallel`](../bench/results/2026-11-03-rx7900xtx-tensor-parallel/).
@@ -407,12 +431,12 @@ tokenizer directory. Set the SDK library paths for the child process:
 ```sh
 export LD_LIBRARY_PATH="$PWD/.venv/lib/python3.12/site-packages/_rocm_sdk_core/lib:$PWD/.venv/lib/python3.12/site-packages/_rocm_sdk_libraries_gfx110X_dgpu/lib"
 HIP_VISIBLE_DEVICES=0,1 HSA_FORCE_FINE_GRAIN_PCIE=1 \
-FNX_STATIC_EXPERTS=1 FNX_EXPERT_RAM_GIB=16 FNX_STATIC_CACHE_SLOTS=1024 \
+FNX_STATIC_EXPERTS=1 FNX_EXPERT_RAM_GIB=15.5 FNX_STATIC_CACHE_SLOTS=1024 \
 FNX_STATIC_CACHE_GROUPS=2 \
 FNX_MOE_STAGE=0 FNX_PF_ROWS=256 \
 FNX_IQ_REUSE=1 FNX_IQ_GROUP=16 FNX_MOE_PRE_ROWS=1 \
 FNX_STATIC_HOST_CACHE=1 FNX_EMBED_WARM_AFTER_LOAD=1 \
-FNX_RELEASE_COPIED_WEIGHTS=1 \
+FNX_RELEASE_COPIED_WEIGHTS=1 FNX_KV_CONTEXT_ONLY=1 \
 FNX_HC_ROW_GROUP=64 FNX_STATIC_CACHE_FUSED_DN=64 \
 FNX_EXPERT_PROFILE="$PWD/bench/results/2026-11-03-rx7900xtx-tensor-parallel/swift-decode-routes.bin" \
 python3 tools/tp_decode_bench.py \
@@ -486,6 +510,9 @@ context alone does not measure long-context decode.
   and invalid-input rejection, full-window capacity, memory/slot bounds and
   order-independent layer assignment.
 - Both engines passed the three completed-code tasks described above.
+- Context-sized int8 KV: the complete panel and reviewed code tasks match
+  their reference token IDs, with 1326 code checks passing. A real 32688-token
+  input plus 64-token generation matches the original pool at context 32768.
 - CUDA has not been built or run here. No SYCL files are changed.
 - Remaining: the 200 tokens/s target, long-context acceptance, broader quality
   and workload coverage, and integration into launch policy.

@@ -85,12 +85,20 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
     // the paged K/V pool: pages for the whole context (one more for the block a position past the last one needs)
     // and the extra lanes' blocks. Int8 rows: the context's pages as many as fit in their f16 bytes (the smallest ratio
     // of the cards': every card has the same pages)
+    const long long context_only = env_int("FNX_KV_CONTEXT_ONLY", 0);
+    if (context_only != 0 && context_only != 1)
+        throw std::runtime_error("FNX_KV_CONTEXT_ONLY: expected 0 or 1");
+    if (context_only && m.arena)
+        throw std::runtime_error("FNX_KV_CONTEXT_ONLY requires a plain K/V pool");
     int ctx_pages = max_ctx / KVP_POS + 2;
-    if (kv_q8()) {
+    if (kv_q8() && !context_only) {
         double ratio = 1e9;
         for (int cc = 0; cc < NCARD; ++cc) ratio = std::min(ratio, (double) kvp_page(cc, false) / kvp_page(cc, true));
         ctx_pages = (int) (ctx_pages * ratio);
     }
+    if (context_only && kv_q8())
+        std::fprintf(stderr, "fnx: int8 K/V: %d context pages (%d positions) for requested context %d; spare capacity expansion disabled\n",
+                     ctx_pages, ctx_pages * KVP_POS, max_ctx);
     int n_pages = ctx_pages + extra_pages;
     // FNX_PEER (AMD only; hip/peer_policy.hpp has the rules: 0 host exchange, 1 try the peer push, unset the build's default): every directed pair is probed at start
     // (kernel stores into the peer, a full read-back compare on both sides, a flag round trip); any failure leaves the host exchange for the whole run with one line.
