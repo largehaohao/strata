@@ -9,6 +9,26 @@ struct IqDot32 {
     int scale0, scale1;
 };
 
+// The ggml HIP header supplies byte-by-byte implementations after kernels.cu
+// removes the compatibility macros. Use the tree's packed operations here.
+// IQ grid magnitudes fit positive signed bytes; applying their signs cannot
+// saturate, so wrapping and signed-saturating subtraction give the same values.
+__device__ __forceinline__ int iq_sign_mask(int bits) {
+#if FNX_HIP
+    return ::strata::hip_compat::vcmpne4(bits, 0);
+#else
+    return __vcmpne4(bits, 0);
+#endif
+}
+
+__device__ __forceinline__ int iq_signed_grid(int grid, int mask) {
+#if FNX_HIP
+    return ::strata::hip_compat::vsub4(grid ^ mask, mask);
+#else
+    return __vsub4(grid ^ mask, mask);
+#endif
+}
+
 template <ggml_type TA>
 __device__ __forceinline__ IqDot32 iq_decode32(const char* row, int kbx, int iqs) {
     IqDot32 r;
@@ -22,10 +42,10 @@ __device__ __forceinline__ IqDot32 iq_decode32(const char* row, int kbx, int iqs
 #pragma unroll
         for (int k = 0; k < 8; k += 2) {
             const int* grid = reinterpret_cast<const int*>(iq2s_grid + (qs[k / 2] | ((qh << (8 - k)) & 0x300)));
-            const int s0 = __vcmpne4(((signs[k / 2] & 0x03) << 7) | ((signs[k / 2] & 0x0C) << 21), 0);
-            const int s1 = __vcmpne4(((signs[k / 2] & 0x30) << 3) | ((signs[k / 2] & 0xC0) << 17), 0);
-            r.grid[k] = __vsub4(grid[0] ^ s0, s0);
-            r.grid[k + 1] = __vsub4(grid[1] ^ s1, s1);
+            const int s0 = iq_sign_mask(((signs[k / 2] & 0x03) << 7) | ((signs[k / 2] & 0x0C) << 21));
+            const int s1 = iq_sign_mask(((signs[k / 2] & 0x30) << 3) | ((signs[k / 2] & 0xC0) << 17));
+            r.grid[k] = iq_signed_grid(grid[0], s0);
+            r.grid[k + 1] = iq_signed_grid(grid[1], s1);
         }
         r.d = __half2float(b->d);
         r.scale0 = b->scales[iqs / 2] & 15;
@@ -38,10 +58,10 @@ __device__ __forceinline__ IqDot32 iq_decode32(const char* row, int kbx, int iqs
 #pragma unroll
         for (int k = 0; k < 8; k += 2) {
             const uint32_t signs = unpack_ksigns(aux >> (7 * k / 2));
-            const int s0 = __vcmpne4(signs & 0x08040201, 0);
-            const int s1 = __vcmpne4(signs & 0x80402010, 0);
-            r.grid[k] = __vsub4(iq3xxs_grid[qs[k]] ^ s0, s0);
-            r.grid[k + 1] = __vsub4(iq3xxs_grid[qs[k + 1]] ^ s1, s1);
+            const int s0 = iq_sign_mask(signs & 0x08040201);
+            const int s1 = iq_sign_mask(signs & 0x80402010);
+            r.grid[k] = iq_signed_grid(iq3xxs_grid[qs[k]], s0);
+            r.grid[k + 1] = iq_signed_grid(iq3xxs_grid[qs[k + 1]], s1);
         }
         r.d = __half2float(b->d);
         r.scale0 = aux >> 28;
@@ -58,10 +78,10 @@ __device__ __forceinline__ IqDot32 iq_decode32(const char* row, int kbx, int iqs
         for (int k = 0; k < 8; k += 2) {
             const int g0 = iq3s_grid[qs[k] | ((qh << (8 - k)) & 0x100)];
             const int g1 = iq3s_grid[qs[k + 1] | ((qh << (7 - k)) & 0x100)];
-            const int s0 = __vcmpne4(((signs[k / 2] & 0x03) << 7) | ((signs[k / 2] & 0x0C) << 21), 0);
-            const int s1 = __vcmpne4(((signs[k / 2] & 0x30) << 3) | ((signs[k / 2] & 0xC0) << 17), 0);
-            r.grid[k] = __vsub4(g0 ^ s0, s0);
-            r.grid[k + 1] = __vsub4(g1 ^ s1, s1);
+            const int s0 = iq_sign_mask(((signs[k / 2] & 0x03) << 7) | ((signs[k / 2] & 0x0C) << 21));
+            const int s1 = iq_sign_mask(((signs[k / 2] & 0x30) << 3) | ((signs[k / 2] & 0xC0) << 17));
+            r.grid[k] = iq_signed_grid(g0, s0);
+            r.grid[k + 1] = iq_signed_grid(g1, s1);
         }
         r.d = __half2float(b->d);
         r.scale0 = 1 + 2 * ((b->scales[iqs / 4] >> ((iqs << 1) & 4)) & 15);

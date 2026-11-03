@@ -31,6 +31,10 @@ not replaced. All new execution paths are opt-in.
 - `FNX_IQ_GROUP=16`, with IQ reuse, assigns 16 lanes to each output row.
   Each lane keeps two partial sums, then joins them in the original 32-lane
   reduction order. The default remains 32 lanes.
+- On HIP, the IQ reuse path uses packed byte sign masks and subtraction from
+  the existing compatibility layer. IQ grid values cannot saturate signed bytes,
+  so this preserves the original values while avoiding the ggml bytewise
+  implementation. CUDA keeps the original operations.
 - `FNX_MOE_PRE_ROWS=1` computes the routed down activations once for every
   decode window, using the existing precompute kernel. The default threshold
   remains 9 rows; values 1..17 are accepted (17 disables it).
@@ -85,6 +89,7 @@ uses a forced continuation.
 | Cached host weights, direct reads, embedding refresh, two runs | 155.7–156.1 | 131.5–131.6 | 158.3–158.7 |
 | Same, 16-lane IQ groups, two runs | 156.8–158.7 | 133.3–133.5 | 161.4 |
 | Same, precompute down activations from one row, two runs | 158.1–161.1 | 134.3–134.4 | 163.1–163.3 |
+| Same, packed IQ sign operations, two runs | 163.2–167.1 | 137.0–138.8 | 167.9–169.0 |
 
 Values are tokens/s from the engine's reported decode time. The benchmark
 also records client time, time to first token, exact input/output token IDs,
@@ -125,6 +130,10 @@ again all six output sequences match the reference. Its representative
 six-row/24-job kernel pair took about 27 us versus 41–44 us for fused IQ4_NL
 and 23–24 us versus 36–38 us for Q4_0. Kernel savings do not translate directly
 to the full model because other work overlaps and remains on the critical path.
+Packed IQ sign operations measured **155.87 tokens/s** weighted across two
+passes, 3.1% above the down-precompute version. All six output sequences match.
+This is 22.2% above the 127.53 tokens/s two-pass native comparison for these
+tasks; the different-arithmetic caveat above still applies. The target remains 200 tokens/s.
 
 The exact token records and the calibration profile are in
 [`bench/results/2026-11-03-rx7900xtx-tensor-parallel`](../bench/results/2026-11-03-rx7900xtx-tensor-parallel/).
@@ -192,6 +201,8 @@ The 16-lane binary also matched them and passed all 1326 checks
 The down-precompute binary passed the same checks with exactly the reviewed
 tokens (`quality-hostcache-iq16-pre1`); route tracing was enabled in that quality
 run, so its timing is excluded from performance claims.
+The packed-sign binary also matched all reviewed tokens and passed all 1326
+checks (`quality-hostcache-iq16-pre1-swar`).
 
 A four-second ROCprofiler sample showed matrix staging at 23.15% and the
 window-sum peer kernel at 15.99% of summed kernel duration. This includes
@@ -268,6 +279,7 @@ context alone does not measure long-context decode.
 - Extended IQ grouping: 2048 exact direct/graph checks passed on both cards,
   covering both lane groups and the fallback. Guard initialization is explicitly
   ordered on the compute stream.
+- Packed IQ signs: all 2048 exact direct/graph checks passed again on both cards.
 - Down precompute: 512 exact direct/graph comparisons passed on both cards,
   including T=1..16, changing routes/job counts, IQ4_NL and Q4_0, and guards.
 - Both engines passed the three completed-code tasks described above.
