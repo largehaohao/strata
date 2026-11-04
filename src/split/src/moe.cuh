@@ -274,6 +274,7 @@ __global__ void __launch_bounds__(MMVQ_THREADS) k_moe_gu(MoeW w, const Job* __re
 
 #include "moe_iq_reuse.cuh"
 #include "moe_iq_cache.cuh"
+#include "moe_q2_down.cuh"
 
 // down: one block per (job, rows_per_block rows). The block first makes its tokens' h = silu(gate) * up (gu rows
 // jb.y[j] of [gate (ffs) | up (ffs)]) as q8_1 in shared memory; thread (row, u) then dots its 32-column unit u of the
@@ -300,9 +301,10 @@ __global__ void k_moe_h(const float* __restrict__ gu, int ffs, int npairs) {
 
 // PRE: the pairs' h made by k_moe_h (past 8 rows: kbench 16 rows 82.9 -> 70.7 us); else each block makes its own (the
 // extra launch costs more than it saves: 5 rows 30.7 -> 31.7)
-template <ggml_type TA, bool PRE>
+template <ggml_type TA, bool PRE, bool PACKED_Q2 = false>
 __global__ void __launch_bounds__(DN_THREADS) k_moe_down(MoeW w, const Job* __restrict__ jobs, const int* __restrict__ njobs,
                                                         const float* __restrict__ gu, float* __restrict__ out) {
+    static_assert(!PACKED_Q2 || TA == GGML_TYPE_Q4_0, "packed Q2 retains Q4_0 arithmetic");
     const int ji = blockIdx.y;
     if (ji >= *njobs) return;
     __shared__ Job jb;
@@ -336,7 +338,12 @@ __global__ void __launch_bounds__(DN_THREADS) k_moe_down(MoeW w, const Job* __re
     const bool live = r < rpb && row < w.nrows;
     if (live) {
         const char* wr = moe_expert(w, jb.w) + (size_t) row * w.row_a;
-        for (int j = 0; j < n; ++j) part[j][threadIdx.x] = unit_dot<TA, DN_U>(wr, u, hq[j]);
+        if constexpr (PACKED_Q2) {
+            const Q2Half decoded = q2_load_half(wr, u);
+            for (int j = 0; j < n; ++j) part[j][threadIdx.x] = q2_half_dot(decoded, hq[j] + u);
+        } else {
+            for (int j = 0; j < n; ++j) part[j][threadIdx.x] = unit_dot<TA, DN_U>(wr, u, hq[j]);
+        }
     }
     __syncthreads();
     for (int e = threadIdx.x; e < n * rpb; e += DN_THREADS) {
@@ -381,9 +388,10 @@ __global__ void __launch_bounds__(MMVQ_THREADS) k_moe_gu_big(MoeW w, const BigJo
 }
 
 // k_moe_down for BigJobs: per MAXT pairs, their h into shared memory, the dots, the sums
-template <ggml_type TA>
+template <ggml_type TA, bool PACKED_Q2 = false>
 __global__ void __launch_bounds__(DN_THREADS) k_moe_down_big(MoeW w, const BigJob* __restrict__ jobs, const int* __restrict__ njobs,
                                                             const float* __restrict__ gu, float* __restrict__ out) {
+    static_assert(!PACKED_Q2 || TA == GGML_TYPE_Q4_0, "packed Q2 retains Q4_0 arithmetic");
     const int ji = blockIdx.y;
     if (ji >= *njobs) return;
     __shared__ BigJob jb;
@@ -395,6 +403,10 @@ __global__ void __launch_bounds__(DN_THREADS) k_moe_down_big(MoeW w, const BigJo
     const int row = blockIdx.x * rpb + r;
     const bool live = r < rpb && row < w.nrows;
     const char* wr = moe_expert(w, jb.w) + (size_t) (live ? row : 0) * w.row_a;
+    Q2Half decoded{};
+    if constexpr (PACKED_Q2) {
+        if (live) decoded = q2_load_half(wr, u);
+    }
 #pragma unroll 1
     for (int b0 = 0; b0 < jb.n; b0 += MAXT) {
         const int n = min(MAXT, jb.n - b0);
@@ -408,8 +420,13 @@ __global__ void __launch_bounds__(DN_THREADS) k_moe_down_big(MoeW w, const BigJo
             if (lane == 0) hq[j][b].ds = make_half2(__float2half(d), __float2half(sm));
         }
         __syncthreads();
-        if (live)
-            for (int j = 0; j < n; ++j) part[j][threadIdx.x] = unit_dot<TA, DN_U>(wr, u, hq[j]);
+        if (live) {
+            if constexpr (PACKED_Q2) {
+                for (int j = 0; j < n; ++j) part[j][threadIdx.x] = q2_half_dot(decoded, hq[j] + u);
+            } else {
+                for (int j = 0; j < n; ++j) part[j][threadIdx.x] = unit_dot<TA, DN_U>(wr, u, hq[j]);
+            }
+        }
         __syncthreads();
         for (int e = threadIdx.x; e < n * rpb; e += DN_THREADS) {
             const int j = e / rpb, rr = e % rpb, orow = blockIdx.x * rpb + rr;
@@ -422,14 +439,18 @@ __global__ void __launch_bounds__(DN_THREADS) k_moe_down_big(MoeW w, const BigJo
     }
 }
 
-template <ggml_type TA>
+template <ggml_type TA, bool PACKED_Q2 = false>
 void moe_launch_big(bool down, const MoeW& w, const BigJob* jobs, const int* njobs, int njobs_cap, const void* in, float* out,
                     cudaStream_t s) {
+    if constexpr (PACKED_Q2) {
+        if (!down || w.ncols % 64 || w.row_a != (size_t) w.ncols / 64 * 18)
+            throw std::runtime_error("packed Q2_0 requires down rows of whole 64-value blocks");
+    }
     if (down) {
         if (!unit_ok<TA>(DN_U) || w.ncols / DN_U > DN_MAXB)
             throw std::runtime_error("moe_down: shape or type does not fit the units");
         const int rpb = DN_THREADS / (w.ncols / DN_U);
-        k_moe_down_big<TA><<<dim3((w.nrows + rpb - 1) / rpb, njobs_cap), DN_THREADS, 0, s>>>(w, jobs, njobs, (const float*) in, out);
+        k_moe_down_big<TA, PACKED_Q2><<<dim3((w.nrows + rpb - 1) / rpb, njobs_cap), DN_THREADS, 0, s>>>(w, jobs, njobs, (const float*) in, out);
         return;
     }
     const int G = moe_g<TA>(w.ncols);
@@ -470,9 +491,13 @@ void gu_launch(int T, dim3 grid, cudaStream_t s, const MoeW& w, const Job* jobs,
     }
 }
 
-template <ggml_type TA>
+template <ggml_type TA, bool PACKED_Q2 = false>
 void moe_launch(bool down, const MoeW& w, const Job* jobs, const int* njobs, int njobs_max, const void* in, float* out,
                 cudaStream_t s, int T, const CacheDownCopy* copy = nullptr, const CacheGateUpCopy* gu_copy = nullptr) {
+    if constexpr (PACKED_Q2) {
+        if (!down || w.ncols % 64 || w.row_a != (size_t) w.ncols / 64 * 18)
+            throw std::runtime_error("packed Q2_0 requires down rows of whole 64-value blocks");
+    }
     if (down) {
         if (!unit_ok<TA>(DN_U) || w.ncols / DN_U > DN_MAXB)
             throw std::runtime_error("moe_down: shape or type does not fit the units");
@@ -487,9 +512,9 @@ void moe_launch(bool down, const MoeW& w, const Job* jobs, const int* njobs, int
         if (T >= pre_rows) {
             if (njobs_max > MAXT * TOPK) throw std::runtime_error("moe_down: more pairs than g_moe_hq holds");
             k_moe_h<<<(nh + 7) / 8, 256, 0, s>>>((const float*) in, w.ncols, njobs_max);
-            k_moe_down<TA, true><<<grid, DN_THREADS, smem, s>>>(w, jobs, njobs, (const float*) in, out);
+            k_moe_down<TA, true, PACKED_Q2><<<grid, DN_THREADS, smem, s>>>(w, jobs, njobs, (const float*) in, out);
         } else {
-            k_moe_down<TA, false><<<grid, DN_THREADS, smem, s>>>(w, jobs, njobs, (const float*) in, out);
+            k_moe_down<TA, false, PACKED_Q2><<<grid, DN_THREADS, smem, s>>>(w, jobs, njobs, (const float*) in, out);
         }
         return;
     }

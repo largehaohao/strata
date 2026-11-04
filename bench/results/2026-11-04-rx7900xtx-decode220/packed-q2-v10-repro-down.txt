@@ -1,0 +1,9 @@
+card 0 PASS 524288 exact packed dot checks
+card 0 cols 64 PASS 512 exact down/guard checks
+card 0 cols 256 PASS 512 exact down/guard checks
+card 0 cols 320 PASS 512 exact down/guard checks
+card 1 PASS 524288 exact packed dot checks
+card 1 cols 64 PASS 512 exact down/guard checks
+card 1 cols 256 PASS 512 exact down/guard checks
+card 1 cols 320 PASS 512 exact down/guard checks
+PASS 1048576 exact dot checks and 3072 exact down/guard checks and 648 prefill checks

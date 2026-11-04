@@ -1,0 +1,3 @@
+gguf: 2 dense/small tensors converted to Q8_0/F32 at load (the file's routed experts keep their types)
+gguf: 1 dense/small tensors converted to Q8_0/F32 at load (the file's routed experts keep their types)
+PASS 384 packed/default weight checks, scale/metadata and unchanged gate conversion

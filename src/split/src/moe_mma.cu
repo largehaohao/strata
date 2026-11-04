@@ -62,6 +62,11 @@ void moe_mma(const DW& A, size_t sa, const BigJob* jobs, const int* njobs, int n
         case T_Q5_1: mma_launch<GGML_TYPE_Q5_1>(w, jobs, njobs, njobs_cap, x, out, s); break;
         case T_Q8_0: mma_launch<GGML_TYPE_Q8_0>(w, jobs, njobs, njobs_cap, x, out, s); break;
         case T_Q4_0: mma_launch<GGML_TYPE_Q4_0>(w, jobs, njobs, njobs_cap, x, out, s); break;
+        case T_Q2_0:
+            if (w.ncols % 64 || w.row_a != (size_t) w.ncols / 64 * 18)
+                throw std::runtime_error("moe_mma: packed Q2_0 requires whole 64-value blocks");
+            mma_launch<GGML_TYPE_Q2_0>(w, jobs, njobs, njobs_cap, x, out, s);
+            break;
         case T_IQ4_NL: mma_launch<GGML_TYPE_IQ4_NL>(w, jobs, njobs, njobs_cap, x, out, s); break;
         case T_IQ4_XS: mma_launch<GGML_TYPE_IQ4_XS>(w, jobs, njobs, njobs_cap, x, out, s); break;
         case T_IQ3_S: mma_launch<GGML_TYPE_IQ3_S>(w, jobs, njobs, njobs_cap, x, out, s); break;

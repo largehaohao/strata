@@ -697,7 +697,14 @@ struct Up {
     }
     // per expert: every row, input blocks [b0, b1) (down), expert-major
     DW expert_cols(const Tensor& t, int b0, int b1, size_t& stride, const char** host_of = nullptr) {
-        const TypeInfo ti = block32(t);
+        const TypeInfo ti = t.type == T_Q2_0 ? type_info(t.type) : block32(t);
+        if (t.type == T_Q2_0) {
+            // Callers count 32-value blocks; Q2_0 stores pairs of those blocks
+            // under one scale. Never split a packed block across cards.
+            if (b0 % 2 || b1 % 2) throw std::runtime_error(t.name + ": Q2_0 column slices need 64-value alignment");
+            b0 /= 2;
+            b1 /= 2;
+        }
         DW w;
         w.type = t.type;
         w.n_in = (b1 - b0) * ti.block;
@@ -1320,19 +1327,36 @@ Mtp::~Mtp() { free_mtp_cards(cards); }
 
 // A file whose routed experts the engine has no kernel for is refused here, in one plain line, before anything is read into RAM or placed on
 // the cards (the app's rule, strata_control/split_engine.py, refuses it earlier; this is the same check for a start that skipped the rule). The
-// server then starts the normal layer split. Q2_0 is not listed: the Gguf has already repacked it to Q4_0.
+// server then starts the normal layer split. Q2_0 is accepted only for the optional packed down path.
 static void check_supported(const Gguf& g) {
     const uint32_t ok[] = {T_Q4_K, T_Q5_K, T_Q5_1, T_Q8_0, T_Q4_0, T_IQ4_NL, T_IQ4_XS, T_IQ3_S, T_IQ3_XXS, T_IQ2_S};
     for (const auto& kv : g.tensors()) {
         const std::string& n = kv.first;
         if (n.find("_exps.weight") == std::string::npos || n.find("shexp") != std::string::npos) continue;
+        const std::string down_suffix = ".ffn_down_exps.weight";
+        if (kv.second.type == T_Q2_0 && n.size() >= down_suffix.size() &&
+            n.compare(n.size() - down_suffix.size(), down_suffix.size(), down_suffix) == 0) continue;
         if (std::find(std::begin(ok), std::end(ok), kv.second.type) == std::end(ok))
             throw std::runtime_error("the all-cards split engine does not read this model's routed experts (" + n + " is ggml type " +
                                      std::to_string(kv.second.type) + "); use the normal layer split");
     }
 }
 
-Model::Model(const std::string& path, Load how, Store* store, const std::string* image) : g(path) {
+static bool packed_q2_down_setting() {
+    const auto setting = env_int("FNX_PACKED_Q2_DOWN", 0);
+    if (setting != 0 && setting != 1) throw std::runtime_error("FNX_PACKED_Q2_DOWN: expected 0 or 1");
+    if (setting) {
+#if !FNX_HIP || FNX_27B || FNX_NCARD != 2
+        throw std::runtime_error("FNX_PACKED_Q2_DOWN requires the two-card HIP Flash-Next engine");
+#else
+        if (env_int("FNX_STATIC_EXPERTS", 0) != 1)
+            throw std::runtime_error("FNX_PACKED_Q2_DOWN requires FNX_STATIC_EXPERTS=1");
+#endif
+    }
+    return setting == 1;
+}
+
+Model::Model(const std::string& path, Load how, Store* store, const std::string* image) : g(path, packed_q2_down_setting()) {
     const long long static_setting = env_int("FNX_STATIC_EXPERTS", 0);
     if (static_setting != 0 && static_setting != 1)
         throw std::runtime_error("FNX_STATIC_EXPERTS: expected 0 or 1");
@@ -1344,6 +1368,8 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
         throw std::runtime_error("FNX_RELEASE_COPIED_WEIGHTS requires plain static expert placement");
     if (static_experts && how != Load::PLAIN)
         throw std::runtime_error("FNX_STATIC_EXPERTS: only plain loads are supported");
+    if (env_flag("FNX_PACKED_Q2_DOWN"))
+        std::fprintf(stderr, "fnx: preserving lossless packed Q2_0 down weights (Q4_0 arithmetic order)\n");
     // the cards first: reading the embeddings into RAM below takes seconds on a cold cache
     {
         int ndev = 0;

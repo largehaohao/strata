@@ -95,7 +95,7 @@ int64_t read_int(Cur& c, uint32_t t) {
 }
 }  // namespace
 
-Gguf::Gguf(const std::string& first) {
+Gguf::Gguf(const std::string& first, bool packed_q2_down) {
     std::smatch m;
     static const std::regex split(R"((.*-)(\d{5})(-of-)(\d{5})(\.gguf)$)");
     if (std::regex_match(first, m, split)) {
@@ -108,14 +108,14 @@ Gguf::Gguf(const std::string& first) {
     } else {
         load_shard(first, true);
     }
-    convert_small_tensors();
+    convert_small_tensors(packed_q2_down);
 }
 
 // A file with routed experts in the IQ types or Strata's 2-bit type (the ISTA IQ3_S set) also keeps its dense matrices, routers,
 // embeddings and projections in K-quants, IQ4_XS and BF16, which the engine does not read. Those are dequantized and written
 // again as Q8_0 (F32 for the small ones), once, here; the routed experts are left as they are. A file without such experts
 // (UD-Q4_K_XL, Q8_0) is not touched at all: the check below is the only difference for it.
-void Gguf::convert_small_tensors() {
+void Gguf::convert_small_tensors(bool packed_q2_down) {
     bool mixed = false;
     for (const auto& kv : tensors_)
         mixed |= kv.second.type == T_IQ2_S || kv.second.type == T_IQ3_XXS || kv.second.type == T_IQ3_S || kv.second.type == T_Q2_0;
@@ -123,6 +123,10 @@ void Gguf::convert_small_tensors() {
     for (auto& kv : tensors_) {
         Tensor& t = kv.second;
         if (t.type == T_Q2_0) {   // the routed down experts of some layers: the same values as Q4_0 blocks
+            const std::string suffix = ".ffn_down_exps.weight";
+            if (packed_q2_down && t.name.size() >= suffix.size() &&
+                t.name.compare(t.name.size() - suffix.size(), suffix.size(), suffix) == 0)
+                continue;
             owned_.emplace_back();
             conv::repack_q2_0_to_q4_0(t, owned_.back());
             ++converted_;

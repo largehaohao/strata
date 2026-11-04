@@ -67,6 +67,37 @@ struct Fixture {
     ~Fixture() { if (!path.empty()) std::remove(path.c_str()); }
 };
 struct Snapshot { fnx::Tensor tensor; std::vector<uint8_t> bytes; };
+void check_packed_down() {
+    Fixture f(true);
+    fnx::Gguf original(f.path), packed(f.path, true);
+    const auto& raw = packed.t("blk.0.ffn_down_exps.weight");
+    const auto& q4 = original.t("blk.0.ffn_down_exps.weight");
+    require(packed.converted() == 4 && original.converted() == 5, "only down repacking is skipped");
+    require(raw.type == fnx::T_Q2_0 && raw.nbytes == 72 && raw.row_bytes() == 18 && raw.shard >= 0 &&
+            q4.type == fnx::T_Q4_0 && q4.nbytes == 144 && q4.row_bytes() == 36 && q4.shard == -1, "packed metadata");
+    for (int b = 0; b < 4; ++b) {
+        const auto* source = raw.data + b * 18;
+        for (int h = 0; h < 2; ++h) {
+            const auto* expanded = q4.data + (b * 2 + h) * 18;
+            require(std::memcmp(source, expanded, 2) == 0, "packed scale");
+            for (int j = 0; j < 32; ++j) {
+                const int i = 32 * h + j;
+                const int code = (source[2 + i / 4] >> (2 * (i % 4))) & 3;
+                const int nibble = (expanded[2 + j % 16] >> (4 * (j / 16))) & 15;
+                require(code + 7 == nibble, "packed value");
+            }
+        }
+    }
+    for (const auto& kv : original.tensors()) {
+        if (kv.first == raw.name) continue;
+        const auto& a = kv.second; const auto& b = packed.t(kv.first);
+        require(a.type == b.type && a.nbytes == b.nbytes && std::memcmp(a.data, b.data, a.nbytes) == 0, "unrelated conversion changed");
+    }
+    const auto* before = raw.data;
+    const std::vector<uint8_t> bytes(raw.data, raw.data + raw.nbytes);
+    packed.release_owned_except({});
+    require(raw.data == before && std::memcmp(raw.data, bytes.data(), bytes.size()) == 0, "packed mapping released");
+}
 void check_mixed() {
     Fixture f(true);
     fnx::Gguf g(f.path);
@@ -106,9 +137,10 @@ void check_mixed() {
 }
 int main() {
     check_mixed();
+    check_packed_down();
     Fixture f(false);
     fnx::Gguf g(f.path);
     const auto* p = g.t("plain.weight").data;
     require(g.converted() == 0 && g.release_owned_except({}) == 0 && g.t("plain.weight").data == p, "unconverted GGUF changed");
-    std::cout << "GGUF ownership: mixed/plain, metadata, retention, rejection and repeated release passed\n";
+    std::cout << "GGUF ownership: mixed/plain, packed down, metadata, retention, rejection and repeated release passed\n";
 }

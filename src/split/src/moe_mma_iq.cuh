@@ -64,6 +64,30 @@ struct MmTile4 {
 template <> struct MmTile<GGML_TYPE_Q4_0> : MmTile4<false> {};
 template <> struct MmTile<GGML_TYPE_IQ4_NL> : MmTile4<true> {};
 
+// Expand only the fetched 32-value half of a packed Q2_0 block into the
+// original Q4_0 tile registers. Inherited put() and WMMA arithmetic are unchanged.
+template <> struct MmTile<GGML_TYPE_Q2_0> : MmTile4<false> {
+    __device__ __forceinline__ void fetch(const char* we, size_t row_a, int nrows, int row0, int k0, int kc) {
+        const int r = threadIdx.x / MM_TPR, u = threadIdx.x % MM_TPR, row = row0 + r;
+        item = u * 32 < kc;
+        live = item && row < nrows;
+        if (live) {
+            const int half = k0 / 32 + u;
+            const auto* b = reinterpret_cast<const uint8_t*>(we) + (size_t) row * row_a + (size_t) (half / 2) * 18;
+            const auto* q = b + 2 + (half % 2) * 8;
+            v[0] = (uint16_t) mq_ld16(b);
+#pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                const int shift = 4 * (w % 2);
+                const unsigned lo = (q[w / 2] >> shift) & 15u;
+                const unsigned hi = (q[4 + w / 2] >> shift) & 15u;
+                v[1 + w] = (uint16_t) (((lo & 3u) + 7u) | (((hi & 3u) + 7u) << 4) |
+                    (((lo >> 2) + 7u) << 8) | (((hi >> 2) + 7u) << 12));
+            }
+        }
+    }
+};
+
 // IQ4_XS: 136 bytes = d (f16), scales_h (u16), scales_l[4], qs[128]; sub-block ib has 16 qs bytes at 8 + 16 ib and a 6-bit scale
 template <> struct MmTile<GGML_TYPE_IQ4_XS> {
     uint32_t hd[2], q[4];

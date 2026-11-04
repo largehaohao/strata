@@ -840,3 +840,56 @@ over shared memory; a per-block-flag HC barrier was slower than the existing
 atomic barrier; raising compact HC's grid from 80 to 96 blocks was slower.
 An exact INT8 WMMA dense-Q8 prototype passed 864 direct/graph comparisons,
 but regressed the common seven-token shapes and was not integrated.
+
+### Lossless packed down weights (V10)
+
+`FNX_PACKED_Q2_DOWN=1` retains the GGUF's original Q2_0 routed-down storage
+instead of expanding each 18-byte block into two Q4_0 blocks. Nine layers of
+Swift IQ3_S use this format, saving 2123366400 bytes (1.97754 GiB) across both
+cards' expert weight set. The weights are unchanged: the two-bit code maps to
+the original Q4 nibble as `code + 7`, with the same scale. Decode expands a
+half-block once into registers and reuses it for the job's tokens, retaining
+both Q4 partial dots, the rounded Q8 activation-sum correction, and the original
+floating-point accumulation order. Prefill expands into the original Q4 tile
+registers and retains the same WMMA shapes and arithmetic. Its alternative Q8
+BigJob path is also supported.
+
+The option is disabled by default and requires plain static placement with the
+two-card HIP Flash-Next engine. Column slices must align to 64 values. Other
+GGUF readers retain default repacking; other tensors and MTP are unchanged.
+The V10 recipe combines this option with V7 and sets expert RAM to 11.625 GiB
+instead of 13.5 GiB, using the saved space to keep more experts resident. It
+loads 5973 cold experts, has 142 MiB free per card after warmup, and preserves
+the full 32768-position context allocation.
+
+The complete six-request panel measured **214.14082 tokens/s**, against
+**210.89848** with packed down disabled and the original 13.5 GiB RAM budget
+in the same binary: **+1.54%**. All six requests improved; input/output tokens
+and draft acceptance were identical. Both engines exited normally with zero
+decode major faults. The aggregate remains below the 220 target. The immutable
+binary is `build-tensor-parralize-baseline/strata-split-packed-q2-v10`, SHA256
+`bf1e35c8d08850128c0a8eae2b1306cbea1c19f3e318614629831ae8ab30ef01`.
+
+Validation covers 1048576 exact dot comparisons (including zero, signed zero,
+subnormal and extreme finite scales), 3072 decode/guard comparisons, 648 Q8
+prefill comparisons, and 648 WMMA prefill comparisons on both cards. The tests
+exercise odd output widths, 64/256/320-column slices, empty jobs, partial token
+tiles, both activation-precompute modes and graph replay. The host GGUF test
+checks default conversion, packed metadata, unchanged other tensors, exact
+values, and mapped-buffer lifetime. The three reviewed code tasks pass all
+1326 checks; near-context, Chinese, seeded sampling, cache churn and probe
+outputs match their existing references. See `packed-q2-v10-same-binary.json`
+and `packed-q2-v10-validation.json` in the November 4 evidence directory.
+
+Reproduce the panel with a fresh destination:
+
+```sh
+bash bench/results/2026-11-04-rx7900xtx-decode220/reproduce-214.sh NEW_OUTPUT_DIRECTORY
+```
+
+Build the focused tests with CMake targets `split_moe_q2_down_test`,
+`split_moe_q2_mma_test` and `split_gguf_release_test`; the first two require both
+cards. `split_moe_q2_down_test --bench` also runs diagnostic kernel timings.
+Changing expert ranking to frequency alone, four-token GU tiling, a signed-IQ
+lookup table, and host transparent huge pages did not improve their respective
+controls and remain excluded from the selected recipe.

@@ -47,7 +47,9 @@ struct Tensor {
 
 class Gguf {
 public:
-    explicit Gguf(const std::string& first_shard);   // finds the other "-0000N-of-0000M" shards beside it
+    // Finds sibling shards. The optional packed down format preserves the
+    // file's Q2_0 bytes; other readers retain the original Q4_0 repacking.
+    explicit Gguf(const std::string& first_shard, bool packed_q2_down = false);
     ~Gguf();
     const Tensor& t(const std::string& name) const;          // throws when missing
     const Tensor* find(const std::string& name) const;
@@ -90,7 +92,7 @@ private:
     std::deque<std::vector<uint8_t>> owned_;   // tensors converted at load (tensor_convert.hpp): their bytes live here, not in a file
     int converted_ = 0;
     void load_shard(const std::string& path, bool meta);
-    void convert_small_tensors();
+    void convert_small_tensors(bool packed_q2_down);
 };
 
 // Reads groups of tensors (a layer's, say) into host buffers ahead of the threads that slice them, in the order they

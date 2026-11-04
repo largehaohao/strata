@@ -1,5 +1,42 @@
 # November 4 decode follow-up
 
+The latest validated candidate is V10: **214.14082 tokens/s** on Swift IQ3_S,
+single request, context allocation 32768, code/prose/edit 2048 outputs each
+with two repeats. The metric is total output tokens divided by engine decode
+time, excluding warmup. **220 remains open.**
+
+V10 adds lossless packed Q2_0 down weights to V7. The same binary with this
+feature disabled and the original RAM budget measured 210.89848 tokens/s
+(+1.54% for V10). All six input/output and draft-acceptance streams match;
+both processes exited normally with zero decode major faults. The production
+service and configuration are unchanged.
+
+```sh
+bash bench/results/2026-11-04-rx7900xtx-decode220/reproduce-214.sh NEW_OUTPUT_DIRECTORY
+```
+
+The tested binary is `build-tensor-parralize-baseline/strata-split-packed-q2-v10`,
+SHA256 `bf1e35c8d08850128c0a8eae2b1306cbea1c19f3e318614629831ae8ab30ef01`.
+A rebuilt binary can be selected with `TP_EXE`. Full model paths and settings
+are in `run-heads-experiment.sh` and each raw `results.json` manifest.
+`packed-q2-v10-same-binary.json` records performance;
+`packed-q2-v10-validation.json` records the completed quality checks. Raw
+outputs and engine logs are retained in the corresponding directories.
+
+Focused CMake test targets are `split_moe_q2_down_test`, `split_moe_q2_mma_test`
+and `split_gguf_release_test`. The reproduced test logs record 1048576 exact
+dots, 3072 decode/guard cases, 648 Q8 prefill cases, 648 WMMA prefill cases, and
+host conversion/lifetime checks. Quality validation includes 1326 reviewed
+code checks, near-context generation, Chinese prompts, fixed seeded sampling,
+forced cache churn, and the prefetch probe. All match their prior references.
+
+The `run-*.sh` and `validate-*.sh` files record fixed original artifact names;
+copy them with fresh destinations before repeating. `reproduce-214.sh` accepts
+a new destination directly. The measurements below retain the earlier V7
+checkpoint for comparison.
+
+## V7 checkpoint
+
 The 220 tokens/s target remains open. The validated V7 candidate measured
 210.93794 tokens/s on the same Swift IQ3_S, single-request, 32768-context panel
 as the accepted 200 tokens/s recipe. Code, prose and edit each generate 2048
