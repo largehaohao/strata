@@ -31,3 +31,17 @@ A separate live Pi run passed both tasks without output truncation, taking 105.7
 Three zero-prefix-reuse API requests at each of 4096/16384/32768 tokens gave medians of 3622.2/4706.6/4698.5 prompt tokens/s. The engine and expert cache were already warm. A 200579-token input plus 64-token output completed without OOM, at 3664.8 prefill and 88.7 decode tokens/s. Its output and draft counts matched v27b. These long-input results guard capacity and the existing prefill path; they are not Pi incremental acceptance results.
 
 Only HIP on these two gfx1100 cards was exercised. The second candidate binary is `build-tensor-parralize-baseline/strata-split-pi-cache-stage-v2` (SHA-256 `4f5df943b47c4016e0e2c64f49e876e68d5e62d7bace10c8f0b0b6d2405d9682`). Private experiment configurations, captured fixture traffic and detailed timing records are under `build-tensor-parralize-baseline/pi-increment-20261105/`; do not publish that directory wholesale.
+
+## Pi-specific expert placement
+
+The saved Pi profile now uses the same binary with a different existing-format expert ranking. It was built from two **different** Pi tasks (`refactor-orders` and `reservation-workflow`), both of which passed. The decode bank contains all 2,389,920 verified expert picks from those tasks. The prompt bank contains 538,620 picks from their six cached, sub-512-token follow-ups; it excludes cold prefix reads. Atomic per-request snapshots reconciled with the engine's expected pick counts for all ten requests. The profile contains aggregated expert counts, not prompt or output text.
+
+| Evaluation on the original fixed Python/TypeScript requests | v27b | Pi placement | Gain |
+| --- | ---: | ---: | ---: |
+| Small incremental prefill | 263.03 | 597.01 | +127.0% |
+| All decode | 162.87 | 169.43 | +4.0% |
+| Small-follow-up decode | 158.37 | 168.04 | +6.1% |
+
+All 21 requests still matched the original outputs, tool arguments, draft counts and prefix reuse. A separate live run passed both tasks without truncation in 94.36 seconds. It generated 9233 tokens across 15 requests instead of 10444 across 21, so its 626.62 small-prefill tokens/s and task time are reported separately from the matched-input gain. Zero-prefix-reuse 4K/16K/32K medians were 3675.2/4687.0/4695.8 tokens/s. The 200579-input + 64-output case completed without OOM, with matching text and draft counts (3669.7 prefill, 88.9 decode tokens/s).
+
+The 196608-byte ranking is `bench/results/2026-11-05-rx7900xtx-pi-increment50/pi-small-fresh-routes-v1.bin` (SHA-256 `70f80eba6d9e28b9506958902ff6206d1bab77e9e4fbaa45c3d47a456495718c`). The 3× prefill and 1.2× decode targets remain unmet. A tighter chunk-dependent MoE launch bound was also checked against 10,476 exhaustive maxima and the real GPU jobs. It changed 524.15 to 524.64 tokens/s in the cache/staging configuration, so it was not selected.
