@@ -893,3 +893,29 @@ cards. `split_moe_q2_down_test --bench` also runs diagnostic kernel timings.
 Changing expert ranking to frequency alone, four-token GU tiling, a signed-IQ
 lookup table, and host transparent huge pages did not improve their respective
 controls and remain excluded from the selected recipe.
+
+### Cache pool padding (V11)
+
+`FNX_STATIC_CACHE_MIN_PADDING=1` considers two-pool partitions at cuts of
+ascending gate/up bytes, down bytes, and total bytes. It chooses lower
+layer-weighted pool padding within the original allocation budget; ties retain
+the median-based default. The calculation uses only weight geometry, with
+integer-overflow-safe cost comparisons and the existing minimum slots per pool.
+This option requires `FNX_STATIC_CACHE_GROUPS=2` and is off by default.
+
+For packed Swift IQ3_S, the selected 37/11-layer split increases base cache
+slots from 1088 to 1184 and total slots with spare K/V borrowing from 1292 to
+1402. Total cache plus borrowed bytes remain within the same budget. The
+unchanged 11.625 GiB expert RAM recipe measured **214.73470 tokens/s**, versus
+**213.84493** with only this option disabled in the same binary (+0.42%). All
+six input/output and draft streams match, normal process exits are recorded,
+and decode major faults remain zero. The 220 target remains open.
+
+`split_static_cache_layout_test` checks 768 generated layouts, deterministic
+pool assignment, budget constraints, default compatibility, the real packed
+shape fixture and large integer costs. `split_static_kv_cache_test` passes
+21945 layout checks. Code, near-context, Chinese, seeded sampling, forced churn
+and probe outputs match their existing references. Reproduce with
+`reproduce-cache-padding-v11.sh NEW_OUTPUT_DIRECTORY` in the November 4 evidence
+directory. The tested binary SHA256 is
+`006e535eb09e75b7a7fc61c781afd7f0c1d085e7aa1beacc6801f0aace1c4b2b`.

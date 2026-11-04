@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace fnx {
@@ -22,7 +23,7 @@ struct StaticCacheLayout {
 };
 
 inline StaticCacheLayout static_cache_layout(const std::vector<StaticCacheShape>& shapes, int budget_slots, int groups,
-                                             int min_slots = 160) {
+                                             int min_slots = 160, bool min_padding = false) {
     if (shapes.empty() || shapes.size() > 1024 || min_slots < 32 || min_slots % 32 ||
         budget_slots < min_slots || budget_slots > 4096 || budget_slots % 32 || (groups != 1 && groups != 2))
         throw std::runtime_error("static cache layout: invalid shapes, slot count or group count");
@@ -41,11 +42,65 @@ inline StaticCacheLayout static_cache_layout(const std::vector<StaticCacheShape>
     sizes.erase(std::unique(sizes.begin(), sizes.end()), sizes.end());
     const bool split = groups == 2 && sizes.size() > 1;
     const size_t cut = sizes[(sizes.size() - 1) / 2];
+    std::vector<int> partition;
+    for (const auto& s : shapes) partition.push_back(split && s.gu + s.dn > cut);
+    if (min_padding && split) {
+        // A median of total bytes can mix a wide GU/small DN with a narrow
+        // GU/wide DN, wasting both dimensions. Compare cuts on GU, DN and
+        // total size using the actual independently padded pool dimensions.
+        // This is O(n^2), bounded by the number of model layers; it reads no
+        // benchmark routes. Preserve the original partition on equal cost.
+        using Cost = std::pair<size_t, size_t>;
+        auto cost = [&](const std::vector<int>& assignment, Cost& out) {
+            StaticCachePool p[2];
+            for (size_t i = 0; i < shapes.size(); ++i) {
+                auto& pool = p[assignment[i]];
+                pool.gu = std::max(pool.gu, shapes[i].gu);
+                pool.dn = std::max(pool.dn, shapes[i].dn);
+                ++pool.layers;
+            }
+            if (!p[0].layers || !p[1].layers) return false;
+            size_t left = budget;
+            for (const auto& pool : p) {
+                const size_t bytes = pool.stride() * min_slots;
+                if (bytes > left) return false;
+                left -= bytes;
+            }
+            // Exact weighted average as quotient + remainder; multiplying
+            // a potentially large stride by all layers would overflow.
+            size_t whole = 0, remainder = 0;
+            for (const auto& pool : p) {
+                whole += (pool.stride() / shapes.size()) * pool.layers;
+                remainder += (pool.stride() % shapes.size()) * pool.layers;
+            }
+            out = {whole + remainder / shapes.size(), remainder % shapes.size()};
+            return true;
+        };
+        Cost best{std::numeric_limits<size_t>::max(), std::numeric_limits<size_t>::max()};
+        cost(partition, best);
+        std::vector<int> candidate(shapes.size());
+        for (int axis = 0; axis < 3; ++axis) {
+            auto key = [&](const StaticCacheShape& s) { return axis == 0 ? s.gu : axis == 1 ? s.dn : s.gu + s.dn; };
+            std::vector<size_t> cuts;
+            for (const auto& s : shapes) cuts.push_back(key(s));
+            std::sort(cuts.begin(), cuts.end());
+            cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
+            for (size_t boundary : cuts) {
+                for (size_t i = 0; i < shapes.size(); ++i) candidate[i] = key(shapes[i]) > boundary;
+                Cost next;
+                if (cost(candidate, next) && next < best) {
+                    best = next;
+                    partition = candidate;
+                }
+            }
+        }
+    }
     StaticCacheLayout layout;
     layout.pools.resize(split ? 2 : 1);
-    for (const auto& s : shapes) {
-        const int p = split && s.gu + s.dn > cut;
-        layout.pool_of.push_back(p);
+    layout.pool_of = partition;
+    for (size_t i = 0; i < shapes.size(); ++i) {
+        const auto& s = shapes[i];
+        const int p = partition[i];
         auto& pool = layout.pools[p];
         pool.gu = std::max(pool.gu, s.gu); pool.dn = std::max(pool.dn, s.dn); ++pool.layers;
     }

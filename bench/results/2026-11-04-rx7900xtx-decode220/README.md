@@ -1,5 +1,37 @@
 # November 4 decode follow-up
 
+The latest validated candidate is V11: **214.73470 tokens/s** on the unchanged
+single-request Swift IQ3_S panel (code/prose/edit, 2048 outputs each, twice;
+context allocation 32768). The aggregate uses total tokens divided by engine
+decode time, excluding warmup. **220 remains open.**
+
+V11 minimizes per-pool padding while retaining the cache byte budget and V10
+packed Q2 arithmetic. It uses only tensor geometry, not benchmark routes. The
+same binary with only this option disabled measured 213.84493 tokens/s
+(+0.42%). All six input/output streams and draft acceptance match, both
+processes exited normally, and all decode major-fault counts are zero.
+
+```sh
+bash bench/results/2026-11-04-rx7900xtx-decode220/reproduce-cache-padding-v11.sh NEW_OUTPUT_DIRECTORY
+```
+
+The tested binary is `build-tensor-parralize-baseline/strata-split-cache-padding-v11`,
+SHA256 `006e535eb09e75b7a7fc61c781afd7f0c1d085e7aa1beacc6801f0aace1c4b2b`.
+The option `FNX_STATIC_CACHE_MIN_PADDING=1` requires two cache groups and is
+disabled by default. Cache slots increase from 1292 to 1402 with unchanged
+expert RAM (11.625 GiB), including space temporarily borrowed from unused K/V.
+
+The layout test passes 768 generated cases, default-compatibility and real-model
+fixtures; 21945 K/V layout checks pass. The full quality suite passes the
+1326 reviewed code checks and exact reference comparisons for near-context,
+Chinese generation, fixed seeded sampling with penalties, forced cache churn,
+and prefetch probing. See `cache-padding-v11-same-binary.json` and
+`cache-padding-v11-validation.json`; raw manifests and engine logs are retained.
+A RAM11.5 experiment measured 214.91535 tokens/s, only +0.08%, and is retained
+as evidence rather than selected over the configuration with more VRAM margin.
+
+## V10 checkpoint
+
 The latest validated candidate is V10: **214.14082 tokens/s** on Swift IQ3_S,
 single request, context allocation 32768, code/prose/edit 2048 outputs each
 with two repeats. The metric is total output tokens divided by engine decode

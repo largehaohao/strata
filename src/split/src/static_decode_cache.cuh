@@ -13,6 +13,9 @@ namespace fnx {
 
 inline ExpertCache static_decode_cache(const Model& model, const CardW& weights, int slots, int groups = 1,
                                        size_t full_kv_bytes = 0, size_t base_kv_bytes = 0) {
+    const auto padding = env_int("FNX_STATIC_CACHE_MIN_PADDING", 0);
+    if ((padding != 0 && padding != 1) || (padding && groups != 2))
+        throw std::runtime_error("FNX_STATIC_CACHE_MIN_PADDING: expected 0 or 1; enabling requires two cache groups");
     std::vector<StaticCacheShape> shapes;
     for (const LayerW& layer : weights.L) {
         if (!layer.gu_e.ep || !layer.down_e.ep)
@@ -22,7 +25,7 @@ inline ExpertCache static_decode_cache(const Model& model, const CardW& weights,
     const long long pool_hint = full_kv_bytes ? env_int("FNX_STATIC_CACHE_ARENA_POOL", -1) : -1;
     if (pool_hint < -1 || pool_hint >= groups)
         throw std::runtime_error("FNX_STATIC_CACHE_ARENA_POOL: expected -1 (automatic) or an existing cache pool");
-    const auto plan = static_kv_cache_plan(static_cache_layout(shapes, slots, groups, MAXT * TOPK),
+    const auto plan = static_kv_cache_plan(static_cache_layout(shapes, slots, groups, MAXT * TOPK, padding == 1),
                                            full_kv_bytes, base_kv_bytes, (int) pool_hint);
     const auto& layout = plan.cache;
     ExpertCache ec;
@@ -64,6 +67,7 @@ inline ExpertCache static_decode_cache(const Model& model, const CardW& weights,
     ck(cudaMemcpy(ec.hand, ec.s0, EC_POOLS * sizeof(int), cudaMemcpyHostToDevice), "cache initial hands");
     std::fprintf(stderr, "fnx: card %d: static decode cache %d slots, %zu MiB in %d pools, fixed hot experts bypass it\n",
                  weights.dev, ec.n_slots, layout.bytes >> 20, ec.n_pools);
+    if (padding) std::fprintf(stderr, "fnx: static cache partition minimizes independent gate/up and down padding\n");
     if (plan.pool >= 0)
         std::fprintf(stderr, "fnx: cache pool %d shares unused K/V pages: %d extra slots; original capacity remains at full context\n",
                      plan.pool, plan.extra_slots);

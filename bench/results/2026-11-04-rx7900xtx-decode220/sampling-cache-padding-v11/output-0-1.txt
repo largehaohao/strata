@@ -1,0 +1,5 @@
+# 深入解析数据库并发控制：从 MVCC 到可串行化
+
+对于后端工程师而言，理解数据库并发控制（Concurrency Control）不仅仅是为了通过面试，更是为了在分布式系统和高并发场景下保证数据的一致性（Consistency）。许多线上故障源于对“隔离级别”理解的偏差——开发者往往认为选择了 `REPEATABLE READ` 就万事大吉，却忽视了**写偏差（Write Skew）**这种隐蔽的异常。
+
+本文将以 PostgreSQL 为具体语境，深入剖析 MVCC、快照隔离（Snapshot Isolation, SI）、写偏差以及可串行化隔离（Serializable Isolation,

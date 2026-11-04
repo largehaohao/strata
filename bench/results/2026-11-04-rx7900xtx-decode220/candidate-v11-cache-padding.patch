@@ -1,0 +1,196 @@
+diff --git a/src/split/src/static_cache_layout.hpp b/src/split/src/static_cache_layout.hpp
+index 7239d74c..c547d763 100644
+--- a/src/split/src/static_cache_layout.hpp
++++ b/src/split/src/static_cache_layout.hpp
+@@ -5,6 +5,7 @@
+ #include <cstddef>
+ #include <limits>
+ #include <stdexcept>
++#include <utility>
+ #include <vector>
+ 
+ namespace fnx {
+@@ -22,7 +23,7 @@ struct StaticCacheLayout {
+ };
+ 
+ inline StaticCacheLayout static_cache_layout(const std::vector<StaticCacheShape>& shapes, int budget_slots, int groups,
+-                                             int min_slots = 160) {
++                                             int min_slots = 160, bool min_padding = false) {
+     if (shapes.empty() || shapes.size() > 1024 || min_slots < 32 || min_slots % 32 ||
+         budget_slots < min_slots || budget_slots > 4096 || budget_slots % 32 || (groups != 1 && groups != 2))
+         throw std::runtime_error("static cache layout: invalid shapes, slot count or group count");
+@@ -41,11 +42,65 @@ inline StaticCacheLayout static_cache_layout(const std::vector<StaticCacheShape>
+     sizes.erase(std::unique(sizes.begin(), sizes.end()), sizes.end());
+     const bool split = groups == 2 && sizes.size() > 1;
+     const size_t cut = sizes[(sizes.size() - 1) / 2];
++    std::vector<int> partition;
++    for (const auto& s : shapes) partition.push_back(split && s.gu + s.dn > cut);
++    if (min_padding && split) {
++        // A median of total bytes can mix a wide GU/small DN with a narrow
++        // GU/wide DN, wasting both dimensions. Compare cuts on GU, DN and
++        // total size using the actual independently padded pool dimensions.
++        // This is O(n^2), bounded by the number of model layers; it reads no
++        // benchmark routes. Preserve the original partition on equal cost.
++        using Cost = std::pair<size_t, size_t>;
++        auto cost = [&](const std::vector<int>& assignment, Cost& out) {
++            StaticCachePool p[2];
++            for (size_t i = 0; i < shapes.size(); ++i) {
++                auto& pool = p[assignment[i]];
++                pool.gu = std::max(pool.gu, shapes[i].gu);
++                pool.dn = std::max(pool.dn, shapes[i].dn);
++                ++pool.layers;
++            }
++            if (!p[0].layers || !p[1].layers) return false;
++            size_t left = budget;
++            for (const auto& pool : p) {
++                const size_t bytes = pool.stride() * min_slots;
++                if (bytes > left) return false;
++                left -= bytes;
++            }
++            // Exact weighted average as quotient + remainder; multiplying
++            // a potentially large stride by all layers would overflow.
++            size_t whole = 0, remainder = 0;
++            for (const auto& pool : p) {
++                whole += (pool.stride() / shapes.size()) * pool.layers;
++                remainder += (pool.stride() % shapes.size()) * pool.layers;
++            }
++            out = {whole + remainder / shapes.size(), remainder % shapes.size()};
++            return true;
++        };
++        Cost best{std::numeric_limits<size_t>::max(), std::numeric_limits<size_t>::max()};
++        cost(partition, best);
++        std::vector<int> candidate(shapes.size());
++        for (int axis = 0; axis < 3; ++axis) {
++            auto key = [&](const StaticCacheShape& s) { return axis == 0 ? s.gu : axis == 1 ? s.dn : s.gu + s.dn; };
++            std::vector<size_t> cuts;
++            for (const auto& s : shapes) cuts.push_back(key(s));
++            std::sort(cuts.begin(), cuts.end());
++            cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
++            for (size_t boundary : cuts) {
++                for (size_t i = 0; i < shapes.size(); ++i) candidate[i] = key(shapes[i]) > boundary;
++                Cost next;
++                if (cost(candidate, next) && next < best) {
++                    best = next;
++                    partition = candidate;
++                }
++            }
++        }
++    }
+     StaticCacheLayout layout;
+     layout.pools.resize(split ? 2 : 1);
+-    for (const auto& s : shapes) {
+-        const int p = split && s.gu + s.dn > cut;
+-        layout.pool_of.push_back(p);
++    layout.pool_of = partition;
++    for (size_t i = 0; i < shapes.size(); ++i) {
++        const auto& s = shapes[i];
++        const int p = partition[i];
+         auto& pool = layout.pools[p];
+         pool.gu = std::max(pool.gu, s.gu); pool.dn = std::max(pool.dn, s.dn); ++pool.layers;
+     }
+diff --git a/src/split/src/static_decode_cache.cuh b/src/split/src/static_decode_cache.cuh
+index d2a6562a..1040a33a 100644
+--- a/src/split/src/static_decode_cache.cuh
++++ b/src/split/src/static_decode_cache.cuh
+@@ -13,6 +13,9 @@ namespace fnx {
+ 
+ inline ExpertCache static_decode_cache(const Model& model, const CardW& weights, int slots, int groups = 1,
+                                        size_t full_kv_bytes = 0, size_t base_kv_bytes = 0) {
++    const auto padding = env_int("FNX_STATIC_CACHE_MIN_PADDING", 0);
++    if ((padding != 0 && padding != 1) || (padding && groups != 2))
++        throw std::runtime_error("FNX_STATIC_CACHE_MIN_PADDING: expected 0 or 1; enabling requires two cache groups");
+     std::vector<StaticCacheShape> shapes;
+     for (const LayerW& layer : weights.L) {
+         if (!layer.gu_e.ep || !layer.down_e.ep)
+@@ -22,7 +25,7 @@ inline ExpertCache static_decode_cache(const Model& model, const CardW& weights,
+     const long long pool_hint = full_kv_bytes ? env_int("FNX_STATIC_CACHE_ARENA_POOL", -1) : -1;
+     if (pool_hint < -1 || pool_hint >= groups)
+         throw std::runtime_error("FNX_STATIC_CACHE_ARENA_POOL: expected -1 (automatic) or an existing cache pool");
+-    const auto plan = static_kv_cache_plan(static_cache_layout(shapes, slots, groups, MAXT * TOPK),
++    const auto plan = static_kv_cache_plan(static_cache_layout(shapes, slots, groups, MAXT * TOPK, padding == 1),
+                                            full_kv_bytes, base_kv_bytes, (int) pool_hint);
+     const auto& layout = plan.cache;
+     ExpertCache ec;
+@@ -64,6 +67,7 @@ inline ExpertCache static_decode_cache(const Model& model, const CardW& weights,
+     ck(cudaMemcpy(ec.hand, ec.s0, EC_POOLS * sizeof(int), cudaMemcpyHostToDevice), "cache initial hands");
+     std::fprintf(stderr, "fnx: card %d: static decode cache %d slots, %zu MiB in %d pools, fixed hot experts bypass it\n",
+                  weights.dev, ec.n_slots, layout.bytes >> 20, ec.n_pools);
++    if (padding) std::fprintf(stderr, "fnx: static cache partition minimizes independent gate/up and down padding\n");
+     if (plan.pool >= 0)
+         std::fprintf(stderr, "fnx: cache pool %d shares unused K/V pages: %d extra slots; original capacity remains at full context\n",
+                      plan.pool, plan.extra_slots);
+diff --git a/src/split/tools/static_cache_layout_test.cpp b/src/split/tools/static_cache_layout_test.cpp
+index bba979b9..17fa4ad4 100644
+--- a/src/split/tools/static_cache_layout_test.cpp
++++ b/src/split/tools/static_cache_layout_test.cpp
+@@ -1,4 +1,5 @@
+ #include "static_cache_layout.hpp"
++#include "static_kv_cache.hpp"
+ #include <iostream>
+ #include <cstdlib>
+ #include <cstdint>
+@@ -10,8 +11,8 @@ static void invalid(const std::vector<StaticCacheShape>& s, int slots, int group
+     catch (const std::runtime_error&) { return; }
+     throw std::runtime_error("invalid layout was accepted");
+ }
+-static void check(const std::vector<StaticCacheShape>& shapes, int budget_slots, int groups) {
+-    const auto a = static_cache_layout(shapes, budget_slots, groups);
++static void check(const std::vector<StaticCacheShape>& shapes, int budget_slots, int groups, bool padding = false) {
++    const auto a = static_cache_layout(shapes, budget_slots, groups, 160, padding);
+     need(a.pools.size() >= 1 && a.pools.size() <= (size_t) groups);
+     need(a.pool_of.size() == shapes.size());
+     size_t gu = 0, dn = 0, bytes = 0; int slots = 0, layers = 0;
+@@ -29,9 +30,16 @@ static void check(const std::vector<StaticCacheShape>& shapes, int budget_slots,
+     }
+     if (groups == 1) need(a.slots == budget_slots && a.bytes == (gu + dn) * budget_slots);
+     auto reversed = shapes; std::reverse(reversed.begin(), reversed.end());
+-    const auto b = static_cache_layout(reversed, budget_slots, groups);
++    const auto b = static_cache_layout(reversed, budget_slots, groups, 160, padding);
+     need(a.slots == b.slots && a.bytes == b.bytes && a.pools.size() == b.pools.size());
+     for (size_t l = 0; l < shapes.size(); ++l) need(a.pool_of[l] == b.pool_of[shapes.size() - l - 1]);
++    if (padding) {
++        const auto old = static_cache_layout(shapes, budget_slots, groups);
++        size_t before = 0, after = 0;
++        for (const auto& p : old.pools) before += p.stride() * p.layers;
++        for (const auto& p : a.pools) after += p.stride() * p.layers;
++        need(after <= before);
++    }
+ }
+ int main() {
+     const std::vector<StaticCacheShape> four{{256,128},{320,160},{384,192},{448,224}};
+@@ -46,6 +54,26 @@ int main() {
+     // Independent GU/DN maxima can exceed every individual layer's total size.
+     check({{1024,16},{16,1024},{2048,16},{16,2048}}, 512, 2);
+     check({{16,16},{size_t(1) << 40,16}}, 1024, 2); // bounded slot growth
++    // The real Q2-down model: a median of total bytes mixes opposing GU/DN
++    // dimensions. The padding policy recovers slots within the same budget.
++    std::vector<StaticCacheShape> packed;
++    auto add = [&](int n, size_t gu, size_t dn) { packed.insert(packed.end(), n, {gu, dn}); };
++    add(5,524800,230400); add(15,524800,460800); add(3,627200,230400);
++    add(14,627200,460800); add(1,704000,230400); add(9,704000,460800); add(1,870400,460800);
++    const auto old_packed = static_cache_layout(packed, 1024, 2);
++    const auto new_packed = static_cache_layout(packed, 1024, 2, 160, true);
++    need(old_packed.slots == 1088 && new_packed.slots == 1184);
++    need(new_packed.pools[0].layers == 37 && new_packed.pools[0].gu == 627200 && new_packed.pools[0].dn == 460800);
++    const auto kv = static_kv_cache_plan(new_packed, size_t(172) * 1517568, size_t(16) * 1517568);
++    need(kv.extra_slots == 218 && kv.cache.slots == 1402 && kv.cache.bytes == 1595417600);
++    check(packed, 1024, 2, true);
++    for (auto& s : packed) s.dn = 460800;
++    const auto old_expanded = static_cache_layout(packed, 1024, 2);
++    const auto new_expanded = static_cache_layout(packed, 1024, 2, 160, true);
++    need(old_expanded.pool_of == new_expanded.pool_of && old_expanded.bytes == new_expanded.bytes && old_expanded.slots == new_expanded.slots);
++    const size_t large = (std::numeric_limits<size_t>::max() / 4096) & ~size_t(31);
++    const auto edge = static_cache_layout({{large,16},{16,large},{large/2,large/2}}, 1024, 2, 160, true);
++    need(edge.bytes <= 2 * large * 1024 && edge.slots <= 2048);
+     invalid({}, 1024, 1); invalid(four, 0, 1); invalid(four, 159, 1); invalid(four, 161, 1);
+     invalid(four, 4128, 1); invalid(four, 1024, 0); invalid(four, 1024, 3);
+     invalid(four, 1024, 1, 0); invalid(four, 1024, 1, 161); invalid(four, 160, 2);
+@@ -61,6 +89,7 @@ int main() {
+             seed = seed * 1664525u + 1013904223u; s.push_back({g,16 * (1 + seed % 128)});
+         }
+         check(s, cap, 1); check(s, cap, 2);
++        check(s, cap, 1, true); check(s, cap, 2, true);
+     }
+-    std::cout << "static cache layout: allocation bounds, pool assignment, 384 generated layouts and invalid inputs passed\n";
++    std::cout << "static cache layout: allocation bounds, pool assignment, 768 generated layouts and invalid inputs passed\n";
+ }
