@@ -251,15 +251,108 @@ __global__ void __launch_bounds__(GCH_THREADS) k_gdn_ch_prep(const float* __rest
     if (tid == 0) o[2 * GCH * GCH + 3 * GCH] = gch_exp(lgam[GCH - 1]);
 }
 
+// K/Q are dead after their dot products. Keep the eight products in registers
+// until every wave finishes reading, then reuse their 32 KiB for A, P, T and
+// gates. XOR column swizzling replaces the padded input rows without bank
+// conflicts, allowing two preparation blocks in 64 KiB of LDS on gfx11.
+__global__ void __launch_bounds__(GCH_THREADS) k_gdn_ch_prep_compact(const float* __restrict__ xc,
+    const float* __restrict__ ab, const float* __restrict__ dt, const float* __restrict__ a,
+    const int* __restrict__ vmap, int nk, int nv, int C, float* __restrict__ out) {
+    const int sc = blockIdx.x, lv = blockIdx.y, kh = vmap[lv] & 255, tid = threadIdx.x, t0 = sc * GCH;
+    const int n = min(GCH, C - t0), ch = (2 * nk + nv) * HS;
+    __shared__ float sm[2 * GCH * HS];
+    static_assert(HS >= GCH && (HS & (HS - 1)) == 0, "XOR-swizzled head width");
+    static_assert(3 * GCH * (GCH + 1) + 3 * GCH <= 2 * GCH * HS, "prep scratch lifetimes fit");
+    auto key = [&](int row, int col) -> float& { return sm[row * HS + (col ^ row)]; };
+    auto query = [&](int row, int col) -> float& { return sm[GCH * HS + row * HS + (col ^ row)]; };
+    for (int e = tid; e < GCH * HS; e += GCH_THREADS) {
+        const int i = e / HS, r = e % HS;
+        const float* row = xc + (size_t) (t0 + i) * ch;
+        query(i,r) = i < n ? row[kh * HS + r] : 0.f;
+        key(i,r) = i < n ? row[nk * HS + kh * HS + r] : 0.f;
+    }
+    float gate_log = 0.f, gate_b = 0.f;
+    if (tid < n) {
+        const float* abt = ab + (size_t) (t0 + tid) * 2 * nv;
+        const float x = abt[lv] + dt[lv];
+        gate_log = (x > 20.f ? x : log1pf(__expf(x))) * a[lv];
+        gate_b = 1.f / (1.f + __expf(-abt[nv + lv]));
+    }
+    __syncthreads();
+    const int i0 = (tid / (GCH / 2)) * 2, j0 = (tid % (GCH / 2)) * 2;
+    float k00=0.f, k01=0.f, k10=0.f, k11=0.f, q00=0.f, q01=0.f, q10=0.f, q11=0.f;
+#pragma unroll 4
+    for (int r=0;r<HS;++r) {
+        const float a0=key(i0,r), a1=key(i0+1,r), b0=query(i0,r), b1=query(i0+1,r);
+        const float c0=key(j0,r), c1=key(j0+1,r);
+        k00=fmaf(a0,c0,k00), k01=fmaf(a0,c1,k01), k10=fmaf(a1,c0,k10), k11=fmaf(a1,c1,k11);
+        q00=fmaf(b0,c0,q00), q01=fmaf(b0,c1,q01), q10=fmaf(b1,c0,q10), q11=fmaf(b1,c1,q11);
+    }
+    __syncthreads(); // every input read is complete before reusing K/Q storage
+    auto* kk = reinterpret_cast<float(*)[GCH+1]>(sm);
+    auto* pp = kk + GCH;
+    auto* tt = pp + GCH;
+    float* lg = reinterpret_cast<float*>(tt + GCH);
+    float* lgam = lg + GCH;
+    float* bb = lgam + GCH;
+    kk[i0][j0]=k00, kk[i0][j0+1]=k01, kk[i0+1][j0]=k10, kk[i0+1][j0+1]=k11;
+    pp[i0][j0]=q00, pp[i0][j0+1]=q01, pp[i0+1][j0]=q10, pp[i0+1][j0+1]=q11;
+    if (tid<GCH) lg[tid]=gate_log, bb[tid]=gate_b;
+    __syncthreads();
+    if (tid==0) {
+        float s=0.f;
+        for (int i=0;i<GCH;++i) lgam[i]=s+=lg[i];
+    }
+    __syncthreads();
+    for (int e=tid;e<GCH*GCH;e+=GCH_THREADS) {
+        const int i=e/GCH,j=e%GCH;
+        const float dec=gch_exp(lgam[i]-lgam[j]);
+        kk[i][j]=j<i ? bb[i]*dec*kk[i][j] : 0.f;
+        pp[i][j]=j<=i ? dec*pp[i][j] : 0.f;
+    }
+    __syncthreads();
+    if (tid<GCH) {
+        const int m=tid;
+        for (int i=0;i<GCH;++i) {
+            float v=i==m ? 1.f : 0.f;
+            for (int j=m;j<i;++j) v=fmaf(-kk[i][j],tt[j][m],v);
+            tt[i][m]=m<=i ? v : 0.f;
+            __syncwarp();
+        }
+    }
+    __syncthreads();
+    float* o=out+((size_t)sc*nv+lv)*GCH_PREP_FLOATS;
+    for (int e=tid;e<GCH*GCH;e+=GCH_THREADS) {
+        o[e]=tt[e/GCH][e%GCH];
+        o[GCH*GCH+e]=pp[e/GCH][e%GCH];
+    }
+    if (tid<GCH) {
+        o[2*GCH*GCH+tid]=gch_exp(lgam[tid]);
+        o[2*GCH*GCH+GCH+tid]=gch_exp(lgam[GCH-1]-lgam[tid]);
+        o[2*GCH*GCH+2*GCH+tid]=bb[tid];
+    }
+    if (tid==0) o[2*GCH*GCH+3*GCH]=gch_exp(lgam[GCH-1]);
+}
+
 constexpr size_t GCH_REC_SMEM = sizeof(float) * (2 * GCH * (HS + 1) + HS * GCB + 4 * GCH * GCB + GCH_PREP_FLOATS);
+// Q is dead after W/Y. Its tile can then hold R, Y and U, leaving room
+// for 32 state columns and eight waves without exceeding RDNA's 64 KiB LDS.
+constexpr size_t GCH_REC_WIDE_SMEM = sizeof(float) * (2 * GCH * (HS + 1) + HS * 32 + GCH * 32 + GCH_PREP_FLOATS);
+static_assert(GCH_REC_WIDE_SMEM <= 64 * 1024 && 3 * GCH * 32 <= GCH * (HS + 1), "wide recurrent scratch fits");
 // a thread's share of a sub-chunk's inputs, fetched into registers while the sub-chunk before computes
 constexpr int GCH_KQ_PER = GCH * HS / GCR_THREADS, GCH_V_PER = GCH * GCB / GCR_THREADS,
               GCH_PRE_PER = (GCH_PREP_FLOATS + GCR_THREADS - 1) / GCR_THREADS;
 static_assert(GCH * HS % GCR_THREADS == 0 && GCH * GCB % GCR_THREADS == 0, "even shares");
 
-__global__ void __launch_bounds__(GCR_THREADS) k_gdn_ch_rec(const float* __restrict__ xc, const float* __restrict__ prep,
+template <int Columns = GCB, bool ReuseQ = false>
+__global__ void __launch_bounds__(GCH * Columns / 4) k_gdn_ch_rec(const float* __restrict__ xc, const float* __restrict__ prep,
                                                            float* __restrict__ S, float* __restrict__ y32, int nk, int nv,
                                                            const int* __restrict__ vmap, int C) {
+    constexpr int GCB = Columns, GCR_THREADS = GCH * Columns / 4, GCR_CG = Columns / 4;
+    constexpr int GCH_REC_BLOCKS_PER_HEAD = HS / Columns;
+    constexpr int GCH_KQ_PER = GCH * HS / GCR_THREADS, GCH_V_PER = GCH * Columns / GCR_THREADS,
+                  GCH_PRE_PER = (GCH_PREP_FLOATS + GCR_THREADS - 1) / GCR_THREADS;
+    static_assert(Columns == 16 || Columns == 32, "supported recurrent state column tiles");
     const int lv = blockIdx.x / GCH_REC_BLOCKS_PER_HEAD, c0 = (blockIdx.x % GCH_REC_BLOCKS_PER_HEAD) * GCB;
     const int kh = vmap[lv] & 255, tid = threadIdx.x, ch = (2 * nk + nv) * HS;
     extern __shared__ float gsm[];
@@ -267,10 +360,10 @@ __global__ void __launch_bounds__(GCR_THREADS) k_gdn_ch_rec(const float* __restr
     float(*qs)[HS + 1] = reinterpret_cast<float(*)[HS + 1]>(gsm + GCH * (HS + 1));
     float* ss = gsm + 2 * GCH * (HS + 1);   // [HS][GCB]: the state's columns c0.. (rows: the key dimension)
     float* vv = ss + HS * GCB;              // [GCH][GCB] each: v; R; Y; U
-    float* rr = vv + GCH * GCB;
+    float* rr = ReuseQ ? reinterpret_cast<float*>(qs) : vv + GCH * GCB;
     float* yy = rr + GCH * GCB;
     float* uu = yy + GCH * GCB;
-    float* pre = uu + GCH * GCB;            // the sub-chunk's T, P, G, decay to end, b, G_last
+    float* pre = ReuseQ ? vv + GCH * GCB : uu + GCH * GCB; // T, P, G, decay to end, b, G_last
     float* sst = S + (size_t) lv * HS * HS;
     for (int e = tid; e < HS * GCB; e += GCR_THREADS) ss[e] = sst[(size_t) (e / GCB) * HS + c0 + e % GCB];
     const float scale = rsqrtf((float) HS);
@@ -336,6 +429,9 @@ __global__ void __launch_bounds__(GCR_THREADS) k_gdn_ch_rec(const float* __restr
                     for (int b = 0; b < 4; ++b) w[a][b] = fmaf(k, sv[b], w[a][b]), y[a][b] = fmaf(q, sv[b], y[a][b]);
                 }
             }
+            // Every wave must finish Q reads before any half writes partials
+            // into the same storage. K, V and the state stay disjoint.
+            if constexpr (ReuseQ) __syncthreads();
             if (half) {
 #pragma unroll
                 for (int a = 0; a < 2; ++a)
@@ -443,6 +539,75 @@ __global__ void __launch_bounds__(HS) k_gdn_pf_norm(const float* __restrict__ qk
 #else
     *y = *y * rsqrtf(ms + eps) * nw[c] / (1.0f + __expf(-z));
 #endif
+}
+
+// One wave owns a head, with the original four 32-column reductions kept
+// independent and added in the same order. Eight heads share a block; no
+// block-wide barrier is needed for either normalization. This reduces the
+// number of short blocks without changing convolution or FP32 reduction bits.
+constexpr int GDN_PF_ROW_WAVES = 8, GDN_PF_ROW_THREADS = 32 * GDN_PF_ROW_WAVES;
+static_assert(HS % 32 == 0, "wave row layout needs whole 32-column segments");
+__global__ void __launch_bounds__(GDN_PF_ROW_THREADS) k_gdn_pf_conv_rows(const float* __restrict__ qkvz,
+    const float* __restrict__ hist, const float* __restrict__ convw, const int* __restrict__ ctl,
+    float* __restrict__ xc, int nk, int nv, int C) {
+    const int heads = 2 * nk + nv, row = blockIdx.x * GDN_PF_ROW_WAVES + threadIdx.x / 32;
+    if (row >= C * heads) return;
+    const int t = row / heads, h = row % heads, lane = threadIdx.x & 31;
+    const int ch = heads * HS, stride = ch + nv * HS;
+    const float* hin = hist + (size_t) (((const unsigned*) ctl)[3] & 1u) * 3 * ch;
+    float y[HS / 32];
+#pragma unroll
+    for (int w = 0; w < HS / 32; ++w) {
+        const int c = h * HS + lane + w * 32;
+        float win[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const int r = t - 3 + k;
+            win[k] = r >= 0 ? qkvz[(size_t) r * stride + c] : hin[(size_t) (3 + r) * ch + c];
+        }
+        const float x = convw[c * 4] * win[0] + convw[c * 4 + 1] * win[1] +
+                        convw[c * 4 + 2] * win[2] + convw[c * 4 + 3] * win[3];
+        y[w] = x / (1.0f + __expf(-x));
+    }
+    if (h < 2 * nk) {
+        float sq = 0.f;
+#pragma unroll
+        for (int w = 0; w < HS / 32; ++w)
+            sq += __shfl_sync(0xffffffffu, wsum(y[w] * y[w]), 0);
+        const float scale = rsqrtf(sq + 1e-6f);
+#pragma unroll
+        for (int w = 0; w < HS / 32; ++w) y[w] = y[w] * scale;
+    }
+#pragma unroll
+    for (int w = 0; w < HS / 32; ++w) xc[(size_t) t * ch + h * HS + lane + w * 32] = y[w];
+}
+
+__global__ void __launch_bounds__(GDN_PF_ROW_THREADS) k_gdn_pf_norm_rows(const float* __restrict__ qkvz,
+    const float* __restrict__ nw, float* __restrict__ y32, int nk, int nv, float eps, int C) {
+    const int row = blockIdx.x * GDN_PF_ROW_WAVES + threadIdx.x / 32;
+    if (row >= C * nv) return;
+    const int t = row / nv, lv = row % nv, lane = threadIdx.x & 31;
+    const int ch = (2 * nk + nv) * HS, stride = ch + nv * HS;
+    float v[HS / 32], sq = 0.f;
+#pragma unroll
+    for (int w = 0; w < HS / 32; ++w) {
+        v[w] = y32[(size_t) row * HS + lane + w * 32];
+        // The reference stores lane 0's reduction. Contraction of the first
+        // square/add may make another lane differ by an ULP; broadcast the
+        // same lane instead of assuming all XOR-reduction lanes are identical.
+        sq += __shfl_sync(0xffffffffu, wsum(v[w] * v[w]), 0);
+    }
+    const float scale = rsqrtf(sq / (float) HS + eps);
+#pragma unroll
+    for (int w = 0; w < HS / 32; ++w) {
+        const int c = lane + w * 32;
+        const float z = qkvz[(size_t) t * stride + ch + lv * HS + c];
+#if FNX_27B
+        y32[(size_t) row * HS + c] = v[w] * scale * nw[c] * z / (1.0f + __expf(-z));
+#else
+        y32[(size_t) row * HS + c] = v[w] * scale * nw[c] / (1.0f + __expf(-z));
+#endif
+    }
 }
 
 }  // namespace

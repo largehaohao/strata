@@ -15,12 +15,17 @@ namespace {
 
 // a k-step of MM_KC columns; a K-quant row takes MM_TPR threads (16 quant bytes, 32 weights each), so one pass of the
 // block's threads fills MM_PASS rows; tile rows are padded to MM_LD halves (8: the fewest bank conflicts)
-constexpr int MM_BM = 64, MM_KC = 64, MM_TPR = MM_KC / 32, MM_THREADS = 128, MM_PASS = MM_THREADS / MM_TPR, MM_LD = MM_KC + 8;
+#if defined(FNX_MOE_MMA_WIDE)
+constexpr int MM_THREADS = 256, MM_BM = 128;
+#else
+constexpr int MM_THREADS = 128, MM_BM = 64;
+#endif
+constexpr int MM_KC = 64, MM_TPR = MM_KC / 32, MM_PASS = MM_THREADS / MM_TPR, MM_LD = MM_KC + 8;
 constexpr int MM_XV = PF_JOB * MM_KC / 8 / MM_THREADS;   // activation uint4s per thread and step, at most
 // a K-quant tile's thread: its row and which half of the step's 64 columns (MM_TPR = 2). Eight threads in a row take 8
 // rows at the same columns, so a quarter-warp's 16-byte stores hit 8 different bank groups (a 144-byte row stride); both
 // halves of a row are still fetched by one warp (threads t and t + 8)
-static_assert(MM_TPR == 2 && MM_THREADS == 128, "the K-quant thread layout");
+static_assert(MM_TPR == 2 && (MM_THREADS == 128 || MM_THREADS == 256), "the K-quant thread layout");
 __device__ __forceinline__ int mm_kq_row() { return (threadIdx.x & 7) | ((threadIdx.x >> 4) << 3); }
 __device__ __forceinline__ int mm_kq_part() { return (threadIdx.x >> 3) & 1; }
 
@@ -290,7 +295,16 @@ template <int BM>
 constexpr int MM_SLD = BM + 8;
 // the block's shared memory: the weight and activation tiles, later the output staging over them
 template <int BM>
-constexpr size_t mm_smem() { return std::max(sizeof(__half) * (BM + PF_JOB) * MM_LD, PF_JOB * MM_SLD<BM> * sizeof(float)); }
+constexpr size_t mm_smem() {
+#if defined(FNX_MOE_MMA_WIDE)
+    // Store one token tile per warp group at a time. This keeps the 128-row
+    // kernel below 32 KiB so two blocks fit in gfx11's 64 KiB of LDS.
+    constexpr int epi_rows = 16 * (MM_THREADS / 32 / (BM / 32));
+#else
+    constexpr int epi_rows = PF_JOB;
+#endif
+    return std::max(sizeof(__half) * (BM + PF_JOB) * MM_LD, epi_rows * MM_SLD<BM> * sizeof(float));
+}
 
 // out[jb.out[j] * nrows + row] = sum_k W_e[row][k] * x[jb.y[j] * ldx + k] for the job's rows j, BM rows of the expert
 // from row BM * blockIdx.x. Each warp holds a 32-row x (64 / WT)-token output (2 x TT WMMA tiles, so a fragment loaded
@@ -448,6 +462,34 @@ __global__ void __launch_bounds__(MM_THREADS) k_moe_mma(MoeW w, const BigJob* __
     float* so = reinterpret_cast<float*>(smem);
     constexpr int SLD = MM_SLD<BM>;
     static_assert(MM_LD % 8 == 0, "16-byte operand loads");
+#if defined(FNX_MOE_MMA_WIDE) && FNX_HIP
+    // Keep WT=2, TT, every K-step and the partial-sum addition identical to
+    // the original 64-row kernel. Only twice as many independent weight rows
+    // share each activation load. A tiled epilogue avoids a 34-KiB allocation.
+#pragma unroll
+    for (int t = 0; t < TT; ++t) {
+        float* sob = so + tg * 16 * SLD + rg * 32 + (FNX_WMMA_GFX11 ? lh : 8 * lh);
+#pragma unroll
+        for (int r = 0; r < 2; ++r)
+#pragma unroll
+            for (int k = 0; k < 8; ++k)
+                sob[ln * SLD + r * 16 + (FNX_WMMA_GFX11 ? 2 * k : k)] = acc[r][t][k];
+        __syncthreads();
+        const int groups = split ? 1 : WT;
+        for (int e = threadIdx.x; e < groups * 16 * BM; e += MM_THREADS) {
+            const int group = e / (16 * BM), token = (e / BM) % 16, r = e % BM;
+            const int j = (split ? 0 : group * TT * 16) + t * 16 + token, row = row0 + r;
+            if (j >= n || row >= w.nrows) continue;
+            float v = so[(group * 16 + token) * SLD + r];
+            if (split) {
+#pragma unroll
+                for (int g = 1; g < WT; ++g) v += so[(g * 16 + token) * SLD + r];
+            }
+            out[(size_t) jb.out[j] * w.nrows + row] = v;
+        }
+        __syncthreads();
+    }
+#else
 #if FNX_HIP
     // the accumulator lane l holds token ln and rows 8 lh + 0..7 of a tile (gfx12): eight consecutive floats of the staging's row; gfx11: rows 2 j + lh
     float* sob = so + (split ? tg * LO * SLD : tb * 16 * SLD) + rg * 32 + (FNX_WMMA_GFX11 ? lh : 8 * lh);
@@ -495,6 +537,7 @@ __global__ void __launch_bounds__(MM_THREADS) k_moe_mma(MoeW w, const BigJob* __
         }
         out[(size_t) jb.out[j] * w.nrows + row] = v;
     }
+#endif
 }
 
 // h = silu(gate) * up of the stacked gate|up rows, rounded to f16 (llama.cpp's swiglu output, converted for cuBLAS)

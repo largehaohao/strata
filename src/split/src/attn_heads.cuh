@@ -300,6 +300,8 @@ __global__ void __launch_bounds__(AP_THREADS) k_pf_attn_head(const float* __rest
     }
 }
 
+#include "attn_heads_direct.cuh"
+
 __global__ void __launch_bounds__(HD) k_pf_attn_merge_head(const float* __restrict__ own, const float* __restrict__ recv,
                                                       const float* __restrict__ qg, float* __restrict__ out, int C, int card) {
     const int t = blockIdx.x, hl = blockIdx.y, i = threadIdx.x;

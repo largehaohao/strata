@@ -7,6 +7,7 @@
 #include <mma.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -32,6 +33,19 @@
 #endif
 
 namespace fnx {
+
+#if FNX_HIP && defined(FNX_MOE_MMA_DISPATCH_WIDE) && !defined(FNX_MOE_MMA_WIDE)
+void moe_gate_up_mma_wide(const DW&, size_t, const BigJob*, const int*, int, const uint16_t*, float*, void*);
+void moe_down_mma_wide(const DW&, size_t, const BigJob*, const int*, int, const uint16_t*, float*, void*);
+static bool moe_wide_requested(int type) {
+    static const bool on = [] {
+        const char* v = std::getenv("FNX_PF_MOE_WIDE");
+        return v && v[0] == '1' && v[1] == 0;
+    }();
+    return on && (type == T_IQ3_S || type == T_IQ3_XXS || type == T_IQ2_S ||
+                  type == T_IQ4_NL || type == T_Q2_0 || type == T_Q4_0);
+}
+#endif
 
 namespace {
 
@@ -78,6 +92,9 @@ void moe_mma(const DW& A, size_t sa, const BigJob* jobs, const int* njobs, int n
 }
 }  // namespace
 void moe_gate_up_mma(const DW& A, size_t sa, const BigJob* jobs, const int* njobs, int njobs_cap, const uint16_t* xh, float* gu, void* st) {
+#if FNX_HIP && defined(FNX_MOE_MMA_DISPATCH_WIDE) && !defined(FNX_MOE_MMA_WIDE)
+    if (moe_wide_requested(A.type)) { moe_gate_up_mma_wide(A, sa, jobs, njobs, njobs_cap, xh, gu, st); return; }
+#endif
     moe_mma(A, sa, jobs, njobs, njobs_cap, reinterpret_cast<const __half*>(xh), gu, st);
 }
 void swiglu_h16(const float* gu, int ffs, int P, uint16_t* h16, void* st) {
@@ -85,6 +102,9 @@ void swiglu_h16(const float* gu, int ffs, int P, uint16_t* h16, void* st) {
     ck_launch("swiglu_h16");
 }
 void moe_down_mma(const DW& A, size_t sa, const BigJob* jobs, const int* njobs, int njobs_cap, const uint16_t* h16, float* part, void* st) {
+#if FNX_HIP && defined(FNX_MOE_MMA_DISPATCH_WIDE) && !defined(FNX_MOE_MMA_WIDE)
+    if (moe_wide_requested(A.type)) { moe_down_mma_wide(A, sa, jobs, njobs, njobs_cap, h16, part, st); return; }
+#endif
     moe_mma(A, sa, jobs, njobs, njobs_cap, reinterpret_cast<const __half*>(h16), part, st);
 }
 

@@ -6,6 +6,7 @@
 #include "env.hpp"
 #include "attn_head_split.hpp"
 #include "peer_probe.hpp"
+#include "prefill_scratch_plan.hpp"
 
 #include <cuda_runtime.h>
 #include <unistd.h>
@@ -684,6 +685,8 @@ void Engine::arena_refill(int c, int from, int to) {
 void Engine::arena_set(int w) {
     if (w == arena_w_) return;
     if (w < arena_base_ || w > arena_cap_) throw std::runtime_error("arena: top " + std::to_string(w) + " outside its range");
+    if (prefill_arena_end_ && w < prefill_arena_end_)
+        throw std::runtime_error("arena: cannot shrink through prefill scratch");
     const auto t0 = std::chrono::steady_clock::now();
     for (int c = 0; c < NCARD; ++c) {
         CardBuf& b = *cb_[c];
@@ -729,7 +732,7 @@ void Engine::arena_set(int w) {
 void Engine::arena_reclaim(double hold_s) {
     if (!arena_cap_ || arena_w_ == arena_base_) return;
     if (std::chrono::duration<double>(std::chrono::steady_clock::now() - arena_last_lend_).count() < hold_s) return;
-    int top = arena_base_;
+    int top = std::max(arena_base_, prefill_arena_end_);
     for (const LaneHost& L : lanes_)
         for (int pg : L.pages) top = std::max(top, pg + 1);
     if (top < arena_w_) arena_set(top);
@@ -740,11 +743,53 @@ void Engine::arena_reclaim(double hold_s) {
 void Engine::arena_churn() {
     static const bool on = env_flag("FNX_ARENA_CHURN");
     if (!on || !arena_cap_) return;
-    int top = arena_base_;
+    int top = std::max(arena_base_, prefill_arena_end_);
     for (const LaneHost& L : lanes_)
         for (int pg : L.pages) top = std::max(top, pg + 1);
     arena_set(std::min(arena_cap_, std::max(arena_w_, top) + ARENA_STEP));
     arena_set(top);
+}
+
+// Only the host-backed static decode cache may be borrowed. Its entries are
+// independent of prefill's immutable expert tables and refill on demand after
+// return. Leave enough low pages for the entire read, not merely its first pass.
+bool Engine::borrow_prefill_arena(size_t bytes, int end_pos) {
+    if (prefill_arena_end_) throw std::runtime_error("prefill scratch: nested borrow");
+    if (!static_arena_ || lanes_.size()!=1 || lanes_[0].block_n || !pending_.empty() ||
+        !rows_pending_.lanes.empty() || end_pos<pos_ || end_pos>max_ctx_) return false;
+    std::array<size_t,NCARD> page_bytes{};
+    for (int c=0;c<NCARD;++c) page_bytes[(size_t)c]=kvp_page(c)*sizeof(uint16_t);
+    int used_top=arena_base_;
+    for (int pg:lanes_[0].pages) used_top=std::max(used_top,pg+1);
+    const auto plan=plan_prefill_scratch(arena_base_,arena_cap_,end_pos/KVP_POS+1,used_top,bytes,page_bytes);
+    if (!plan) return false;
+    // arena_set idles both cards, redirects/invalidate cache entries, and
+    // zeroes newly exposed pages before any scratch kernel can write them.
+    arena_set(plan.end);
+    if (!reserve_prefill_pages(plan,free_pages_))
+        throw std::runtime_error("prefill scratch: reserved page was not free");
+    prefill_arena_begin_=plan.begin;
+    prefill_arena_end_=plan.end;
+    return true;
+}
+
+void* Engine::prefill_arena_data(int card) const {
+    if (!prefill_arena_end_ || card<0 || card>=NCARD)
+        throw std::logic_error("prefill scratch: no reservation for card");
+    return (char*)cb_[(size_t)card]->pool+(size_t)prefill_arena_begin_*kvp_page(card)*sizeof(uint16_t);
+}
+
+void Engine::release_prefill_arena() {
+    if (!prefill_arena_end_) return;
+    // This also handles a recoverable interruption during host embedding,
+    // before prefill_pass reached its usual end-of-pass stream synchronization.
+    for (CardBuf* b:cb_) {
+        ck(cudaSetDevice(b->dev),"prefill scratch: set");
+        ck(cudaDeviceSynchronize(),"prefill scratch: cards idle");
+    }
+    return_prefill_pages({prefill_arena_begin_,prefill_arena_end_},free_pages_);
+    prefill_arena_begin_=prefill_arena_end_=0;
+    arena_reclaim(0.0);
 }
 
 void Engine::ensure_pages(int n_pos) { ensure_pages_of(cur_, n_pos); }

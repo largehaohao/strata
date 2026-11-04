@@ -253,6 +253,12 @@ private:
     // slots (the coldest first), up to arena_cap_ (the pool keeps 2 MAXT TOPK slots on every card); all 0 without one
     int arena_base_ = 0, arena_w_ = 0, arena_cap_ = 0;
     bool static_arena_ = false;   // unused K/V pages hold only host-backed static-cache entries
+    // Temporary prefill ownership of a top range, excluded from free_pages_.
+    // Reclaim/churn must respect it even though it is not a lane's K/V.
+    int prefill_arena_begin_ = 0, prefill_arena_end_ = 0;
+    bool borrow_prefill_arena(size_t bytes, int end_pos);
+    void release_prefill_arena();
+    void* prefill_arena_data(int card) const;
     ExpertCache& arena_cache(int c);
     const ExpertCache& arena_cache(int c) const;
     std::chrono::steady_clock::time_point arena_last_lend_{};

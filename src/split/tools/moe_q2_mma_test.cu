@@ -68,7 +68,8 @@ int run_mma(int dev, int cols, int rows) {
         ck(cudaMemcpyAsync(d2, h2.data(), h2.size(), cudaMemcpyHostToDevice, st), "big q2 upload");
         ck(cudaMemcpyAsync(d4, h4.data(), h4.size(), cudaMemcpyHostToDevice, st), "big q4 upload");
         ck(cudaMemcpyAsync(gu, hgu.data(), hgu.size() * sizeof(__half), cudaMemcpyHostToDevice, st), "big input");
-        for (int nj : {0, 1, 3}) for (int n : {0, 1, 15, 16, 17, 31, 32, PF_JOB - 1, PF_JOB}) {
+        for (int nj : {0, 1, 3}) for (int n : {0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, PF_JOB - 1, PF_JOB}) {
+            if (n > PF_JOB) continue;
             for (int j = 0; j < experts; ++j) {
                 hj[j].w = (j + seed) % experts;
                 hj[j].n = j % 2 ? std::min(PF_JOB, n + 1) : n;

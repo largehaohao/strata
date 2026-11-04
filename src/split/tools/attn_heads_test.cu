@@ -25,8 +25,8 @@ __global__ void fill_kv(__half* k0, __half* k1, __half* v0, __half* v1,
     __half *kh = h ? hk1 : hk0, *vh = h ? hv1 : hv0;
     const int8_t k = (int)((e * 13 + e / 41) % 255) - 127;
     const int8_t v = (int)((e * 19 + e / 29) % 255) - 127;
-    const __half ks = __float2half(0.00390625f * (1 + (p + h + d / 32) % 3));
-    const __half vs = __float2half(0.001953125f * (1 + (p + h + d / 32) % 5));
+    const __half ks = __float2half(0.0039125f * (1 + (p + h + d / 32) % 3));
+    const __half vs = __float2half(0.0019521f * (1 + (p + h + d / 32) % 5));
     if (g.q8) {
         const size_t a = kvq_row(g, row), s = kvq_scale(g, row);
         ((int8_t*)kr)[a + h * HD + d] = ((int8_t*)kh)[a + card * HD + d] = k;
@@ -45,7 +45,7 @@ __global__ void fill_query(float* q, float* q0, float* q1, int T, int seed) {
     const int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= T * NQH * 2 * HD) return;
     const int h = e / (2 * HD) % NQH, t = e / (NQH * 2 * HD), d = e % (2 * HD);
-    const float v = seed == 2 ? 0.f : ((int)((e * 17 + e / 31 + seed * 23) % 511) - 255) / 256.f;
+    const float v = seed == 2 ? 0.f : ((int)((e * 17 + e / 31 + seed * 23) % 511) - 255) / 257.f;
     q[e] = v;
     (h < ATT_OWN ? q0 : q1)[((size_t)t * ATT_OWN + h % ATT_OWN) * 2 * HD + d] = v;
 }
@@ -153,6 +153,9 @@ int run(int dev, bool q8) {
             k_pf_attn_merge<<<dim3(T,ATT_OWN),HD,0,st>>>(part[owner]+owner*blk,part[1-owner]+owner*blk,q,out+pad,T,owner);
             ck(cudaStreamSynchronize(st),"pf reference");ck(cudaMemcpy(expected.data(),out,out_bytes,cudaMemcpyDeviceToHost),"pf reference copy");
             auto pftest=[&](){
+                if (q8 && env_flag("FNX_PF_ATTN_DIRECT"))
+                    k_pf_attn_head_direct<<<dim3(T,2),256,0,st>>>(hq[owner],hk[owner],hv[owner],g,pos,cells,ncells,owner,T,0,hp);
+                else
                 k_pf_attn_head<<<dim3(T,2),AP_THREADS,AP_SMEM,st>>>(hq[owner],hk[owner],hv[owner],g,pos,cells,ncells,owner,T,0,hp);
                 k_pf_attn_merge_head<<<dim3(T,ATT_OWN),HD,0,st>>>(hp+owner*blk,hp+(1-owner)*blk,hq[owner],out+pad,T,owner);
             };
@@ -313,16 +316,70 @@ int append_test(int dev, bool q8) {
     cudaStreamDestroy(st);return checks;
 }
 }
+namespace fnx {
+void prompt_micro(int dev) {
+    Memory mem;
+    constexpr int count = 32768, pages = (count + KVP_POS - 1) / KVP_POS;
+    std::vector<int> pt(pages);
+    for (int i = 0; i < pages; ++i) pt[i] = pages - 1 - i;
+    auto* dpt = mem.get<int>(pages);
+    ck(cudaMemcpy(dpt, pt.data(), pages * 4, cudaMemcpyHostToDevice), "micro pages");
+    KvPages g{dpt, kvp_rows_halves(0, true) + 64, kvp_rows(0), true};
+    __half *k[2], *v[2], *hk[2], *hv[2];
+    for (int c = 0; c < 2; ++c) {
+        k[c] = mem.get<__half>(pages * g.page); v[c] = mem.get<__half>(pages * g.page);
+        hk[c] = mem.get<__half>(pages * g.page); hv[c] = mem.get<__half>(pages * g.page);
+    }
+    fill_kv<<<(count * NKVH * HD + 255) / 256, 256>>>(k[0], k[1], v[0], v[1], hk[0], hk[1], hv[0], hv[1], g, count);
+    constexpr int cap = 4096;
+    auto* q = mem.get<float>((size_t) cap * NQH * 2 * HD);
+    float* hq[2] = {mem.get<float>((size_t) cap * ATT_OWN * 2 * HD), mem.get<float>((size_t) cap * ATT_OWN * 2 * HD)};
+    auto* pos = mem.get<int>(1);
+    auto* cells = mem.get<int>(2 * cap * QSA_MAXSEL);
+    auto* ncells = mem.get<int>(2 * cap);
+    auto* out = mem.get<float>((size_t) 2 * cap * ATT_OWN * AP_W);
+    cudaEvent_t a, b; ck(cudaEventCreate(&a), "micro event"); ck(cudaEventCreate(&b), "micro event");
+    for (int C : {64, 1024, 4096}) {
+        const int start = count - C;
+        ck(cudaMemcpy(pos, &start, 4, cudaMemcpyHostToDevice), "micro pos");
+        fill_query<<<(C * NQH * 2 * HD + 255) / 256, 256>>>(q, hq[0], hq[1], C, 1);
+        std::vector<int> hc(2 * C * QSA_MAXSEL), hn(2 * C, std::min(2048, QSA_MAXSEL));
+        for (int r = 0; r < 2 * C; ++r)
+            for (int i = 0; i < hn[r]; ++i) hc[(size_t) r * QSA_MAXSEL + i] = 3 * i;
+        ck(cudaMemcpy(cells, hc.data(), hc.size() * 4, cudaMemcpyHostToDevice), "micro cells");
+        ck(cudaMemcpy(ncells, hn.data(), hn.size() * 4, cudaMemcpyHostToDevice), "micro counts");
+        const size_t n = (size_t) 2 * C * ATT_OWN * AP_W;
+        std::vector<float> expected(n), actual(n);
+        for (bool direct : {false, true}) {
+            auto launch = [&] {
+                if (direct) k_pf_attn_head_direct<<<dim3(C, 2), 256>>>(hq[dev], hk[dev], hv[dev], g, pos, cells, ncells, dev, C, 0, out);
+                else k_pf_attn_head<<<dim3(C, 2), AP_THREADS, AP_SMEM>>>(hq[dev], hk[dev], hv[dev], g, pos, cells, ncells, dev, C, 0, out);
+            };
+            launch(); ck(cudaDeviceSynchronize(), "micro warm");
+            ck(cudaMemcpy((direct ? actual : expected).data(), out, n * 4, cudaMemcpyDeviceToHost), "micro result");
+            if (direct && std::memcmp(actual.data(), expected.data(), n * 4)) throw std::runtime_error("micro attention mismatch");
+            ck(cudaEventRecord(a), "micro start");
+            for (int rep = 0; rep < 10; ++rep) launch();
+            ck(cudaEventRecord(b), "micro end"); ck(cudaEventSynchronize(b), "micro wait");
+            float ms; ck(cudaEventElapsedTime(&ms, a, b), "micro time");
+            std::cout << "card " << dev << " C=" << C << " direct=" << direct << " ms=" << ms / 10 << "\n";
+        }
+    }
+    ck(cudaEventDestroy(a), "micro event destroy"); ck(cudaEventDestroy(b), "micro event destroy");
+}
+}
 int main() {
     try {
         int checks = 0;
         for (int dev = 0; dev < 2; ++dev) {
             fnx::ck(cudaSetDevice(dev), "device");
+            if (fnx::env_flag("FNX_ATTN_MICRO")) { fnx::prompt_micro(dev); continue; }
             for (bool q8 : {false, true}) {
                 checks += fnx::run(dev, q8);
                 checks += fnx::append_test(dev, q8);
             }
         }
-        std::cout << "PASS " << checks << " exact head attention and append checks\n";
+        if (fnx::env_flag("FNX_ATTN_MICRO")) std::cout << "PASS 6 exact full-buffer prompt comparisons\n";
+        else std::cout << "PASS " << checks << " exact head attention and append checks\n";
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

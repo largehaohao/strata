@@ -474,7 +474,9 @@ __global__ void k_gdn_out_norm(const float* o, const float* z, const float* w, f
 }
 
 #include "gdn_core.cuh"
+#if FNX_KPART == 4 || FNX_KPART == 99
 #include "gdn_prompt.cuh"
+#endif
 
 // ---------------------------------------------------------------- attention
 // per (t, head): RMS norm with the weight, then NEOX rotary on dims [0, NROT): pairs (i, i + NROT/2)
@@ -1566,6 +1568,17 @@ void attn_prompt(const float* qg, const uint16_t* kc, const uint16_t* vc, const 
 void attn_prompt_heads(const float* qg, const uint16_t* kc, const uint16_t* vc, const KvPages& g, const int* pos0,
                        const int* cells, const int* n_cells, int card, int C, float* part, float* out, void* st) {
     cudaStream_t s = (cudaStream_t) st;
+#if FNX_HIP
+    static const bool direct = env_flag("FNX_PF_ATTN_DIRECT");
+    if (direct && g.q8) {
+        int dev = 0; hipDeviceProp_t prop{};
+        if (hipGetDevice(&dev) != hipSuccess || hipGetDeviceProperties(&prop, dev) != hipSuccess ||
+            std::string(prop.gcnArchName).rfind("gfx1100", 0) != 0)
+            throw std::runtime_error("FNX_PF_ATTN_DIRECT requires gfx1100");
+        k_pf_attn_head_direct<<<dim3(C, 2), 256, 0, s>>>(qg, reinterpret_cast<const __half*>(kc),
+            reinterpret_cast<const __half*>(vc), g, pos0, cells, n_cells, card, C, 0, part);
+    } else
+#endif
     k_pf_attn_head<<<dim3(C, 2), AP_THREADS, AP_SMEM, s>>>(qg, reinterpret_cast<const __half*>(kc),
         reinterpret_cast<const __half*>(vc), g, pos0, cells, n_cells, card, C, 0, part);
     const size_t block = attn_prompt_block_floats(C);
@@ -2149,7 +2162,11 @@ void gdn_prompt(const float* qkvz, const float* ab, float* hist, const float* co
                 float* chw, void* st) {
     cudaStream_t s = (cudaStream_t) st;
     const int ch = (2 * nk + nv) * HS;
-    k_gdn_pf_conv<<<dim3(C, 2 * nk + nv), HS, 0, s>>>(qkvz, hist, convw, ctl, xc, nk, nv);
+    static const bool row_waves = env_flag("FNX_PF_GDN_ROWS");
+    if (row_waves)
+        k_gdn_pf_conv_rows<<<(C * (2 * nk + nv) + GDN_PF_ROW_WAVES - 1) / GDN_PF_ROW_WAVES,
+            GDN_PF_ROW_THREADS, 0, s>>>(qkvz, hist, convw, ctl, xc, nk, nv, C);
+    else k_gdn_pf_conv<<<dim3(C, 2 * nk + nv), HS, 0, s>>>(qkvz, hist, convw, ctl, xc, nk, nv);
     k_gdn_pf_hist<<<(ch + 255) / 256, 256, 0, s>>>(qkvz, hist, ctl, ng, C, nk, nv);
     static const bool chunked = [] {
         const char* e = std::getenv("FNX_PF_GDN_CHUNK");
@@ -2157,11 +2174,15 @@ void gdn_prompt(const float* qkvz, const float* ab, float* hist, const float* co
         return !e || !std::strcmp(e, "1");
     }();
     if (chunked) {
+        static const bool wide = env_flag("FNX_PF_GDN_WIDE");
         static thread_local bool smem_set[16] = {};
         int dev = 0;
         cudaGetDevice(&dev);
         if (!smem_set[dev]) {
-            if (cudaFuncSetAttribute(k_gdn_ch_rec, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) GCH_REC_SMEM) != cudaSuccess)
+            const auto status = wide
+                ? cudaFuncSetAttribute(k_gdn_ch_rec<32, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) GCH_REC_WIDE_SMEM)
+                : cudaFuncSetAttribute(k_gdn_ch_rec<GCB, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) GCH_REC_SMEM);
+            if (status != cudaSuccess)
                 ck_launch("gdn_prompt: shared memory");
             smem_set[dev] = true;
         }
@@ -2182,8 +2203,14 @@ void gdn_prompt(const float* qkvz, const float* ab, float* hist, const float* co
             cudaStreamSynchronize(s);
             cudaFree(s0), cudaFree(yr);
         }
-        k_gdn_ch_prep<<<dim3((C + GCH - 1) / GCH, nv), GCH_THREADS, 0, s>>>(xc, ab, dt, a, vmap, nk, nv, C, chw);
-        k_gdn_ch_rec<<<nv * GCH_REC_BLOCKS_PER_HEAD, GCR_THREADS, GCH_REC_SMEM, s>>>(xc, chw, S, y32, nk, nv, vmap, C);
+        static const bool compact_prep = env_flag("FNX_PF_GDN_PREP_COMPACT");
+        if (compact_prep)
+            k_gdn_ch_prep_compact<<<dim3((C + GCH - 1) / GCH, nv), GCH_THREADS, 0, s>>>(xc, ab, dt, a, vmap, nk, nv, C, chw);
+        else k_gdn_ch_prep<<<dim3((C + GCH - 1) / GCH, nv), GCH_THREADS, 0, s>>>(xc, ab, dt, a, vmap, nk, nv, C, chw);
+        if (wide)
+            k_gdn_ch_rec<32, true><<<nv * (HS / 32), 256, GCH_REC_WIDE_SMEM, s>>>(xc, chw, S, y32, nk, nv, vmap, C);
+        else
+            k_gdn_ch_rec<GCB, false><<<nv * GCH_REC_BLOCKS_PER_HEAD, GCR_THREADS, GCH_REC_SMEM, s>>>(xc, chw, S, y32, nk, nv, vmap, C);
         if (check) {
             std::vector<float> y(ny), sn(ns);
             cudaMemcpyAsync(y.data(), y32, ny * 4, cudaMemcpyDeviceToHost, s);
@@ -2197,7 +2224,10 @@ void gdn_prompt(const float* qkvz, const float* ab, float* hist, const float* co
             std::fprintf(stderr, "gdn check: C %d, outputs %.3g, end state %.3g (largest difference over largest value)\n", C,
                          rel(y_ref, y), rel(s_ref, sn));
         }
-        k_gdn_pf_norm_own<<<dim3(C, nv), HS, 0, s>>>(qkvz, nw, y32, nk, nv, eps);
+        if (row_waves)
+            k_gdn_pf_norm_rows<<<(C * nv + GDN_PF_ROW_WAVES - 1) / GDN_PF_ROW_WAVES,
+                GDN_PF_ROW_THREADS, 0, s>>>(qkvz, nw, y32, nk, nv, eps, C);
+        else k_gdn_pf_norm_own<<<dim3(C, nv), HS, 0, s>>>(qkvz, nw, y32, nk, nv, eps);
     } else {
         k_gdn_pf_rec<<<nv * GDN_Q, GDN_PF_THREADS, 0, s>>>(xc, ab, dt, a, S, y32, sq, nk, nv, vmap, C);
         k_gdn_pf_norm<<<dim3(C, nv), HS, 0, s>>>(qkvz, nw, sq, y32, nk, nv, eps);
