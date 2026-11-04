@@ -120,6 +120,36 @@ __global__ void k_pf_count(const int* __restrict__ topi, int P, int* __restrict_
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p < P) atomicAdd(&cnt[topi[p]], 1);
 }
+// Diagnostic only: validate the exact weight bytes at the new cache-read seam.
+// The immutable model tables remain the reference, including host-resident experts.
+__global__ void k_pf_cache_check(const char* const* src_gu, const char* const* src_dn,
+    const char* const* cached_gu, const char* const* cached_dn, const int* counts,
+    size_t gs, size_t ds, unsigned long long* stats) {
+    const int e=blockIdx.y;
+    if(!counts[e]) return;
+    const bool gu=src_gu[e]!=cached_gu[e], dn=src_dn[e]!=cached_dn[e];
+    if(!gu && !dn) return;
+    if(blockIdx.x==0 && threadIdx.x==0) {
+        atomicAdd(stats+1,1ull);
+        atomicAdd(stats+2,(unsigned long long)((gu?gs:0)+(dn?ds:0)));
+    }
+    const size_t g=gs/sizeof(uint4),d=ds/sizeof(uint4);
+    unsigned long long mismatch=0;
+    for(size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;i<g+d;i+=(size_t)gridDim.x*blockDim.x) {
+        uint4 a,b;
+        if(i<g) {
+            if(!gu) continue;
+            a=reinterpret_cast<const uint4*>(src_gu[e])[i];
+            b=reinterpret_cast<const uint4*>(cached_gu[e])[i];
+        } else {
+            if(!dn) continue;
+            a=reinterpret_cast<const uint4*>(src_dn[e])[i-g];
+            b=reinterpret_cast<const uint4*>(cached_dn[e])[i-g];
+        }
+        mismatch+=(a.x!=b.x || a.y!=b.y || a.z!=b.z || a.w!=b.w);
+    }
+    if(mismatch) atomicAdd(stats,mismatch);
+}
 // one block of NEXP threads: each expert's first job (ceil(count / PF_JOB) jobs each), the job count
 __global__ void k_pf_jobbase(const int* __restrict__ cnt, int* __restrict__ jbase, int* __restrict__ njobs) {
     __shared__ int s[NEXP];
@@ -226,6 +256,8 @@ struct Engine::Pf {
     uint16_t* h16;                    // the experts' swiglu rows as f16, for the tensor-core down product
     bool moe_q8 = false;              // FNX_PF_MOE_Q8=1: the experts through the decode kernels' q8_1 arithmetic
     bool moe_fused = false;           // optional exact gate/up + SwiGLU, avoiding the FP32 intermediate
+    bool decode_cache = false;        // optional read-only decode cache sources, direct or through routed static stages
+    unsigned long long* cache_check = nullptr; // diagnostic: mismatched vectors, cached experts, cached bytes
     float *logits, *topw, *gu, *part, *shg;
     __half* shh;
     int *topi, *cnt, *jbase, *njobs;
@@ -619,6 +651,16 @@ void Engine::prefill_alloc() {
         }
         ckb(cublasSetStream(p->blas, b.st), "stream");
         ckb(cublasSetMathMode(p->blas, CUBLAS_TENSOR_OP_MATH), "math mode");
+        p->decode_cache = env_flag("FNX_PF_DECODE_CACHE");
+        if (p->decode_cache && !b.static_cache.n_slots)
+            throw std::runtime_error("FNX_PF_DECODE_CACHE requires a static decode cache");
+        if (env_flag("FNX_PF_DECODE_CACHE_CHECK")) {
+            if (!p->decode_cache) throw std::runtime_error("FNX_PF_DECODE_CACHE_CHECK requires FNX_PF_DECODE_CACHE");
+            for (const auto& layer : w.L)
+                if (layer.gu_e_stride % sizeof(uint4) || layer.down_e_stride % sizeof(uint4))
+                    throw std::runtime_error("prefill cache byte check requires aligned expert strides");
+            p->cache_check = palloc<unsigned long long>(3);
+        }
         p->f16acc = env_flag("FNX_PF_F16ACC");
         p->native_gemm = env_int("FNX_PF_GEMM", 0) != 0;
         p->hc_streams = env_flag("FNX_PF_HC_STREAMS");
@@ -1088,6 +1130,8 @@ void Engine::prefill_draft(int C, int set) {
 void Engine::prefill(const std::vector<int>& tokens, int after) {
     if (!pending_.empty() || !rows_pending_.lanes.empty()) throw std::runtime_error("prefill: a window is not committed");
     if (mtp_ && after < 0) throw std::runtime_error("prefill: the draft layer needs the token after the last row");
+    if (pf_[0]->decode_cache && lanes_.size() != 1)
+        throw std::runtime_error("FNX_PF_DECODE_CACHE requires one lane");
     if (pf_[0]->seq >= PF_SEQ_RESET) {
         std::fprintf(stderr, "fnx: prompt ring sequence numbers at %u: flags zeroed, numbers from 0 again\n", pf_[0]->seq);
         pf_seq_reset(0);
@@ -1274,6 +1318,9 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
         for (Pf* p : pf_) p->R = p->Rk[j], p->bo_f = p->bofk[j], p->inj_f = p->injfk[j], p->ctl = p->ctlk[j], p->bo_a = p->boak[j],
                           p->inj_a = p->injak[j];
     };
+    each([&](int, CardBuf& b, const CardW&, Pf& p) {
+        if (p.cache_check) ckc(cudaMemsetAsync(p.cache_check,0,3*sizeof(unsigned long long),b.st),"cache check reset");
+    });
     // with an ExpertCache: the pass's expert tables, each layer's experts not in a slot at stage[l & 1] (as many as
     // fit, in expert order; the rest in place), the others in their slots
     if (staging && !pf_[0]->static_stage)
@@ -1504,6 +1551,15 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
                 if (staging) {
                     gu_e.ep = p.ep_gu + (size_t) l * NEXP, down_e.ep = p.ep_dn + (size_t) l * NEXP;
                     if (j == 0 && !p.selective_stage) ckc(cudaStreamWaitEvent(s, p.ev_ready[l & 1], 0), "stage in");
+                } else if (p.decode_cache) {
+                    // ensure_pages ran before this pass. Any slots lent to K/V
+                    // already point back to host weights in these current tables.
+                    // The one-lane prompt owns the engine until its streams finish;
+                    // no decoder can replace a slot while these kernels read it.
+                    // Keep the tables live: retaining individual slot pointers
+                    // between passes would become stale after cache replacement.
+                    gu_e.ep = b.static_cache.ep_gu + (size_t)l*NEXP;
+                    down_e.ep = b.static_cache.ep_dn + (size_t)l*NEXP;
                 }
                 pf_hc_read(p, p.R, p.bo_a, p.inj_a, L.hc_norm[1], L.hc_down[1], L.hc_up[1], L.hc_inj[1], eps, p.mixed, p.inj_f, C, s);
                 if (p.moe_q8) quantize_q8_1(p.mixed, p.xq, N, C, s);   // else xh holds the hc read's f16 of mixed
@@ -1521,6 +1577,10 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
                 if (b.route_cnt) route_count(p.topi, P, b.route_cnt + (size_t) (NL + l) * NEXP, s);
                 k_pf_jobbase<<<1, NEXP, 0, s>>>(p.cnt, p.jbase, p.njobs);
                 k_pf_fill<<<NEXP, PF_FILL_THREADS, 0, s>>>(p.topi, P, p.cnt, p.jbase, p.jobs_gu, p.jobs_dn);
+                if (p.cache_check && (!staging || (p.selective_stage && !p.routed_dma && !p.routed_overlap)))
+                    k_pf_cache_check<<<dim3(2,NEXP),256,0,s>>>(L.gu_e.ep,L.down_e.ep,
+                        b.static_cache.ep_gu+(size_t)l*NEXP,b.static_cache.ep_dn+(size_t)l*NEXP,
+                        p.cnt,L.gu_e_stride,L.down_e_stride,p.cache_check);
                 if (staging && p.routed_dma) {
                     // Issue both cards' routers before waiting for either. The
                     // small readback completes ahead of independent shared work.
@@ -1547,7 +1607,14 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
                 }
                 if (staging && p.selective_stage) {
                     if (j == 0) ckc(cudaMemsetAsync(p.stage_ready, 0, NEXP, s), "stage readiness");
-                    static_prefill_copy(L.gu_e.ep, L.down_e.ep, gu_e.ep, down_e.ep, p.cnt, p.stage_ready,
+                    // Mode 2 may use the same current decode-cache sources as a
+                    // direct small read. Cache misses still point at immutable
+                    // host weights. Copying both kinds into our separate stage
+                    // preserves its existing lifetime/ready protocol and avoids
+                    // retaining individual cache-slot addresses between passes.
+                    const char* const* src_gu = p.decode_cache ? b.static_cache.ep_gu+(size_t)l*NEXP : L.gu_e.ep;
+                    const char* const* src_dn = p.decode_cache ? b.static_cache.ep_dn+(size_t)l*NEXP : L.down_e.ep;
+                    static_prefill_copy(src_gu, src_dn, gu_e.ep, down_e.ep, p.cnt, p.stage_ready,
                                         L.gu_e_stride, L.down_e_stride, NEXP, p.stage_moved, s, p.copy_blocks);
                 }
                 routed_experts(b, w, p, l, gu_e, down_e);
@@ -1615,7 +1682,7 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
     unsigned err = 0;
     // bounded: a copy-engine ring step waits on its flag without a timeout of its own
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
-    each([&](int, CardBuf& b, const CardW&, Pf&) {
+    each([&](int c, CardBuf& b, const CardW&, Pf& p) {
         for (;;) {
             const cudaError_t q = cudaStreamQuery(b.st);
             if (q == cudaSuccess) break;
@@ -1627,6 +1694,12 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
         unsigned e = 0;
         ckc(cudaMemcpy(&e, b.ring.err, 4, cudaMemcpyDeviceToHost), "err");
         err |= e;
+        if (p.cache_check) {
+            unsigned long long stats[3]={};
+            ckc(cudaMemcpy(stats,p.cache_check,sizeof(stats),cudaMemcpyDeviceToHost),"cache byte check");
+            if (stats[0]) throw std::runtime_error("prefill: decode cache weight bytes differ from immutable model weights");
+            std::fprintf(stderr,"prefill cache check: card %d, %llu routed cached experts, %llu bytes exact\n",c,stats[1],stats[2]);
+        }
     });
     if (err) throw std::runtime_error("prefill: ring error " + std::to_string(err));
     const auto t_main = std::chrono::steady_clock::now();
