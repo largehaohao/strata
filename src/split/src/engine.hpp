@@ -338,6 +338,7 @@ private:
     struct RowsWindow {          // verify_rows()'s window until its commit_rows()
         std::vector<int> lanes, counts, tokens;
     } rows_pending_;
+    int mtp_head_mode_ = 0;  // per-call draft mode; zero for penalties and sampled candidates
     void mtp_enqueue(int T);
     void mtp_enqueue_lanes(const std::vector<DraftReq>& reqs, int T);
     const Mtp* mtp_ = nullptr;

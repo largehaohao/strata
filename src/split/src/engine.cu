@@ -1323,6 +1323,11 @@ void Engine::mtp_attach(const Mtp& mtp) {
     if (mtp_last_head())
         for (const MtpCard& card : mtp.cards)
             if (card.head.type != T_Q4_0) throw std::runtime_error("FNX_MTP_LAST_HEAD requires a Q4 draft head");
+    if (mtp_head_mode()) {
+        if (!mtp_last_head()) throw std::runtime_error("FNX_MTP_HEAD_MODE requires FNX_MTP_LAST_HEAD=1");
+        for (const MtpCard& card : mtp.cards)
+            if (card.head.type != T_Q4_0) throw std::runtime_error("FNX_MTP_HEAD_MODE requires a Q4 draft head");
+    }
     mtp_ = &mtp;
     for (int c = 0; c < NCARD; ++c) {
         CardBuf& b = *cb_[c];
@@ -1426,11 +1431,14 @@ void Engine::mtp_enqueue(int T) {
             // slot for penalties, argmax, sampled candidates and host readback.
             const int last = T - 1, nv = mc.dv1 - mc.dv0;
             float* logits = b.mtp_logits + (size_t) last * nv;
-            dense(mc.head, (const uint8_t*) b.xq + (size_t) last * q8_1_bytes(N), logits, b, 1);
+            const void* input = (const uint8_t*) b.xq + (size_t) last * q8_1_bytes(N);
+            if (mtp_head_mode_) mtp_head_gemv(mc.head, input, logits, mtp_head_mode_, b.st);
+            else dense(mc.head, input, logits, b, 1);
             penalize_row(logits, nv, b.mtp_pen, b.mtp_pen_par, b.st);
             argmax(logits, nv, 1, mc.dv0, b.mtp_bv + last, b.mtp_bi + last, b.am_keys + last, b.ring.err, b.st);
         } else {
-            dense(mc.head, b.xq, b.mtp_logits, b, T);
+            if (mtp_head_mode_) mtp_head_gemv(mc.head, b.xq, b.mtp_logits, mtp_head_mode_, b.st);
+            else dense(mc.head, b.xq, b.mtp_logits, b, T);
             penalize_row(b.mtp_logits + (size_t) (T - 1) * (mc.dv1 - mc.dv0), mc.dv1 - mc.dv0, b.mtp_pen, b.mtp_pen_par, b.st);
             argmax(b.mtp_logits, mc.dv1 - mc.dv0, T, mc.dv0, b.mtp_bv, b.mtp_bi, b.am_keys, b.ring.err, b.st);
         }

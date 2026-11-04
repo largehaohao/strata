@@ -40,6 +40,7 @@ namespace fnx {
 //   state_pieces(...)           a sequence's device state on one card as (pointer, bytes) pieces, in a fixed order
 
 void ck(cudaError_t e, const char* what);
+int mtp_head_mode();   // validated FNX_MTP_HEAD_MODE, default 0
 float h2f(uint16_t h);   // an fp16 bit pattern's value
 // a graph just captured into its slot: the slot's executable updated in place when it has one (the same kernels with
 // other pointers: no new memory), else instantiated; key: what it was captured for

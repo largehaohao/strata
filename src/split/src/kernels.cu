@@ -202,6 +202,7 @@ __global__ void __launch_bounds__(MMVQ_THREADS) k_mmvq(const char* __restrict__ 
     }
 }
 
+#include "mtp_head_gemv.cuh"
 #include "dense.cuh"
 #include "moe.cuh"
 #include "moe_q4k.cuh"
@@ -1110,6 +1111,24 @@ void mmvq(const DW& W, size_t w_stride, const Job* jobs, const int* njobs, int n
         default: throw std::runtime_error("mmvq: weight type " + std::to_string(W.type) + " not handled");
     }
     ck_launch("mmvq");
+}
+
+
+// This wrapper is reserved for the speculative draft head. Mode 1 is exact;
+// modes 2/3 screen rows using respectively one/two quarters of the dot.
+void mtp_head_gemv(const DW& W, const void* y, float* out, int mode, void* st) {
+    if (W.type != T_Q4_0 || W.n_in % 32 || W.row_bytes != (size_t)(W.n_in / 32) * sizeof(block_q4_0))
+        throw std::runtime_error("mtp_head_gemv: expected packed Q4_0 rows");
+    if (mode < 1 || mode > 3) throw std::runtime_error("mtp_head_gemv: invalid mode");
+    if (W.n_out < 1) return;
+    const dim3 grid((W.n_out + 15) / 16);
+    const auto stream = (cudaStream_t) st;
+    const auto weights = (const char*) W.p;
+    const auto input = (const block_q8_1*) y;
+    if (mode == 1) k_draft_head_full<<<grid, 128, 0, stream>>>(weights, W.row_bytes, W.n_out, W.n_in, input, out);
+    else if (mode == 2) k_draft_head_prune<4, 1><<<grid, 128, 0, stream>>>(weights, W.row_bytes, W.n_out, W.n_in, input, out);
+    else k_draft_head_prune<4, 2><<<grid, 128, 0, stream>>>(weights, W.row_bytes, W.n_out, W.n_in, input, out);
+    ck_launch("mtp_head_gemv");
 }
 
 namespace {

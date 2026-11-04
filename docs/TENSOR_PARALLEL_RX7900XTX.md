@@ -919,3 +919,36 @@ and probe outputs match their existing references. Reproduce with
 `reproduce-cache-padding-v11.sh NEW_OUTPUT_DIRECTORY` in the November 4 evidence
 directory. The tested binary SHA256 is
 `006e535eb09e75b7a7fc61c781afd7f0c1d085e7aa1beacc6801f0aace1c4b2b`.
+
+### Speculative draft-head screening (V13)
+
+`FNX_MTP_HEAD_MODE=3` computes the first half of each Q4 draft-head dot and
+retains four candidates in each group of sixteen vocabulary rows. It completes
+those candidates with the original per-lane accumulation and reduction order;
+other draft scores receive a finite negative sentinel. Candidate selection is
+approximate, and a discarded row may have won after a complete dot. This affects
+only speculative proposals: the unchanged main model verifies them. Sampling
+and penalty requests use the original complete draft projection, with the mode
+included in the graph key so transitions recapture the appropriate graph.
+
+Mode 0 is the default. Mode 1 evaluates a specialized complete Q4 dot; mode 2
+screens one quarter but lost some acceptance and is not the selected recipe.
+Nonzero modes require the two-card HIP Flash-Next engine, a Q4 draft head, and
+`FNX_MTP_LAST_HEAD=1`. Main output projections and model weights are unchanged.
+
+Mode 3 measured **216.62750 tokens/s**, against **214.97927** for the same binary
+in mode 0 (+0.77%). All six input/output token streams and draft acceptance
+counts match, all six requests improve, decode major faults are zero and both
+engines exit normally. This remains below 220 tokens/s. The tested binary SHA256
+is `28e377099cf8c62facf1b73b897f9ee3a294de3844f4cba6185033b38c891328`.
+
+`split_mtp_head_gemv_test` covers 216 bit-exact selected-score and guard cases,
+survivor counts, stable ties, direct launches and replay on both cards. A retained
+candidate's full score is exact; this test does not assert that pruning always
+retains the global winner. The full quality suite includes the 1326 reviewed
+code checks, near-context generation, Chinese prompts, seeded sampling, forced
+cache churn and the prefetch probe. A same-process sequence alternates seven
+greedy, sampled and penalized requests and matches the full-head control. One
+initial sampling warmup had a major fault; the retained isolated recheck has
+none, and both runs' outputs match. See the November 4 evidence README for raw
+records and `reproduce-217.sh NEW_OUTPUT_DIRECTORY`.

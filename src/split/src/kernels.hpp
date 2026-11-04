@@ -48,6 +48,9 @@ void q8_untwin(const void* q8);
 // out[out_row][r] = W[job.w][r] . y[y_row] for every job in jobs[0..*njobs) (or njobs_host when njobs is null)
 void mmvq(const DW& W, size_t w_stride, const Job* jobs, const int* njobs, int njobs_max, const void* y,
           float* out, int out_stride, void* st);
+// One Q4_0 draft-head activation row. Mode 1 preserves full scores; modes 2/3
+// retain four candidates per 16 rows after a partial dot. Main heads never call it.
+void mtp_head_gemv(const DW& W, const void* y, float* out, int mode, void* st);
 // out[t][r] = W[r] . y[t] for t < T: W in the split Q8_0 layout [rows][cols], y q8_1 rows of cols
 void q8s_gemv(const Q8S& w, int rows, int cols, const void* y, float* out, int out_stride, int T, void* st);
 // y[t][r] = W[r] . x[t] (f32 weights [rows][n], f32 x)

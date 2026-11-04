@@ -1,0 +1,25 @@
+{
+  "comparisons": [
+    {
+      "candidate": "near-context-draft-head-v13-mode3",
+      "reference": "near-context-mtp-last-head",
+      "all_ids_exact": true,
+      "draft_acceptance_exact": true
+    },
+    {
+      "candidate": "heldout-draft-head-v13-mode3",
+      "reference": "heldout-mtp-last-head",
+      "all_ids_exact": true,
+      "draft_acceptance_exact": true
+    },
+    {
+      "candidate": "sampling-draft-head-v13-mode3-recheck",
+      "reference": "sampling-mtp-last-head",
+      "all_ids_exact": true,
+      "draft_acceptance_exact": true
+    }
+  ],
+  "churn_output_prefixes_exact": true,
+  "probe_output_prefixes_exact": true,
+  "reviewed_code_checks": 1326
+}

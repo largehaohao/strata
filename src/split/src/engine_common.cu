@@ -1380,6 +1380,15 @@ int Engine::draft(int T, bool from_main, int src_row, const std::vector<int>& to
     return draft_rows(src, T, tokens, pos0, pen, cands);
 }
 
+int mtp_head_mode() {
+    static const long long mode = env_int("FNX_MTP_HEAD_MODE", 0);
+    if (mode < 0 || mode > 3) throw std::runtime_error("FNX_MTP_HEAD_MODE: expected 0..3");
+#if !FNX_HIP || FNX_NCARD != 2 || FNX_27B
+    if (mode) throw std::runtime_error("FNX_MTP_HEAD_MODE requires two-card HIP Flash-Next");
+#endif
+    return (int) mode;
+}
+
 int Engine::draft_rows(const std::vector<const float*>& src, int T, const std::vector<int>& tokens, int pos0,
                        const Penalties::Row* pen, bool cands) {
     if (!mtp_) throw std::runtime_error("draft: no draft layer attached");
@@ -1411,7 +1420,9 @@ int Engine::draft_rows(const std::vector<const float*>& src, int T, const std::v
     } else {
         for (int c = 0; c < NCARD; ++c) h_.mtp_pen[(size_t) c * (1 + 2 * PEN_CAP)] = 0;
     }
-    const std::vector<int> key = graph_key({cur_});
+    mtp_head_mode_ = !pen && !cands ? mtp_head_mode() : 0;
+    auto key = graph_key({cur_});
+    key.push_back(mtp_head_mode_);  // changing to sampled/penalized drafts recaptures full scores
     if (cb_[0]->mtp_graphs[T].key != key || !cb_[0]->mtp_graphs[T].exec) {   // capturing queues no work
         const auto tc = std::chrono::steady_clock::now();
         for (CardBuf* b : cb_) {

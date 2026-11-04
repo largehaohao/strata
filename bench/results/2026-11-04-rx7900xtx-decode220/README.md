@@ -1,5 +1,56 @@
 # November 4 decode follow-up
 
+The latest validated candidate is V13, mode 3: **216.62750 tokens/s** on the
+unchanged Swift IQ3_S single-request panel (32768 context allocation,
+code/prose/edit 2048 outputs each, twice). The aggregate is total output tokens
+divided by engine decode time, excluding warmup. **220 remains open.**
+
+The optional draft-only head screens each 16-row group using half of the dot
+product and completes its best four candidates. Surviving scores retain the
+original Q4 arithmetic and accumulation order. The main model and its output
+head are unchanged; all speculative proposals still pass through verification.
+Sampled or penalized draft requests retain the complete original projection.
+Graph keys include the selected mode, including transitions back to full scores.
+This is approximate candidate selection in the draft model, not lossless full
+head evaluation; equal draft choices are measured results, not a guarantee for
+all prompts.
+
+```sh
+bash bench/results/2026-11-04-rx7900xtx-decode220/reproduce-217.sh NEW_OUTPUT_DIRECTORY
+```
+
+The immutable binary is `build-tensor-parralize-baseline/strata-split-draft-head-v13`,
+SHA256 `28e377099cf8c62facf1b73b897f9ee3a294de3844f4cba6185033b38c891328`.
+`FNX_MTP_HEAD_MODE=3` requires two-card HIP Flash-Next, the Q4 draft head and
+`FNX_MTP_LAST_HEAD=1`; default mode 0 preserves the original path. Mode 1 is a
+specialized full dot. Mode 2 screens one quarter and is not selected because
+its lower acceptance offset part of the kernel gain (215.77807 tokens/s).
+
+The same binary with mode 0 measured 214.97927 tokens/s: **+0.77%** for mode 3,
+with all six requests faster and identical input/output IDs and draft counts.
+Both processes exited normally and all decode major-fault counts are zero.
+See `draft-head-v13-mode3-comparison.json` and the raw mode 0/2/3 directories.
+
+Production-kernel tests cover 216 selected-score, guard, survivor-count and
+stable-tie checks on both cards, odd row tails, small and real head shapes,
+direct calls and graph replay. Build `split_mtp_head_gemv_test`; `--bench`
+adds diagnostic timings with three rotating weight copies. Full code-quality,
+near-context, Chinese, seeded sampling, cache-churn and probe checks are recorded
+in `draft-head-v13-mode3-validation.json`. Seven alternating greedy, sampled and
+penalized requests exercise graph recapture; final IDs and full-score fallback
+draft counts match their same-binary control.
+
+The first sampling validation had one major page fault during warmup; its two
+measured requests and all token/draft streams matched. A fresh isolated sampling
+run (`sampling-draft-head-v13-mode3-recheck`) has zero major faults including
+warmup and supplies the final validation report. The original record is retained.
+The I/O-graph prototype V12 was rejected: same-binary gain was only 0.07% and
+its plain captured event records did not refresh GPU timing. An independent
+120-case diagnostic confirms HIP external event nodes fix the timing behavior;
+no I/O-graph code remains in the selected source.
+
+## V11 checkpoint
+
 The latest validated candidate is V11: **214.73470 tokens/s** on the unchanged
 single-request Swift IQ3_S panel (code/prose/edit, 2048 outputs each, twice;
 context allocation 32768). The aggregate uses total tokens divided by engine
