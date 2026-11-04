@@ -129,3 +129,27 @@ Cancellation was exercised while the 800 MiB reservation was active. Sending the
 The 16K and 32K targets remain unmet. The measurements do not establish 200 tokens/s decode at 200K context, nor 200 tokens/s on every prompt. Only HIP on these two gfx1100 cards has been validated; other backends were not exercised.
 
 Private raw logs and native-format experiment configurations are under `build-tensor-parralize-baseline/prefill-20261104/`. They may contain local paths or authentication settings and must not be published wholesale.
+
+## Fused routed gate/up and SwiGLU
+
+The opt-in `FNX_PF_MOE_FUSED=1` path pairs 64 gate rows with their corresponding 64 up rows in a 128-row tile. Each row keeps the existing FP32 K-step and split-K reduction order. The epilogue applies the same SwiGLU operation and FP16 rounding, and writes the down projection's input directly. It avoids storing and rereading the full FP32 gate/up intermediate.
+
+The supported gate formats are IQ3_S, IQ3_XXS, IQ2_S, IQ4_XS, IQ4_NL, Q4_0 and packed Q2_0. Initialization validates every layer's format, row stride and geometry before omitting the intermediate allocation. The option requires HIP and FP16 expert activations. It defaults off. Unsupported public-kernel calls return false without writing output; enabling the engine option with incompatible model weights gives an initialization error.
+
+On the two gfx1100 cards, 5056 exact comparisons passed, covering both storage layouts, zero/partial/full jobs, split-K boundaries, extreme half scales, graph replay, output guards and shape/type fallback. The reference uses the existing narrow IQ4_XS kernel and the selected wide kernels for the other formats. Paired micros improved by about 5–9%; these are not whole-model rates.
+
+At PF_ROWS=4096 the FFN region shrinks from 577.5 to 477.5 MiB. Attention then determines the shared region's size at 483.875 MiB, so the actual allocation saving is 93.625 MiB per GPU. Native 4K/16K/32K, repeated requests and a 63914-token two-pass request matched all control input/output IDs, accepted/offered counts and finish reasons. First-run 4K/16K/32K times were 1217.9/3525.9/6882.4 ms, but had 21/18/2 major faults and are not clean timing comparisons. Subsequent 4K/16K/32K reads took 1207.2/3566.1/6895.4 ms with zero major faults. The whole-model gain is approximately 1%, much smaller than the kernel microbenchmark gain.
+
+Two alternatives were not selected. PF_ROWS=8192/pass=2/borrow=4 needed approximately 914 MiB more permanent allocation per GPU; with 20 GiB expert RAM backing, its warm 32K/16K reads took 6979.9/3637.4 ms, with no throughput advantage. Output IDs matched, but 32K draft counts differed. A benchmark-only HC kernel that shared weight reads between tokens failed exact comparisons (signed zero and a one-ULP half activation difference); it was removed from serving sources and retained only among private experiment artifacts.
+
+The validated v27b binary is `strata-split-pf-moe-fused-v27b`, SHA-256 `ebcfe9ec9a58473993a263e4df7efde0ac641e7bf0ad1f6e5057d669ad08b4d9`. Three exact cold API requests per length, all with zero reuse, produced:
+
+| Input tokens | Median prompt tokens/s | Range |
+| ---: | ---: | ---: |
+| 4096 | 3346.7 | 3337.1–3362.9 |
+| 16384 | 4566.7 | 4524.0–4573.9 |
+| 32768 | 4643.9 | 4641.2–4650.8 |
+
+These medians improve on v26 by 0.6–0.9%. The same three 2048-token API decode cases gave 207.6/183.5/223.3 tokens/s, weighted 203.44; complete texts matched v26. The prose case remains below 200. A 200579-input / 64-output request succeeded without OOM: prompt 55588.3 ms (3608.3 tokens/s), TTFT 55.707 seconds, decode 82.1 tokens/s. Its text and draft counts matched v26. A fresh 4096-token request afterward succeeded with zero reuse. The 16K and 32K acceptance targets remain unmet.
+
+With the original production configuration and all new options off, v27b matched the immutable production binary on warmup, 4015-token input with 128 generated tokens, and the prose case with 128 generated tokens. All input/output IDs, accepted/offered counts and finish reasons matched, with zero major faults. The saved `tp-prefill` JSON now selects v27b and enables the fused option. Its engine arguments and performance environment match the validated API configuration; the original authentication settings are retained. The original `tp220` configuration and executable remain available.

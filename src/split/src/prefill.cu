@@ -15,6 +15,7 @@
 #include "pf_ring_plan.hpp"
 #include "static_prefill_stage.hpp"
 #include "static_prefill_copy.cuh"
+#include "moe_mma_fused.hpp"
 #include "strata/prefill/hip_batch_copy.hpp"
 #if FNX_HIP
 #include "hip/rccl.h"
@@ -224,6 +225,7 @@ struct Engine::Pf {
     void* xq;                         // mixed as q8_1 (with a twin), for the experts through the decode kernels
     uint16_t* h16;                    // the experts' swiglu rows as f16, for the tensor-core down product
     bool moe_q8 = false;              // FNX_PF_MOE_Q8=1: the experts through the decode kernels' q8_1 arithmetic
+    bool moe_fused = false;           // optional exact gate/up + SwiGLU, avoiding the FP32 intermediate
     float *logits, *topw, *gu, *part, *shg;
     __half* shh;
     int *topi, *cnt, *jbase, *njobs;
@@ -622,6 +624,22 @@ void Engine::prefill_alloc() {
         p->hc_streams = env_flag("FNX_PF_HC_STREAMS");
         p->hc_up_fused = env_flag("FNX_PF_HC_UP_FUSED");
         p->compact_heads = env_flag("FNX_PF_COMPACT_HEADS");
+        p->moe_fused = env_flag("FNX_PF_MOE_FUSED");
+        if (p->moe_fused) {
+#if FNX_HIP
+            if (env_flag("FNX_PF_MOE_Q8"))
+                throw std::runtime_error("FNX_PF_MOE_FUSED requires FP16 expert activations");
+            for (size_t layer=0;layer<w.L.size();++layer) {
+                const DW& gu=w.L[layer].gu_e;
+                if (!moe_gate_up_swiglu_supported(gu))
+                    throw std::runtime_error("FNX_PF_MOE_FUSED: unsupported gate/up at layer "+std::to_string(layer)+
+                        " (type "+std::to_string(gu.type)+", "+std::to_string(gu.n_out)+"x"+std::to_string(gu.n_in)+
+                        ", row bytes "+std::to_string(gu.row_bytes)+")");
+            }
+#else
+            throw std::runtime_error("FNX_PF_MOE_FUSED requires HIP");
+#endif
+        }
         if (phase_scratch && (!p->compact_heads || p->f16acc || !env_flag("FNX_PF_SCRATCH_ALIAS")))
             throw std::runtime_error("FNX_PF_PHASE_SCRATCH requires compact heads, FP32 accumulation and FNX_PF_SCRATCH_ALIAS");
         if (p->compact_heads && (!p->native_gemm || !attn_head_split()))
@@ -646,7 +664,7 @@ void Engine::prefill_alloc() {
         // one region for the buffers of each phase of a layer: they never live at once (the FFN half's are read last
         // by the chunk sum's addend, on the stream before the next half starts)
         auto ffn_set = [&](Arena& a) {
-            p->gu = a.take<float>((size_t) pf_c_ * TOPK * 2 * ffs);
+            p->gu = p->moe_fused ? nullptr : a.take<float>((size_t) pf_c_ * TOPK * 2 * ffs);
             p->part = a.take<float>((size_t) (pf_c_ * TOPK + pf_c_) * N);
             p->shg = a.take<float>((size_t) pf_c_ * 2 * ffs);
             p->shh = a.take<__half>((size_t) pf_c_ * ffs);
@@ -1361,8 +1379,17 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
             moe_gate_up_big(gu, L.gu_e_stride, p.jobs_gu, p.njobs, pf_jobs_, p.xq, p.gu, b.st);
             moe_down_big(down, L.down_e_stride, p.jobs_dn, p.njobs, pf_jobs_, p.gu, p.part, b.st);
         } else {
+#if FNX_HIP
+            if (p.moe_fused) {
+                if (!moe_gate_up_swiglu_mma(gu, L.gu_e_stride, p.jobs_gu, p.njobs, pf_jobs_,
+                                           reinterpret_cast<const uint16_t*>(p.xh), p.h16, b.st))
+                    throw std::runtime_error("prefill: fused gate/up geometry changed after allocation");
+            } else
+#endif
+            {
             moe_gate_up_mma(gu, L.gu_e_stride, p.jobs_gu, p.njobs, pf_jobs_, reinterpret_cast<const uint16_t*>(p.xh), p.gu, b.st);
             swiglu_h16(p.gu, w.ff1 - w.ff0, C * TOPK, p.h16, b.st);
+            }
             moe_down_mma(down, L.down_e_stride, p.jobs_dn, p.njobs, pf_jobs_, p.h16, p.part, b.st);
         }
     };

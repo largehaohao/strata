@@ -311,13 +311,15 @@ constexpr size_t mm_smem() {
 // from shared memory feeds TT or 2 products): warp w takes rows 32 (w % WR) and tokens (64 / WT) (w / WR). A job of at
 // most TT token tiles runs on every warp anyway: the WT warps of a row group then take every WT-th 16 columns of each
 // k-step, summed at the end.
-template <int TYPE, int BM>
+template <int TYPE, int BM, bool FusedGate = false>
 __global__ void __launch_bounds__(MM_THREADS) k_moe_mma(MoeW w, const BigJob* __restrict__ jobs, const int* __restrict__ njobs,
-                                                        const __half* __restrict__ x, int ldx, float* __restrict__ out) {
+                                                        const __half* __restrict__ x, int ldx, float* __restrict__ out,
+                                                        __half* __restrict__ hout = nullptr) {
     using namespace nvcuda;
     constexpr int MM_NT = PF_JOB / 16;   // token tiles of a job
     constexpr int WR = BM / 32, WT = MM_THREADS / 32 / WR, TT = MM_NT / WT, NP = BM / MM_PASS, LO = 16 * TT;
     static_assert(WR * WT == MM_THREADS / 32 && TT * WT == MM_NT && NP * MM_PASS == BM, "warp layout");
+    static_assert(!FusedGate || (FNX_HIP && BM == 128 && MM_THREADS == 256), "fused gate/up uses the wide HIP tile");
 #if FNX_ARCH < 80
     static_assert(PF_JOB == 64, "the m8n8k4 path is laid out for 64-row jobs");
 #endif
@@ -328,7 +330,7 @@ __global__ void __launch_bounds__(MM_THREADS) k_moe_mma(MoeW w, const BigJob* __
     __half* sw = smem;
     __half* sx = smem + BM * MM_LD;
     load_bigjob(jb, jobs + ji);
-    const int n = jb.n, nt = (n + 15) / 16, warp = threadIdx.x >> 5, row0 = blockIdx.x * BM;
+    const int n = jb.n, nt = (n + 15) / 16, warp = threadIdx.x >> 5, row0 = blockIdx.x * (FusedGate ? BM / 2 : BM);
     const int rg = warp % WR, tg = warp / WR;
     const bool split = WT > 1 && nt <= TT;
     const int tb = split ? 0 : tg * TT;   // the warp's first token tile
@@ -377,11 +379,16 @@ __global__ void __launch_bounds__(MM_THREADS) k_moe_mma(MoeW w, const BigJob* __
             for (int j = 0; j < 8; ++j) acc[a][b][j] = 0.f;
 #endif
     const char* we = moe_expert(w, jb.w);
+    // The selected IQ/Q4/Q2 formats assign weight rows as tid/MM_TPR.
+    // A fused tile holds 64 gate rows and their corresponding 64 up rows.
+    // Only their physical addresses differ; each row keeps its original
+    // FP32 K-step and split-K reduction order.
+    const int fetch_row0 = row0 + (FusedGate && threadIdx.x / MM_TPR >= BM / 2 ? w.nrows / 2 - BM / 2 : 0);
     MmTile<TYPE> wt[NP];
     MmX xt;
     xt.rows(jb, nt);
 #pragma unroll
-    for (int p = 0; p < NP; ++p) wt[p].fetch(we, w.row_a, w.nrows, row0 + p * MM_PASS, 0, min(MM_KC, w.ncols));
+    for (int p = 0; p < NP; ++p) wt[p].fetch(we, w.row_a, w.nrows, fetch_row0 + p * MM_PASS, 0, min(MM_KC, w.ncols));
     xt.fetch(x, ldx, 0, min(MM_KC, w.ncols));
     for (int k0 = 0; k0 < w.ncols; k0 += MM_KC) {
         const int kc = min(MM_KC, w.ncols - k0);
@@ -392,7 +399,7 @@ __global__ void __launch_bounds__(MM_THREADS) k_moe_mma(MoeW w, const BigJob* __
         if (k0 + MM_KC < w.ncols) {
             const int kn = min(MM_KC, w.ncols - k0 - MM_KC);
 #pragma unroll
-            for (int p = 0; p < NP; ++p) wt[p].fetch(we, w.row_a, w.nrows, row0 + p * MM_PASS, k0 + MM_KC, kn);
+            for (int p = 0; p < NP; ++p) wt[p].fetch(we, w.row_a, w.nrows, fetch_row0 + p * MM_PASS, k0 + MM_KC, kn);
             xt.fetch(x, ldx, k0 + MM_KC, kn);
         }
         if (tb < nt) {
@@ -476,6 +483,23 @@ __global__ void __launch_bounds__(MM_THREADS) k_moe_mma(MoeW w, const BigJob* __
                 sob[ln * SLD + r * 16 + (FNX_WMMA_GFX11 ? 2 * k : k)] = acc[r][t][k];
         __syncthreads();
         const int groups = split ? 1 : WT;
+        if constexpr (FusedGate) {
+            for (int e=threadIdx.x;e<groups*16*(BM/2);e+=MM_THREADS) {
+                const int group=e/(16*(BM/2)), token=(e/(BM/2))%16, r=e%(BM/2);
+                const int j=(split?0:group*TT*16)+t*16+token, row=row0+r;
+                if(j>=n) continue;
+                float gate=so[(group*16+token)*SLD+r];
+                float up=so[(group*16+token)*SLD+BM/2+r];
+                if(split) {
+#pragma unroll
+                    for(int g=1;g<WT;++g) {
+                        gate+=so[(g*16+token)*SLD+r];
+                        up+=so[(g*16+token)*SLD+BM/2+r];
+                    }
+                }
+                hout[(size_t)jb.out[j]*(w.nrows/2)+row]=__float2half(silu_(gate)*up);
+            }
+        } else {
         for (int e = threadIdx.x; e < groups * 16 * BM; e += MM_THREADS) {
             const int group = e / (16 * BM), token = (e / BM) % 16, r = e % BM;
             const int j = (split ? 0 : group * TT * 16) + t * 16 + token, row = row0 + r;
@@ -486,6 +510,7 @@ __global__ void __launch_bounds__(MM_THREADS) k_moe_mma(MoeW w, const BigJob* __
                 for (int g = 1; g < WT; ++g) v += so[(g * 16 + token) * SLD + r];
             }
             out[(size_t) jb.out[j] * w.nrows + row] = v;
+        }
         }
         __syncthreads();
     }
