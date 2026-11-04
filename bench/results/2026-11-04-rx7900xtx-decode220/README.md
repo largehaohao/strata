@@ -1,6 +1,99 @@
-# November 4 decode follow-up
+# November 4: 220-token/s acceptance
 
-The latest validated candidate is V13, mode 3: **216.62750 tokens/s** on the
+The final V26 recipe passes the fixed single-request target: **222.14549** and
+**222.61031 tokens/s**, combined **222.37766**. The full regression suite
+also passes. `acceptance-220.py` independently audits the raw manifests, tokens,
+configuration, fresh process IDs, binary fingerprint, quality and unit evidence.
+
+## Exact recurrent projection fusion, router storage and cache credit (V26)
+
+The unchanged Swift-1.5 IQ3_S single-request panel now reaches
+**222.14549** and **222.61031 tokens/s** in two independent engine processes,
+or **222.37766 tokens/s** across all 24,576 measured output tokens. Both
+runs exceed 220. Each contains code, prose and edit prompts with 2048 outputs,
+repeated twice; context allocation is 32768. The metric divides output tokens
+by engine DONE decode time and excludes warmup and prefill. Individual prose
+requests remain around 198 tokens/s; this is an aggregate panel target.
+
+The retained additions since V13 are:
+
+- `FNX_STATIC_CACHE_MAX_AGE=2`: bounded CLOCK hit credit. A cache hit increases
+  credit up to the configured maximum; a hand pass consumes credit before
+  eviction. New entries start at one, and K/V lending clears their credit.
+  Values 1..4 are accepted; default 1 retains the previous policy.
+- `FNX_ROUTER_BF16=1`: compact a main router matrix only when every FP32 value
+  has zero low 16 bits. Any inexact matrix falls back to FP32, without rounding.
+  Decode expands the exact bits and retains the original accumulation order;
+  prefill restores FP32 into existing scratch before the same SGEMM. All 48
+  routers on each card qualify in this model, saving 120.234375 MiB per card.
+  This allows the selected expert RAM budget to decrease to 11.25 GiB.
+  MTP routers keep FP32. The default is disabled. The holder image version
+  changes to IMG2 to account for the additional router address.
+- `FNX_Q8S_FUSED_AB=1`: use the existing R=2 fused Q8S/alpha-beta kernel for
+  the two-card recurrent projection's 8192 rows. This removes its stream
+  fork/join while retaining both dot products' arithmetic. It requires HIP,
+  two cards, Flash-Next and `FNX_Q8S_ROW_GROUP=2`; default 0 keeps the old path.
+- `TP_CPU_AFFINITY=0-3` in the benchmark recipe, with
+  `HSA_OVERRIDE_CPU_AFFINITY_DEBUG=0` so ROCr helpers inherit the process mask.
+  The harness records actual main and helper-thread masks after load and after
+  decode; every recorded thread used CPUs 0..3. This runtime behavior is
+  documented in [ROCr environment variables](https://rocm.docs.amd.com/projects/ROCR-Runtime/en/latest/api-reference/environment_variables.html).
+
+With only Q8S/alpha-beta fusion disabled, the same binary measured
+**220.09909 tokens/s**. The first enabled panel improves by **0.93%**,
+with all six requests faster. Input/output token IDs and accepted/offered draft
+counts match the unfused control, both enabled runs, and the V13 checkpoint.
+Every engine exits normally; measured decode major-fault deltas are zero,
+including warmup. These counters start after the client receives the first token.
+
+Production tests pass 1152 exact Q8S/AB direct-launch, graph and guard checks,
+576 router GPU checks, 65536 host BF16 bit-pattern checks and 65535 rejection
+checks, plus 18432 cache-policy checks against an independent CPU oracle
+(6912 with K/V lending). Full final-recipe regression passes all 1326 reviewed
+code checks; near-context generation, held-out Chinese replies, fixed-seed
+sampling with penalties, cache churn and probe mode match their reference
+outputs. Sampled draft counts also match. V13's approximate draft-head screening
+remains selected only for unpenalized greedy proposals; main verification stays
+enabled. These checks do not establish broad quality equivalence with another
+engine or every possible prompt.
+
+The tested binary is `build-tensor-parralize-baseline/strata-split-q8s-ab-v26`,
+SHA256 `83edcdb64b0b620c186b759dac207e458019a5eb7b358e5944b169e77a91cf45`. From `/home/john/Strata`:
+
+```sh
+bash bench/results/2026-11-04-rx7900xtx-decode220/reproduce-220.sh NEW_OUTPUT_DIRECTORY
+python3 bench/results/2026-11-04-rx7900xtx-decode220/acceptance-220.py
+```
+
+The first command requires a new directory. `TP_EXE` can select a newly built
+`strata-split-2`, which needs independent validation. The second command audits
+the retained acceptance artifacts. Build instructions above still apply;
+focused targets are `split_q8s_ab_test`, `split_router_bf16_test`,
+`split_lossless_bf16_test` and `split_moe_cache_test`.
+
+The recipe leaves only **34 MiB free VRAM per card at load** on this host.
+It is validated for the recorded dual RX 7900 XTX and 32768 allocation; the
+deployed 204800-context configuration, concurrent serving, and CUDA performance
+have not been accepted by these tests. Performance panels ran without concurrent
+builds, profiling or other experiment GPU jobs. Runtime defaults and the existing
+service configuration are unchanged; all new execution options are opt-in.
+
+Earlier near-threshold results remain recorded: V17 reached 220.25611 but its
+independent repeat was 219.28564; V21's four-core recipe reached 220.13339 but
+repeated at 219.95017. Neither was accepted as 220. Optional GPU timer removal
+and runtime wait changes had only noise-sized gains and were removed; interrupt
+polling crashed during load. A 128-row prefill experiment changed output IDs
+and was rejected. More aggressive draft-head and draft-dense alternatives lost
+acceptance or end-to-end speed and are absent from the selected source.
+
+See `acceptance-220.json`, `q8s-ab-v26-validation.json`, the comparison JSONs,
+unit-test logs and raw `q8s-ab-v26-*` / `*-q8s-ab-v26` directories in the
+November 4 evidence directory. The original 200-token/s binary is retained
+unchanged for reproduction of that earlier checkpoint.
+
+## V13 checkpoint
+
+The V13 checkpoint, mode 3, measured: **216.62750 tokens/s** on the
 unchanged Swift IQ3_S single-request panel (32768 context allocation,
 code/prose/edit 2048 outputs each, twice). The aggregate is total output tokens
 divided by engine decode time, excluding warmup. **220 remains open.**

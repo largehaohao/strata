@@ -25,7 +25,10 @@ __device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache
     }
     const int s0 = ec.s0[p] + lent, n = ec.n[p] - lent;
     for (int j = lane; j < nj; j += 32)
-        if (const int s = ec.slot_of[base + jobs[j].w]; s >= 0) ec.ref[s] = 2;
+        if (const int s = ec.slot_of[base + jobs[j].w]; s >= 0) {
+            if (ec.age) ec.age[s] = min(ec.max_age, (int) ec.age[s] + 1);
+            ec.ref[s] = 2;
+        }
     __syncwarp();
     int hand = ec.hand[p] - s0, k = 0;   // within the slots not lent
     if (hand < 0 || hand >= n) hand = 0;
@@ -41,7 +44,13 @@ __device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache
                 const unsigned char r = ec.ref[idx];
                 const unsigned free = __ballot_sync(0xffffffffu, r == 0);
                 const int f = free ? __ffs(free) - 1 : 32;
-                if (lane < f && r == 1) ec.ref[idx] = 0;
+                if (lane < f && r == 1) {
+                    if (ec.age && ec.age[idx] > 1) --ec.age[idx];
+                    else {
+                        ec.ref[idx] = 0;
+                        if (ec.age) ec.age[idx] = 0;
+                    }
+                }
                 if (free) victim = s0 + (hand + f) % n;
                 hand = (hand + (free ? f + 1 : 32)) % n;
             }
@@ -54,6 +63,7 @@ __device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache
                 ec.owner[victim] = g;
                 ec.slot_of[g] = victim;
                 ec.ref[victim] = 2;
+                if (ec.age) ec.age[victim] = 1;
                 char* at = ec.pool[p] + (size_t) (victim - ec.s0[p]) * ec.slot_bytes[p];
                 ec.ep_gu[g] = at;
                 ec.ep_dn[g] = at + ec.dn_off[p];
@@ -71,8 +81,8 @@ __device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache
     }
 }
 
-template <int T>
-__global__ void __launch_bounds__(RR_THREADS) k_router_route(const float* __restrict__ W, const float* __restrict__ x,
+template <int T, bool BF16 = false>
+__global__ void __launch_bounds__(RR_THREADS) k_router_route(const void* __restrict__ W, const float* __restrict__ x,
                                                             float* __restrict__ logits, int* __restrict__ topi,
                                                             float* __restrict__ topw, Job* __restrict__ gu, Job* __restrict__ dn,
                                                             int* __restrict__ njobs, unsigned* __restrict__ counter,
@@ -88,10 +98,10 @@ __global__ void __launch_bounds__(RR_THREADS) k_router_route(const float* __rest
     const int row = blockIdx.x * RR_ROWS + rw;
     __shared__ float rsum[T][RR_THREADS / 32];
     if (row < L) {
-        const float4* w4 = reinterpret_cast<const float4*>(W + (size_t) row * N) + half * NC * 32;
+        const size_t first4 = (size_t) row * (N / 4) + half * NC * 32;
         float4 wv[NC];
 #pragma unroll
-        for (int i = 0; i < NC; ++i) wv[i] = __ldg(w4 + i * 32 + lane);
+        for (int i = 0; i < NC; ++i) wv[i] = load_weight4<BF16>(W, first4 + i * 32 + lane);
         // unrolled over the tokens: each pair's x loads and sums run beside the others' (rolled, the pairs waited on
         // each other: one wave of blocks, so latency set the time). Each logit's summation order is unchanged
 #pragma unroll

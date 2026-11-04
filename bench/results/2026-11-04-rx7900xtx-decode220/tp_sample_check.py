@@ -20,6 +20,7 @@ import time
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT))
 from tools.strata_tokenizer import Tokenizer
+from tools.tp_decode_bench import cpu_affinity, process_cpu_times
 
 CASES = {
     'code': 'Write a complete Python module implementing a thread-safe LRU cache with TTL expiration, an injectable clock, capacity validation, get, put, delete and clear methods. Include a unittest test suite covering expiration, eviction order, updates, missing keys, invalid capacity, and concurrent access. Explain the invariants briefly. Return executable code.',
@@ -113,7 +114,7 @@ def measure(a):
     safe_env = {k: v for k, v in env.items()
                 if (k.startswith(('FNX_', 'STRATA_')) or k in
                     ('HIP_VISIBLE_DEVICES', 'CUDA_VISIBLE_DEVICES', 'HSA_FORCE_FINE_GRAIN_PCIE',
-                     'LD_LIBRARY_PATH', 'HIP_FORCE_DEV_KERNARG'))
+                     'LD_LIBRARY_PATH', 'HIP_FORCE_DEV_KERNARG', 'HSA_ENABLE_INTERRUPT', 'HSA_ENABLE_MWAITX', 'TP_CPU_AFFINITY', 'HSA_OVERRIDE_CPU_AFFINITY_DEBUG'))
                 and not any(word in k.upper() for word in ('API_KEY', 'PASSWORD', 'SECRET', 'ACCESS_TOKEN'))}
     manifest = {'status': 'running', 'command': cmd, 'env': safe_env, 'source': source_info(),
                 'binary_sha256': sha(Path(cmd[0]).read_bytes()), 'cases': cases, 'sampling': {'temperature':0.7,'top_k':20,'top_p':0.9,'penalty_repeat':1.05,'penalty_freq':0.05,'penalty_present':0.03,'penalty_last_n':128,'seed':20261104},
@@ -162,6 +163,9 @@ def measure(a):
         try:
             while not line().startswith('READY'):
                 pass
+            manifest['cpu_affinity_after_load'] = cpu_affinity(proc.pid)
+            manifest['cpu_times_after_load'] = process_cpu_times(proc.pid)
+            save()
             for rep in range(a.repeats):
                 requests = ([('warmup', 'Say hello in one sentence.')] if rep == 0 else []) + list(cases.items())
                 for case_index, (name, prompt) in enumerate(requests):
@@ -207,6 +211,8 @@ def measure(a):
             measured = [r for r in manifest['runs'] if r['case'] != 'warmup']
             duration = sum(r['decode_ms'] for r in measured)
             manifest['weighted_decode_tps'] = sum(r['tokens'] for r in measured) * 1000 / duration if duration else 0
+            manifest['cpu_affinity_after_decode'] = cpu_affinity(proc.pid)
+            manifest['cpu_times_after_decode'] = process_cpu_times(proc.pid)
             manifest['status'] = 'complete'
         except BaseException as error:
             manifest.update(status='failed', error=str(error))

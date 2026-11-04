@@ -71,6 +71,29 @@ def source_info():
         return {'head': None}
 
 
+def process_cpu_times(pid):
+    """Aggregate engine CPU seconds from Linux /proc, including all its threads."""
+    try:
+        fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
+        hz = os.sysconf('SC_CLK_TCK')
+        return {'user_s': int(fields[11]) / hz, 'system_s': int(fields[12]) / hz}
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def cpu_affinity(pid):
+    """Record the actual engine/thread masks; no process settings are changed."""
+    if not hasattr(os, 'sched_getaffinity'):
+        return None
+    result = {'main': sorted(os.sched_getaffinity(pid)), 'threads': {}}
+    for path in sorted(Path(f'/proc/{pid}/task').glob('*')):
+        try:
+            result['threads'][path.name] = sorted(os.sched_getaffinity(int(path.name)))
+        except ProcessLookupError:
+            continue  # A runtime helper thread may finish during the snapshot.
+    return result
+
+
 def command(a):
     env = dict(os.environ)
     if a.config:
@@ -114,7 +137,7 @@ def measure(a):
                 if (k.startswith(('FNX_', 'STRATA_')) or k in
                     ('HIP_VISIBLE_DEVICES', 'CUDA_VISIBLE_DEVICES', 'HSA_FORCE_FINE_GRAIN_PCIE',
                      'LD_LIBRARY_PATH', 'HIP_FORCE_DEV_KERNARG', 'HSA_ENABLE_SDMA',
-                     'HSA_ENABLE_INTERRUPT'))
+                     'HSA_ENABLE_INTERRUPT', 'HSA_ENABLE_MWAITX', 'TP_CPU_AFFINITY', 'HSA_OVERRIDE_CPU_AFFINITY_DEBUG'))
                 and not any(word in k.upper() for word in ('API_KEY', 'PASSWORD', 'SECRET', 'ACCESS_TOKEN'))}
     manifest = {'status': 'running', 'command': cmd, 'env': safe_env, 'source': source_info(),
                 'binary_sha256': sha(Path(cmd[0]).read_bytes()), 'cases': cases,
@@ -163,6 +186,9 @@ def measure(a):
         try:
             while not line().startswith('READY'):
                 pass
+            manifest['cpu_affinity_after_load'] = cpu_affinity(proc.pid)
+            manifest['cpu_times_after_load'] = process_cpu_times(proc.pid)
+            save()
             for rep in range(a.repeats):
                 requests = ([('warmup', 'Say hello in one sentence.')] if rep == 0 else []) + list(cases.items())
                 for case_index, (name, prompt) in enumerate(requests):
@@ -208,6 +234,8 @@ def measure(a):
             measured = [r for r in manifest['runs'] if r['case'] != 'warmup']
             duration = sum(r['decode_ms'] for r in measured)
             manifest['weighted_decode_tps'] = sum(r['tokens'] for r in measured) * 1000 / duration if duration else 0
+            manifest['cpu_affinity_after_decode'] = cpu_affinity(proc.pid)
+            manifest['cpu_times_after_decode'] = process_cpu_times(proc.pid)
             manifest['status'] = 'complete'
         except BaseException as error:
             manifest.update(status='failed', error=str(error))

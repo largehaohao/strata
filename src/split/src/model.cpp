@@ -1,3 +1,4 @@
+#include "lossless_bf16.hpp"
 #include "model.hpp"
 #include "card_check.hpp"
 #include "env.hpp"
@@ -686,13 +687,22 @@ struct Up {
         return w;
     }
     // f32 tensors' rows one after another
-    float* f32_cat(const Tensor& t1, const Tensor& t2, size_t row_floats) {
+    float* f32_cat(const Tensor& t1, const Tensor& t2, size_t row_floats, uint16_t** packed = nullptr) {
         if (t1.type != T_F32 || t2.type != T_F32 || t1.ne[0] != t2.ne[0]) throw std::runtime_error(t1.name + " and " + t2.name + " do not stack");
         if ((size_t) t1.ne[0] != row_floats)
             throw std::runtime_error(t1.name + " is " + std::to_string(t1.ne[0]) + " floats a row, not the " + std::to_string(row_floats) +
                                      " its reader takes");
         std::vector<float> h((const float*) t1.data, (const float*) t1.data + t1.ne[0] * t1.ne[1]);
         h.insert(h.end(), (const float*) t2.data, (const float*) t2.data + t2.ne[0] * t2.ne[1]);
+        static const long long compact = env_int("FNX_ROUTER_BF16", 0);
+        if (compact != 0 && compact != 1) throw std::runtime_error("FNX_ROUTER_BF16: expected 0 or 1");
+        if (compact && packed) {
+            std::vector<uint16_t> bits;
+            if (pack_lossless_bf16(h.data(), h.size(), bits)) {
+                *packed = put<uint16_t>(bits.data(), bits.size() * sizeof(uint16_t));
+                return nullptr;
+            }
+        }
         return put<float>(h.data(), h.size() * 4);
     }
     // per expert: every row, input blocks [b0, b1) (down), expert-major
@@ -899,7 +909,7 @@ void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resid
             throw std::runtime_error("fnx: " + gi.name + " holds " + std::to_string(gi.ne[1]) + " rows and " + gs.name + " " +
                                      std::to_string(gs.ne[1]) + ", not the " + std::to_string(NEXP) +
                                      " gate rows and 1 shared row k_router_route reads");
-        w.router = up.f32_cat(gi, gs, N);
+        w.router = up.f32_cat(gi, gs, N, &w.router_bf16);
         if (!is_attn(l)) {
             w.qkvz = up.dense(up.rows2(L(l, "attn_qkv.weight"), conv_rows, L(l, "attn_gate.weight"), zrows));
             w.ab = up.f32_rows2(L(l, "ssm_alpha.weight"), L(l, "ssm_beta.weight"), vheads, N);
@@ -960,6 +970,10 @@ void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resid
         }
         st.done(l);
     }
+    int packed_routers = 0;
+    for (const LayerW& layer : c.L) packed_routers += layer.router_bf16 != nullptr;
+    if (packed_routers) std::fprintf(stderr, "fnx: card %d: %d lossless BF16 routers, %.2f MiB saved\n", c.dev, packed_routers,
+                                    (double) packed_routers * (NEXP + 1) * N * sizeof(uint16_t) / 1048576.0);
     c.head_norm = up.f32(st.t(NL, "output_hc_norm.weight"), D);
     c.head_down = up.q8split(st.t(NL, "output_hc_down.weight"));
     c.head_up = up.q8split(st.t(NL, "output_hc_up.weight"));
@@ -1777,7 +1791,9 @@ void card_fields(CardW& c, F f) {
         f(c.ple_norm_query), f(c.ple_norm_conv), f(c.ple_conv), f(c.bytes), f(c.host_bytes);
 }
 #if !FNX_27B   // the 27B has no holder (plain loads only)
-static_assert(sizeof(CardW) == 896, "CardW changed: put what load_card stores in card_fields, then update this size");
+// ExpertCache is rebuilt by placement, after load_card; its optional static-cache
+// ages are allocated by the engine and add no holder-image weight fields.
+static_assert(sizeof(CardW) == 912, "CardW changed: put what load_card stores in card_fields, then update this size");
 #endif
 // every address load_card stores, in a card and in a layer: a worker moves them to where it mapped the holder's memory
 template <typename F>
@@ -1788,7 +1804,7 @@ void card_ptrs(CardW& c, F f) {
         f(c.ple_norm_query), f(c.ple_norm_conv), f(c.ple_conv);
     for (LayerW& w : c.L) {
         for (int h = 0; h < 2; ++h) f(w.hc_norm[h]), q8(w.hc_down[h]), q8(w.hc_up[h]), f(w.hc_inj[h]);
-        f(w.router), dw(w.qkv), dw(w.z), dw(w.ssm_out), dw(w.qkvz), f(w.ab), f(w.conv), f(w.alpha), f(w.beta), f(w.ssm_a),
+        f(w.router), f(w.router_bf16), dw(w.qkv), dw(w.z), dw(w.ssm_out), dw(w.qkvz), f(w.ab), f(w.conv), f(w.alpha), f(w.beta), f(w.ssm_a),
             f(w.dt_bias), f(w.ssm_norm);
         dw(w.wq), dw(w.wk), dw(w.wv), dw(w.wo), f(w.q_norm), f(w.k_norm), f(w.idx_wq), f(w.idx_wk), dw(w.idx_qk), f(w.idx_qn),
             f(w.idx_kn);
@@ -1798,13 +1814,13 @@ void card_ptrs(CardW& c, F f) {
     for (const char*& p : c.ec_host_dn) f(p);
 }
 #if !FNX_27B
-static_assert(sizeof(LayerW) == 952, "LayerW changed: put its new addresses in card_ptrs, then update this size");
+static_assert(sizeof(LayerW) == 960, "LayerW changed: put its new addresses in card_ptrs, then update this size");
 #endif
 }  // namespace
 
 std::string Model::image() const {
     Img m;
-    m.put((uint32_t) 0x31474d49);   // "IMG1"
+    m.put((uint32_t) 0x32474d49);   // "IMG2": LayerW includes the lossless BF16 router address
     for (const CardW& cc : cards) {
         CardW& c = const_cast<CardW&>(cc);
         card_fields(c, [&](auto& v) { m.put(v); });
@@ -1819,7 +1835,7 @@ void Model::restore(const std::string& image, const Store& store) {
     Img m{image};
     uint32_t magic = 0;
     m.get(magic);
-    if (magic != 0x31474d49) throw std::runtime_error("fnx: not a holder's image");
+    if (magic != 0x32474d49) throw std::runtime_error("fnx: not a holder's image");
     for (CardW& c : cards) {
         card_fields(c, [&](auto& v) { m.get(v); });
         m.get_vec(c.L);

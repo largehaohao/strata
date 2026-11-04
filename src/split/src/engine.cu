@@ -30,9 +30,27 @@
 
 namespace fnx {
 
+namespace {
+bool q8s_fused_ab() {
+    static const bool enabled = [] {
+        const auto value = env_int("FNX_Q8S_FUSED_AB", 0);
+        if (value != 0 && value != 1) throw std::runtime_error("FNX_Q8S_FUSED_AB: expected 0 or 1");
+#if !FNX_HIP || FNX_NCARD != 2 || FNX_27B
+        if (value) throw std::runtime_error("FNX_Q8S_FUSED_AB requires two-card HIP Flash-Next");
+#endif
+        if (value && env_int("FNX_Q8S_ROW_GROUP", 0) != 2)
+            throw std::runtime_error("FNX_Q8S_FUSED_AB requires FNX_Q8S_ROW_GROUP=2");
+        if (value) std::fprintf(stderr, "fnx: fused two-card Q8S and alpha/beta projections (8192 rows, two rows per warp)\n");
+        return value != 0;
+    }();
+    return enabled;
+}
+} // namespace
+
 
 Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
     attn_head_check_runtime(lanes, batch_drafts() != BatchDrafts::off);
+    (void) q8s_fused_ab();
     // the 27B build's settings: this Flash-Next engine has none of what they set, so one given is a mistake, not a
     // run of the default
     for (const char* k : {"FNX_PF_SKIP", "FNX_PF_SKIP_CONFIRM", "FNX_PF_SCORE_MIB", "FNX_PF_WINDOWS", "FNX_PF_SCORES",
@@ -1030,7 +1048,7 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
     const bool live = (static_live || cache_live()) && lyr >= 0 && lyr < NL;
     const bool plan_in_router = live && !b.probe_cnt;
     router_route(L.router, b.mixed, b.logits, T, b.topi, b.topw, b.jobs_gu, b.jobs_dn, b.njobs, b.st, plan_in_router ? &ec : nullptr,
-                 lyr, b.cache_list, sh_in ? &L.sh_gu.s : nullptr, 2 * ffs, b.xq, b.sh_gu);
+                 lyr, b.cache_list, sh_in ? &L.sh_gu.s : nullptr, 2 * ffs, b.xq, b.sh_gu, L.router_bf16);
     if (const int l = lyr; l >= 0 && l < NL) {
         if (b.route_cnt) route_count(b.topi, P, b.route_cnt + (size_t) l * NEXP, b.st);
         if (b.route_trace) fnx::route_trace(b.topi, P, l, b.route_trace, b.route_trace_len, b.route_trace_cap, b.st);
@@ -1039,7 +1057,7 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
                 probe_score(b.topi, b.probe_guess + (size_t) l * MAXT * TOPK, T, w.ec.n_slots ? w.ec.slot_of + (size_t) l * NEXP : nullptr,
                             b.probe_cnt, b.st);
             if (l + 1 < NL) {
-                gemv_f32(w.L[(size_t) l + 1].router, b.mixed, b.probe_logits, NEXP, N, T, b.st);
+                gemv_f32(w.L[(size_t) l + 1].router, b.mixed, b.probe_logits, NEXP, N, T, b.st, w.L[(size_t) l + 1].router_bf16);
                 probe_guess(b.probe_logits, T, b.probe_guess + (size_t) (l + 1) * MAXT * TOPK, b.st);
             }
         }
@@ -1107,8 +1125,10 @@ void Engine::enqueue(int T, bool dumps) {
                     b.inj_a, b.hcs, b.ring.err, T, b.st, b.xq);
             if (!is_attn(l)) {
                 const int nv = w.nv(), ch = w.conv_ch();
-                // ab beside qkvz in one launch (a fork and a join: ~5 us more; compiled for 4096..8191 rows)
-                if (L.qkvz.s.q && 2 * nv <= 160 && L.qkvz.n_out >= 4096 && L.qkvz.n_out < 8192) {
+                // The two-card 8192-row projection uses the same R=2 arithmetic
+                // with FNX_Q8S_ROW_GROUP=2; optionally fuse AB to avoid fork/join.
+                if (L.qkvz.s.q && 2 * nv <= 160 && L.qkvz.n_out >= 4096 &&
+                    (L.qkvz.n_out < 8192 || (L.qkvz.n_out == 8192 && q8s_fused_ab()))) {
                     q8s_gemv_f32(L.qkvz.s, L.qkvz.n_out, L.qkvz.n_in, b.xq, b.qkvz, L.ab, b.mixed, b.ab, 2 * nv, T, b.st);
                 } else {
                     ck(cudaEventRecord(b.fork, b.st), "fork");

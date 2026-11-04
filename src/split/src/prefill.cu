@@ -729,7 +729,7 @@ void Engine::prefill_alloc() {
         p->up32 = from_big(std::max<size_t>((size_t) pf_c_ * D, (size_t) pf_c_ * NQH * 2 * HD / 2 + 16));
         p->xf = from_big((size_t) pf_c_ * D);
         p->bo_a = from_big((size_t) pf_c_ * N);
-        p->widx = from_big((size_t) qsa_rows() * N);
+        p->widx = from_big((size_t) std::max(qsa_rows(), NEXP + 1) * N);
         p->wh = palloc<__half>(PF_WH);
         p->xh = palloc<__half>((size_t) pf_c_ * D);
         p->R = palloc<float>((size_t) pf_c_ * D);
@@ -1312,7 +1312,14 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
                 }
                 pf_hc_read(p, p.R, p.bo_a, p.inj_a, L.hc_norm[1], L.hc_down[1], L.hc_up[1], L.hc_inj[1], eps, p.mixed, p.inj_f, C, s);
                 if (p.moe_q8) quantize_q8_1(p.mixed, p.xq, N, C, s);   // else xh holds the hc read's f16 of mixed
-                pf_sgemm(p, L.router, NEXP + 1, N, p.mixed, C, p.logits, NEXP + 1);
+                // Reuse the indexer conversion buffer (640 rows), now idle on this
+                // same stream. SGEMM receives exactly the original FP32 router bits.
+                const float* router = L.router;
+                if (L.router_bf16) {
+                    k_bf16_f32<<<grid_for((size_t) (NEXP + 1) * N), 256, 0, s>>>(L.router_bf16, (size_t) (NEXP + 1) * N, p.widx);
+                    router = p.widx;
+                }
+                pf_sgemm(p, router, NEXP + 1, N, p.mixed, C, p.logits, NEXP + 1);
                 k_pf_top10<<<(C + 7) / 8, 256, 0, s>>>(p.logits, C, p.topi, p.topw);
                 ckc(cudaMemsetAsync(p.cnt, 0, NEXP * 4, s), "cnt");
                 k_pf_count<<<(P + 255) / 256, 256, 0, s>>>(p.topi, P, p.cnt);

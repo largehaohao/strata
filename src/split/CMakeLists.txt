@@ -139,7 +139,7 @@ endif()
 list(GET STRATA_SPLIT_CARDS 0 _moe_cards)
 set(_fnx_kernel_checks moe_iq moe_down moe_cache dense_q8 mtp_head_gpu)
 if(_fnx_hip AND _moe_cards EQUAL 2)
-  list(APPEND _fnx_kernel_checks attn_heads moe_cache_gu moe_q2_down moe_q2_mma mtp_head_gemv)
+  list(APPEND _fnx_kernel_checks attn_heads moe_cache_gu moe_q2_down moe_q2_mma mtp_head_gemv router_bf16 q8s_ab)
 endif()
 foreach(_kind ${_fnx_kernel_checks})
   set(_target split_${_kind}_test)
@@ -250,3 +250,8 @@ set_target_properties(split_attn_head_config_test PROPERTIES CXX_STANDARD 17 CXX
 add_executable(split_static_kv_cache_test EXCLUDE_FROM_ALL ${_sp}/tools/static_kv_cache_test.cpp)
 target_include_directories(split_static_kv_cache_test PRIVATE ${_sp}/src)
 set_target_properties(split_static_kv_cache_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+
+# Exact router storage conversion, including rejection instead of rounding.
+add_executable(split_lossless_bf16_test EXCLUDE_FROM_ALL ${_sp}/tools/lossless_bf16_test.cpp)
+target_include_directories(split_lossless_bf16_test PRIVATE ${_sp}/src)
+set_target_properties(split_lossless_bf16_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)

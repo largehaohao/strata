@@ -1,0 +1,78 @@
+{
+  "reference": "bench/results/2026-11-04-rx7900xtx-decode220/q8s-ab-v26-mode0",
+  "candidate": "bench/results/2026-11-04-rx7900xtx-decode220/q8s-ab-v26-mode1",
+  "binary_sha256": "83edcdb64b0b620c186b759dac207e458019a5eb7b358e5944b169e77a91cf45",
+  "all_token_and_draft_streams_exact": true,
+  "weighted_decode_tps": 222.14549011029538,
+  "reference_tps": 220.0990875775129,
+  "relative_gain": 0.009297642054339805,
+  "all_decode_major_faults_zero": true,
+  "runs": [
+    {
+      "case": "code",
+      "rep": 0,
+      "tokens": 2048,
+      "reference_tps": 228.98544242939244,
+      "candidate_tps": 231.23736832002888,
+      "faults": {
+        "minor": 201,
+        "major": 0
+      }
+    },
+    {
+      "case": "prose",
+      "rep": 0,
+      "tokens": 2048,
+      "reference_tps": 196.17797787250348,
+      "candidate_tps": 198.05427151229134,
+      "faults": {
+        "minor": 128,
+        "major": 0
+      }
+    },
+    {
+      "case": "edit",
+      "rep": 0,
+      "tokens": 2048,
+      "reference_tps": 241.09718052857733,
+      "candidate_tps": 242.95628447713386,
+      "faults": {
+        "minor": 31,
+        "major": 0
+      }
+    },
+    {
+      "case": "code",
+      "rep": 1,
+      "tokens": 2048,
+      "reference_tps": 228.37771533074624,
+      "candidate_tps": 230.25724051088326,
+      "faults": {
+        "minor": 0,
+        "major": 0
+      }
+    },
+    {
+      "case": "prose",
+      "rep": 1,
+      "tokens": 2048,
+      "reference_tps": 195.78601200718902,
+      "candidate_tps": 197.66241036183416,
+      "faults": {
+        "minor": 0,
+        "major": 0
+      }
+    },
+    {
+      "case": "edit",
+      "rep": 1,
+      "tokens": 2048,
+      "reference_tps": 240.27406260265616,
+      "candidate_tps": 242.8612086139835,
+      "faults": {
+        "minor": 0,
+        "major": 0
+      }
+    }
+  ]
+}

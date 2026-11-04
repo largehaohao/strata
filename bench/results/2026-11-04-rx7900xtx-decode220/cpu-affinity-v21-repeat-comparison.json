@@ -1,0 +1,78 @@
+{
+  "reference": "bench/results/2026-11-04-rx7900xtx-decode220/cpu-affinity-v21-physical4",
+  "candidate": "bench/results/2026-11-04-rx7900xtx-decode220/cpu-affinity-v21-physical4-repeat",
+  "binary_sha256": "b6205cf1701b7cc495298d376fa56ae48931a16716c5ba45483873006f62db1b",
+  "all_token_and_draft_streams_exact": true,
+  "weighted_decode_tps": 219.9501675401667,
+  "reference_tps": 220.1333913763174,
+  "relative_gain": -0.0008323309562677794,
+  "all_decode_major_faults_zero": true,
+  "runs": [
+    {
+      "case": "code",
+      "rep": 0,
+      "tokens": 2048,
+      "reference_tps": 229.05971434643047,
+      "candidate_tps": 229.00080508095533,
+      "faults": {
+        "minor": 252,
+        "major": 0
+      }
+    },
+    {
+      "case": "prose",
+      "rep": 0,
+      "tokens": 2048,
+      "reference_tps": 196.11410623485813,
+      "candidate_tps": 196.0990836580905,
+      "faults": {
+        "minor": 75,
+        "major": 0
+      }
+    },
+    {
+      "case": "edit",
+      "rep": 0,
+      "tokens": 2048,
+      "reference_tps": 241.16531835470613,
+      "candidate_tps": 240.76838974383088,
+      "faults": {
+        "minor": 56,
+        "major": 0
+      }
+    },
+    {
+      "case": "code",
+      "rep": 1,
+      "tokens": 2048,
+      "reference_tps": 228.4490451543816,
+      "candidate_tps": 228.0217333214572,
+      "faults": {
+        "minor": 0,
+        "major": 0
+      }
+    },
+    {
+      "case": "prose",
+      "rep": 1,
+      "tokens": 2048,
+      "reference_tps": 195.70369237825855,
+      "candidate_tps": 195.6569506940663,
+      "faults": {
+        "minor": 0,
+        "major": 0
+      }
+    },
+    {
+      "case": "edit",
+      "rep": 1,
+      "tokens": 2048,
+      "reference_tps": 240.51108605787297,
+      "candidate_tps": 240.22615039939944,
+      "faults": {
+        "minor": 0,
+        "major": 0
+      }
+    }
+  ]
+}

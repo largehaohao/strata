@@ -13,6 +13,9 @@ namespace fnx {
 
 inline ExpertCache static_decode_cache(const Model& model, const CardW& weights, int slots, int groups = 1,
                                        size_t full_kv_bytes = 0, size_t base_kv_bytes = 0) {
+    const auto max_age = env_int("FNX_STATIC_CACHE_MAX_AGE", 1);
+    if (max_age < 1 || max_age > 4)
+        throw std::runtime_error("FNX_STATIC_CACHE_MAX_AGE: expected 1..4");
     const auto padding = env_int("FNX_STATIC_CACHE_MIN_PADDING", 0);
     if ((padding != 0 && padding != 1) || (padding && groups != 2))
         throw std::runtime_error("FNX_STATIC_CACHE_MIN_PADDING: expected 0 or 1; enabling requires two cache groups");
@@ -49,6 +52,8 @@ inline ExpertCache static_decode_cache(const Model& model, const CardW& weights,
     ec.slot_of = dalloc<int>(NL * NEXP);
     ec.owner = dalloc<int>(ec.n_slots);
     ec.ref = dalloc<unsigned char>(ec.n_slots);
+    ec.max_age = (int) max_age;
+    if (max_age > 1) ec.age = dalloc<unsigned char>(ec.n_slots);
     ec.hand = dalloc<int>(EC_POOLS);
     ec.lent = dalloc<int>(EC_POOLS);
     std::vector<int> places(NL * NEXP, -1), owners(ec.n_slots, -1);

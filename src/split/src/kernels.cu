@@ -203,14 +203,15 @@ __global__ void __launch_bounds__(MMVQ_THREADS) k_mmvq(const char* __restrict__ 
 }
 
 #include "mtp_head_gemv.cuh"
+#include "bf16_weight_load.cuh"
 #include "dense.cuh"
 #include "moe.cuh"
 #include "moe_q4k.cuh"
 
 // ---------------------------------------------------------------- f32 matrix x vectors (router, alpha / beta, gates)
 // y[t][row] = W[row] . x[t]: a warp per row (WPR = 1) or a block per row (WPR = 4 warps, the columns split), n = N
-template <int T, int WPR>
-__global__ void __launch_bounds__(256) k_gemv_f32(const float* __restrict__ W, const float* __restrict__ x, float* __restrict__ y,
+template <int T, int WPR, bool BF16 = false>
+__global__ void __launch_bounds__(256) k_gemv_f32(const void* __restrict__ W, const float* __restrict__ x, float* __restrict__ y,
                                                  int rows) {
     constexpr int NC = N / 4 / (32 * WPR);   // float4 chunks per lane
     static_assert(N % (4 * 32 * WPR) == 0, "chunks per lane");
@@ -218,10 +219,10 @@ __global__ void __launch_bounds__(256) k_gemv_f32(const float* __restrict__ W, c
     const int row = WPR == 1 ? blockIdx.x * 8 + warp : blockIdx.x;
     const int part = WPR == 1 ? 0 : warp;     // this warp's share of the columns
     if (row >= rows) return;
-    const float4* w4 = reinterpret_cast<const float4*>(W + (size_t) row * N) + part * NC * 32;
+    const size_t first4 = (size_t) row * (N / 4) + part * NC * 32;
     float4 wv[NC];
 #pragma unroll
-    for (int i = 0; i < NC; ++i) wv[i] = __ldg(w4 + i * 32 + lane);
+    for (int i = 0; i < NC; ++i) wv[i] = load_weight4<BF16>(W, first4 + i * 32 + lane);
     float s[T];
 #pragma unroll
     for (int t = 0; t < T; ++t) {
@@ -1132,34 +1133,34 @@ void mtp_head_gemv(const DW& W, const void* y, float* out, int mode, void* st) {
 }
 
 namespace {
-template <int T>
-void gemv_f32_t(const float* W, const float* x, float* y, int rows, cudaStream_t s) {
+template <int T, bool BF16>
+void gemv_f32_t(const void* W, const float* x, float* y, int rows, cudaStream_t s) {
     // a block per row while that still gives every SM a block or two; a warp per row beyond
-    if (rows <= 160) k_gemv_f32<T, 4><<<rows, 128, 0, s>>>(W, x, y, rows);
-    else k_gemv_f32<T, 1><<<(rows + 7) / 8, 256, 0, s>>>(W, x, y, rows);
+    if (rows <= 160) k_gemv_f32<T, 4, BF16><<<rows, 128, 0, s>>>(W, x, y, rows);
+    else k_gemv_f32<T, 1, BF16><<<(rows + 7) / 8, 256, 0, s>>>(W, x, y, rows);
 }
 }  // namespace
 
-void gemv_f32(const float* W, const float* x, float* y, int rows, int n, int T, void* st) {
+void gemv_f32(const float* W, const float* x, float* y, int rows, int n, int T, void* st, const uint16_t* packed) {
     if (n != N) throw std::runtime_error("gemv_f32: rows of N columns only");
     cudaStream_t s = (cudaStream_t) st;
     switch (T) {
-        case 1: gemv_f32_t<1>(W, x, y, rows, s); break;
-        case 2: gemv_f32_t<2>(W, x, y, rows, s); break;
-        case 3: gemv_f32_t<3>(W, x, y, rows, s); break;
-        case 4: gemv_f32_t<4>(W, x, y, rows, s); break;
-        case 5: gemv_f32_t<5>(W, x, y, rows, s); break;
-        case 6: gemv_f32_t<6>(W, x, y, rows, s); break;
-        case 7: gemv_f32_t<7>(W, x, y, rows, s); break;
-        case 8: gemv_f32_t<8>(W, x, y, rows, s); break;
-        case 9: gemv_f32_t<9>(W, x, y, rows, s); break;
-        case 10: gemv_f32_t<10>(W, x, y, rows, s); break;
-        case 11: gemv_f32_t<11>(W, x, y, rows, s); break;
-        case 12: gemv_f32_t<12>(W, x, y, rows, s); break;
-        case 13: gemv_f32_t<13>(W, x, y, rows, s); break;
-        case 14: gemv_f32_t<14>(W, x, y, rows, s); break;
-        case 15: gemv_f32_t<15>(W, x, y, rows, s); break;
-        case 16: gemv_f32_t<16>(W, x, y, rows, s); break;
+        case 1: if (packed) gemv_f32_t<1, true>(packed, x, y, rows, s); else gemv_f32_t<1, false>(W, x, y, rows, s); break;
+        case 2: if (packed) gemv_f32_t<2, true>(packed, x, y, rows, s); else gemv_f32_t<2, false>(W, x, y, rows, s); break;
+        case 3: if (packed) gemv_f32_t<3, true>(packed, x, y, rows, s); else gemv_f32_t<3, false>(W, x, y, rows, s); break;
+        case 4: if (packed) gemv_f32_t<4, true>(packed, x, y, rows, s); else gemv_f32_t<4, false>(W, x, y, rows, s); break;
+        case 5: if (packed) gemv_f32_t<5, true>(packed, x, y, rows, s); else gemv_f32_t<5, false>(W, x, y, rows, s); break;
+        case 6: if (packed) gemv_f32_t<6, true>(packed, x, y, rows, s); else gemv_f32_t<6, false>(W, x, y, rows, s); break;
+        case 7: if (packed) gemv_f32_t<7, true>(packed, x, y, rows, s); else gemv_f32_t<7, false>(W, x, y, rows, s); break;
+        case 8: if (packed) gemv_f32_t<8, true>(packed, x, y, rows, s); else gemv_f32_t<8, false>(W, x, y, rows, s); break;
+        case 9: if (packed) gemv_f32_t<9, true>(packed, x, y, rows, s); else gemv_f32_t<9, false>(W, x, y, rows, s); break;
+        case 10: if (packed) gemv_f32_t<10, true>(packed, x, y, rows, s); else gemv_f32_t<10, false>(W, x, y, rows, s); break;
+        case 11: if (packed) gemv_f32_t<11, true>(packed, x, y, rows, s); else gemv_f32_t<11, false>(W, x, y, rows, s); break;
+        case 12: if (packed) gemv_f32_t<12, true>(packed, x, y, rows, s); else gemv_f32_t<12, false>(W, x, y, rows, s); break;
+        case 13: if (packed) gemv_f32_t<13, true>(packed, x, y, rows, s); else gemv_f32_t<13, false>(W, x, y, rows, s); break;
+        case 14: if (packed) gemv_f32_t<14, true>(packed, x, y, rows, s); else gemv_f32_t<14, false>(W, x, y, rows, s); break;
+        case 15: if (packed) gemv_f32_t<15, true>(packed, x, y, rows, s); else gemv_f32_t<15, false>(W, x, y, rows, s); break;
+        case 16: if (packed) gemv_f32_t<16, true>(packed, x, y, rows, s); else gemv_f32_t<16, false>(W, x, y, rows, s); break;
         default: throw std::runtime_error("gemv_f32: T out of range");
     }
     ck_launch("gemv_f32");
@@ -1981,6 +1982,7 @@ __global__ void k_arena_slots(ExpertCache ec, int from, int to) {
         }
         ec.owner[s] = -1;
         ec.ref[s] = lend ? 3 : 0;
+        if (ec.age) ec.age[s] = 0;
     }
     if (blockIdx.x == 0 && threadIdx.x == 0) {
         ec.lent[p] = to;
@@ -2210,7 +2212,7 @@ namespace fnx {
 #if FNX_KPART == 8
 void router_route(const float* W, const float* x, float* logits, int T, int* topi, float* topw, Job* jobs_gu, Job* jobs_dn,
                   int* njobs, void* st, const ExpertCache* ec, int layer, int* list, const Q8S* sh_gu, int sh_rows, const void* sh_y,
-                  float* sh_out) {
+                  float* sh_out, const uint16_t* packed) {
     cudaStream_t s = (cudaStream_t) st;
     ShexpUp su;
     if (sh_gu) {
@@ -2227,7 +2229,10 @@ void router_route(const float* W, const float* x, float* logits, int T, int* top
     unsigned* counter = (unsigned*) (njobs + 1);
     const ExpertCache none{};
     if (ec && (layer < 0 || layer >= NL || !list)) throw std::runtime_error("router_route: a cache plan needs its layer and list");
-#define FNX_RR(t) k_router_route<t><<<grid, RR_THREADS, 0, s>>>(W, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su)
+#define FNX_RR(t) do { \
+    if (packed) k_router_route<t, true><<<grid, RR_THREADS, 0, s>>>(packed, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su); \
+    else k_router_route<t, false><<<grid, RR_THREADS, 0, s>>>(W, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su); \
+} while (0)
     switch (T) {
         case 1: FNX_RR(1); break;
         case 2: FNX_RR(2); break;
@@ -2525,7 +2530,8 @@ void q8s_gemv_f32(const Q8S& w, int rows, int cols, const void* y, float* out, c
     if (rows >= 8192) q8s_ab_launch<4>(g, rows, cols, yq, W, x, yf, rf, T, s);
     else q8s_ab_launch<2>(g, rows, cols, yq, W, x, yf, rf, T, s);
 #else
-    if (rows < 4096 || rows >= 8192) throw std::runtime_error("q8s_gemv_f32: compiled for 4096..8191 rows (qkvz)");
+    if (rows < 4096 || (rows >= 8192 && env_int("FNX_Q8S_ROW_GROUP", 0) != 2))
+        throw std::runtime_error("q8s_gemv_f32: requires rows >= 4096 and FNX_Q8S_ROW_GROUP=2 for rows >= 8192");
     q8s_ab_launch<2>(g, rows, cols, yq, W, x, yf, rf, T, s);
 #endif
     ck_launch("q8s_gemv_f32");

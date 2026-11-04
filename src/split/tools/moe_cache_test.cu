@@ -17,7 +17,7 @@ __global__ void read_cached(ExpertCache ec, int layer, const Job* jobs, const in
         out[j * stride + i] = i < gu_bytes ? ec.ep_gu[g][i] : ec.ep_dn[g][i - gu_bytes];
 }
 
-void run_cache(int dev, int slots, int pattern, bool coherent, int groups = 1, bool shared_kv = false, int pool_hint = -1) {
+void run_cache(int dev, int slots, int pattern, bool coherent, int groups = 1, bool shared_kv = false, int pool_hint = -1, int max_age = 1) {
     constexpr int layers = 4, experts = layers * NEXP, capacity = MAXT * TOPK;
     constexpr size_t gu_max = 448, dn_max = 224, stride = gu_max + dn_max, guard = 256;
     std::vector<StaticCacheShape> shapes;
@@ -69,6 +69,8 @@ void run_cache(int dev, int slots, int pattern, bool coherent, int groups = 1, b
     ck(cudaMemcpy(ec.slot_of, places.data(), experts * sizeof(int), cudaMemcpyHostToDevice), "places");
     ck(cudaMemcpy(ec.owner, owners.data(), slots * sizeof(int), cudaMemcpyHostToDevice), "owners");
     ec.ref = (unsigned char*) alloc(slots);
+    ec.max_age = max_age;
+    if (max_age > 1) { ec.age = (unsigned char*) alloc(slots); ck(cudaMemset(ec.age, 0, slots), "age reset"); }
     ec.hand = (int*) alloc(EC_POOLS * sizeof(int));
     ec.lent = (int*) alloc(EC_POOLS * sizeof(int));
     std::vector<char*> pools;
@@ -106,11 +108,21 @@ void run_cache(int dev, int slots, int pattern, bool coherent, int groups = 1, b
     std::vector<unsigned char> got(capacity * stride + guard), expected(got.size()), guards(guard * 2);
     std::vector<int> now(experts), owner(slots);
     std::vector<const char*> ep_gu(experts), ep_dn(experts), backing(experts);
+    std::vector<int> oracle_slot = places, oracle_owner = owners;
+    std::vector<unsigned char> oracle_ref(slots, 0), oracle_age(slots, 0), got_ref(slots), got_age(slots);
+    std::vector<int> oracle_hand(ec.s0, ec.s0 + EC_POOLS), got_hand(EC_POOLS);
     int lent = 0;
     for (int rep = 0; rep < 64; ++rep) {
         if (shared_kv) {
             const int sizes[] = {0, plan.extra_slots, plan.extra_slots / 2, 1, plan.extra_slots, 0};
             const int next = sizes[rep % 6];
+            const int p = ec.arena_pool, s0 = ec.s0[p];
+            for (int i = std::min(lent, next); i < std::max(lent, next); ++i) {
+                const int slot = s0 + i, old = oracle_owner[slot];
+                if (old >= 0) oracle_slot[old] = -1;
+                oracle_owner[slot] = -1; oracle_ref[slot] = next > lent ? 3 : 0; oracle_age[slot] = 0;
+            }
+            if (oracle_hand[p] < s0 + next) oracle_hand[p] = s0 + next;
             arena_slots(ec, lent, next, stream);
             lent = next;
             // K/V may overwrite every byte of a lent slot. Neither direct launches
@@ -127,6 +139,35 @@ void run_cache(int dev, int slots, int pattern, bool coherent, int groups = 1, b
             std::memcpy(expected.data() + j * (gb + db), host + g * stride, gb);
             std::memcpy(expected.data() + j * (gb + db) + gb, host + g * stride + gu_max, db);
         }
+        // Sequential CLOCK oracle: same hit pinning and job-order insertion as the GPU warp.
+        const int cp = ec.pool_of[layer], start = ec.s0[cp] + (cp == ec.arena_pool ? lent : 0);
+        const int size = ec.n[cp] - (cp == ec.arena_pool ? lent : 0);
+        int hand = oracle_hand[cp] - start;
+        if (hand < 0 || hand >= size) hand = 0;
+        for (int j = 0; j < n; ++j) {
+            const int slot = oracle_slot[layer * NEXP + js[j].w];
+            if (slot >= 0) { oracle_ref[slot] = 2; oracle_age[slot] = std::min(max_age, (int) oracle_age[slot] + 1); }
+        }
+        for (int j = 0; j < n; ++j) {
+            const int expert = layer * NEXP + js[j].w;
+            if (oracle_slot[expert] != -1) continue;
+            int slot;
+            for (;;) {
+                slot = start + hand; hand = (hand + 1) % size;
+                if (oracle_ref[slot] == 0) break;
+                if (oracle_ref[slot] == 1) {
+                    if (oracle_age[slot] > 1) --oracle_age[slot];
+                    else { oracle_ref[slot] = 0; oracle_age[slot] = 0; }
+                }
+            }
+            if (oracle_owner[slot] >= 0) oracle_slot[oracle_owner[slot]] = -1;
+            oracle_owner[slot] = expert; oracle_slot[expert] = slot; oracle_ref[slot] = 2; oracle_age[slot] = 1;
+        }
+        for (int j = 0; j < n; ++j) {
+            const int slot = oracle_slot[layer * NEXP + js[j].w];
+            if (slot >= 0) oracle_ref[slot] = 1;
+        }
+        oracle_hand[cp] = start + hand;
         ck(cudaMemcpyAsync(jobs, js.data(), js.size() * sizeof(Job), cudaMemcpyHostToDevice, stream), "jobs");
         ck(cudaMemcpyAsync(count, &n, sizeof n, cudaMemcpyHostToDevice, stream), "count");
         ck(cudaMemsetAsync(out, 0xA5, got.size(), stream), "output guard");
@@ -151,6 +192,14 @@ void run_cache(int dev, int slots, int pattern, bool coherent, int groups = 1, b
         }
         ck(cudaMemcpy(now.data(), ec.slot_of, experts * sizeof(int), cudaMemcpyDeviceToHost), "read places");
         ck(cudaMemcpy(owner.data(), ec.owner, slots * sizeof(int), cudaMemcpyDeviceToHost), "read owners");
+        ck(cudaMemcpy(got_ref.data(), ec.ref, slots, cudaMemcpyDeviceToHost), "read refs");
+        ck(cudaMemcpy(got_hand.data(), ec.hand, EC_POOLS * sizeof(int), cudaMemcpyDeviceToHost), "read hands");
+        if (now != oracle_slot || owner != oracle_owner || got_ref != oracle_ref || got_hand != oracle_hand)
+            throw std::runtime_error("CLOCK policy differs from sequential oracle");
+        if (ec.age) {
+            ck(cudaMemcpy(got_age.data(), ec.age, slots, cudaMemcpyDeviceToHost), "read ages");
+            if (got_age != oracle_age) throw std::runtime_error("CLOCK age differs from sequential oracle");
+        }
         ck(cudaMemcpy(ep_gu.data(), ec.ep_gu, experts * sizeof(char*), cudaMemcpyDeviceToHost), "read gate/up table");
         ck(cudaMemcpy(ep_dn.data(), ec.ep_dn, experts * sizeof(char*), cudaMemcpyDeviceToHost), "read down table");
         for (int g = 0; g < experts; ++g) {
@@ -172,23 +221,23 @@ void run_cache(int dev, int slots, int pattern, bool coherent, int groups = 1, b
     cudaStreamDestroy(stream);
     for (void* p : device) cudaFree(p);
     cudaFreeHost(host);
-    std::cout << "card " << dev << " slots " << slots << " pools " << ec.n_pools << " pattern " << pattern << " coherent " << coherent << " shared K/V " << shared_kv << ": 64 checks passed\n";
+    std::cout << "card " << dev << " slots " << slots << " pools " << ec.n_pools << " pattern " << pattern << " coherent " << coherent << " max age " << max_age << " shared K/V " << shared_kv << ": 64 checks passed\n";
 }
 } // namespace fnx
 
 int main() {
     int cards = 0; fnx::ck(cudaGetDeviceCount(&cards), "devices");
     if (cards < 2) throw std::runtime_error("two physical devices required");
-    for (int dev = 0; dev < 2; ++dev) {
+    for (int max_age : {1, 2, 4}) for (int dev = 0; dev < 2; ++dev) {
         fnx::ck(cudaSetDevice(dev), "device");
         for (int slots : {160, 256, 1024}) for (int pattern : {0, 1, 2}) for (bool coherent : {false, true})
-            fnx::run_cache(dev, slots, pattern, coherent);
+            fnx::run_cache(dev, slots, pattern, coherent, 1, false, -1, max_age);
         for (int slots : {352, 1024}) for (int pattern : {0, 1, 2}) for (bool coherent : {false, true})
-            fnx::run_cache(dev, slots, pattern, coherent, 2);
+            fnx::run_cache(dev, slots, pattern, coherent, 2, false, -1, max_age);
         for (int groups : {1, 2}) for (int pattern : {0, 1, 2}) for (bool coherent : {false, true})
-            fnx::run_cache(dev, 352, pattern, coherent, groups, true);
+            fnx::run_cache(dev, 352, pattern, coherent, groups, true, -1, max_age);
         for (int pattern : {0, 1, 2}) for (bool coherent : {false, true})
-            fnx::run_cache(dev, 352, pattern, coherent, 2, true, 1);
+            fnx::run_cache(dev, 352, pattern, coherent, 2, true, 1, max_age);
     }
-    std::cout << "Static decode cache: 6144 exact direct/graph checks passed (2304 with K/V lending)\n";
+    std::cout << "Static decode cache: 18432 exact direct/graph/policy checks passed (6912 with K/V lending)\n";
 }

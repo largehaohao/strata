@@ -54,7 +54,7 @@ void mtp_head_gemv(const DW& W, const void* y, float* out, int mode, void* st);
 // out[t][r] = W[r] . y[t] for t < T: W in the split Q8_0 layout [rows][cols], y q8_1 rows of cols
 void q8s_gemv(const Q8S& w, int rows, int cols, const void* y, float* out, int out_stride, int T, void* st);
 // y[t][r] = W[r] . x[t] (f32 weights [rows][n], f32 x)
-void gemv_f32(const float* W, const float* x, float* y, int rows, int n, int T, void* st);
+void gemv_f32(const float* W, const float* x, float* y, int rows, int n, int T, void* st, const uint16_t* packed = nullptr);
 
 // the hyper-connection read (build_hc_mix) with the previous half's write folded in when bo_prev is not null:
 // R' = R + bo_prev * 2 sigmoid(inj_prev / HC); R <- R'; mixed = mean_c xn_c * sigmoid(up . silu(down . xn / HC));
@@ -296,7 +296,7 @@ void ple_post(float* R, const float* key, const float* value, const float* nk, c
 // sh_gu (rows sh_rows < 4096): the shared expert's gate|up over the q8_1 rows sh_y into sh_out, in the same launch
 void router_route(const float* W, const float* x, float* logits, int T, int* topi, float* topw, Job* jobs_gu, Job* jobs_dn,
                   int* njobs, void* st, const ExpertCache* ec = nullptr, int layer = -1, int* list = nullptr, const Q8S* sh_gu = nullptr,
-                  int sh_rows = 0, const void* sh_y = nullptr, float* sh_out = nullptr);
+                  int sh_rows = 0, const void* sh_y = nullptr, float* sh_out = nullptr, const uint16_t* packed = nullptr);
 // Down weights to fill beside IQ gate/up arithmetic. The preceding cache plan
 // must complete first; GU is already resident or filled by CacheGateUpCopy below.
 // The list/slots stay fixed until this launch finishes. Bytes and offsets are
@@ -413,7 +413,7 @@ void l2_prefetch(const void* p, size_t bytes, void* st);
 void q8s_gemv_segs(const Q8S* w, const int* rows, float* const* out, const int* out_stride, int n, int cols, const void* y, int T,
                    void* st);
 // q8s_gemv(w, rows, cols, y, out, rows) and gemv_f32(W, x, yf, rf <= 160, N) in one launch, the same values; rows
-// 4096..8191 only (q8s_gemv_segs: 8192 rows and more in all)
+// 4096..8191 normally; larger Flash-Next matrices require FNX_Q8S_ROW_GROUP=2.
 void q8s_gemv_f32(const Q8S& w, int rows, int cols, const void* y, float* out, const float* W, const float* x, float* yf, int rf, int T,
                   void* st);
 
