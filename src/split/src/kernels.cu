@@ -1397,19 +1397,31 @@ void qsa_index(const float* y, const float* qn, const float* kn, uint16_t* ring,
     ck_launch("qsa_index");
 }
 
+static void qsa_select_positions(const float* scores, int* cells, int* n_cells, int max_pools, const int* pos0,
+                                 LaneRows lr, int T, int stride, int card, cudaStream_t s) {
+    if (!attn_head_split()) {
+        k_idx_select<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, card, lr);
+        return;
+    }
+#if FNX_HIP && FNX_NCARD == 2 && !FNX_27B
+    static const bool paired = env_flag("FNX_QSA_PAIRED");
+    if (paired && max_pools <= QSA_PAIR_MAX_POOLS) {
+        k_idx_select_pair<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, stride, lr);
+        return;
+    }
+#endif
+    for (int partition = 0; partition < 2; ++partition)
+        k_idx_select<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells + (size_t) partition * stride * QSA_MAXSEL,
+            n_cells + partition * stride, max_pools, pos0, partition, lr);
+}
+
 void qsa_select(const float* q, const uint16_t* pooled, const KvPages& g, float* scores, int* cells, int* n_cells, int max_pools, const int* pos0, int T,
                 int card, void* st, int selection_stride) {
     cudaStream_t s = (cudaStream_t) st;
     const __half* pl = reinterpret_cast<const __half*>(pooled);
     k_idx_score_tc<<<dim3((max_pools + QSC_KEYS - 1) / QSC_KEYS, (T + QSC_ROWS - 1) / QSC_ROWS), 256, 0, s>>>(q, pl, g, scores, max_pools,
                                                                                                          pos0, T);
-    if (attn_head_split()) {
-        const int stride = selection_stride ? selection_stride : T;
-        for (int partition = 0; partition < 2; ++partition)
-            k_idx_select<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells + (size_t) partition * stride * QSA_MAXSEL,
-                n_cells + partition * stride, max_pools, pos0, partition, LaneRows{});
-    } else
-        k_idx_select<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, card, LaneRows{});
+    qsa_select_positions(scores, cells, n_cells, max_pools, pos0, {}, T, selection_stride ? selection_stride : T, card, s);
     ck_launch("qsa_select");
 }
 
@@ -1425,12 +1437,7 @@ void qsa_select_lanes(const float* q, const uint16_t* pooled, const KvPages& g, 
     }
     const __half* pl = reinterpret_cast<const __half*>(pooled);
     k_idx_score<<<dim3((max_pools + 255) / 256, T), 256, 0, s>>>(q, pl, g, scores, max_pools, nullptr, lr);
-    if (attn_head_split()) {
-        for (int partition = 0; partition < 2; ++partition)
-            k_idx_select<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells + (size_t) partition * T * QSA_MAXSEL,
-                n_cells + partition * T, max_pools, nullptr, partition, lr);
-    } else
-        k_idx_select<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, nullptr, card, lr);
+    qsa_select_positions(scores, cells, n_cells, max_pools, nullptr, lr, T, T, card, s);
     ck_launch("qsa_select_lanes");
 }
 int qsa_rows() { return QSA_ROWS; }
@@ -1479,13 +1486,7 @@ void qsa(const uint16_t* wq, const uint16_t* wk, const float* x, float* y, const
         return;
     }
     k_idx_score<<<dim3((max_pools + 255) / 256, T), 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, LaneRows{});
-    if (attn_head_split()) {
-        const int stride = T;
-        for (int partition = 0; partition < 2; ++partition)
-            k_idx_select<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells + (size_t) partition * stride * QSA_MAXSEL,
-                n_cells + partition * stride, max_pools, pos0, partition, LaneRows{});
-    } else
-        k_idx_select<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, card, LaneRows{});
+    qsa_select_positions(scores, cells, n_cells, max_pools, pos0, {}, T, T, card, s);
     ck_launch("qsa");
 }
 
