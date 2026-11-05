@@ -31,6 +31,10 @@ bool strata_pf_gemm_narrow_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t
 // for HC down at 16..63 prompt rows; returns false for unsupported shapes.
 bool strata_pf_hcdown_gsu3_f16(const uint16_t* x, const uint16_t* w, float* y, int rows, int n, int k, int ldy,
                               void* stream = nullptr);
+// Small-row GDN, attention and shared-expert projections using the same
+// three-part FP32 order. Other matrix shapes fall back to the caller.
+bool strata_pf_wide_gsu3_f16(const uint16_t* x, const uint16_t* w, float* y, int rows, int n, int k, int ldy,
+                            void* stream = nullptr);
 /// The same with row strides ldx >= K and ldw >= K (multiples of 8): a 4 KB-multiple row stride (K 2048 / 4096 /
 /// 6144) camps on the memory channels, K + 64 does not (S23 gemm_probe7/8: K 6144 19 -> 35 TFLOPS).
 /// S23 (STRATA_PF_HCDOWN=1): lo[t, n] = sum_k X[t, k] Wd[n, k] (n < nd) and inj[t, n] = sum_k X[t, k] Wi[n, k]

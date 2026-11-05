@@ -356,9 +356,13 @@ void pf_gemm(Engine::Pf& p, const __half* W, int rows, int cols, const __half* X
     }
 #if FNX_HIP
     static const bool hc_gsu3 = env_flag("FNX_PF_HC_DOWN_GSU3");
-    if (hc_gsu3 && p.native_gemm && !p.f16acc && C < 64 &&
-        strata_pf_hcdown_gsu3_f16(reinterpret_cast<const uint16_t*>(X), reinterpret_cast<const uint16_t*>(W),
-                                  out, C, rows, cols, ldo, s)) return;
+    static const bool wide_gsu3 = env_flag("FNX_PF_WIDE_GSU3");
+    if (p.native_gemm && !p.f16acc && C < 64) {
+        const auto* x16 = reinterpret_cast<const uint16_t*>(X);
+        const auto* w16 = reinterpret_cast<const uint16_t*>(W);
+        if (hc_gsu3 && strata_pf_hcdown_gsu3_f16(x16, w16, out, C, rows, cols, ldo, s)) return;
+        if (wide_gsu3 && strata_pf_wide_gsu3_f16(x16, w16, out, C, rows, cols, ldo, s)) return;
+    }
     if (p.native_gemm && strata_pf_gemm_f16(reinterpret_cast<const uint16_t*>(X), reinterpret_cast<const uint16_t*>(W),
                                            out, C, rows, cols, ldo, 0.0f, s)) return;
     if (p.native_gemm && strata_pf_gemm_narrow_f16(reinterpret_cast<const uint16_t*>(X), reinterpret_cast<const uint16_t*>(W),

@@ -152,8 +152,10 @@ static void check_case(Shape s, int mode, hipStream_t stream, hipblasHandle_t bl
 // The original head projection zero-fills a full-model slice, runs GEMM with
 // that output stride, then gathers the local heads. Compare its actual slice
 // boundaries against compact products, including a shard crossing a slice.
-static int check_hc_gsu3(hipStream_t stream, hipblasHandle_t blas) {
-    constexpr int k = 10240, n = 320, max_t = 63, max_ld = n + 9;
+static int check_gsu3(int n, int k, hipStream_t stream, hipblasHandle_t blas) {
+    constexpr int max_t = 63;
+    const int max_ld = n + 9;
+    const auto dispatch = n == 320 ? strata_pf_hcdown_gsu3_f16 : strata_pf_wide_gsu3_f16;
     Buffer x((size_t)max_t * k * 2), w((size_t)n * k * 2), y(((size_t)max_t * max_ld + 17) * 4);
     std::vector<__half> hx((size_t)max_t * k), hw((size_t)n * k);
     std::mt19937 rng(597);
@@ -177,24 +179,24 @@ static int check_hc_gsu3(hipStream_t stream, hipblasHandle_t blas) {
                 x.p, HIPBLAS_R_16F, k, &zero, y.p, HIPBLAS_R_32F, ld, HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT));
             ck(hipMemcpyAsync(reference.data(), y.p, size*4, hipMemcpyDeviceToHost, stream));
             ck(hipMemsetAsync(y.p, 0xa5, size*4, stream));
-            if (!strata_pf_hcdown_gsu3_f16((uint16_t*)x.p, (uint16_t*)w.p, (float*)y.p, t, n, k, ld, stream))
-                throw std::runtime_error("HC GSU3 dispatch");
+            if (!dispatch((uint16_t*)x.p, (uint16_t*)w.p, (float*)y.p, t, n, k, ld, stream))
+                throw std::runtime_error("GSU3 dispatch");
             ck(hipMemcpyAsync(actual.data(), y.p, size*4, hipMemcpyDeviceToHost, stream));
             ck(hipStreamSynchronize(stream));
             for (size_t i=0; i<size; ++i) {
                 const bool padding = i >= (size_t)t*ld || i%ld >= n;
                 if (actual[i] != reference[i] || (padding && actual[i] != 0xa5a5a5a5u)) {
-                    std::fprintf(stderr, "HC GSU3 mismatch at T=%d ld=%d cell=%zu mixed=%d ref=%08x actual=%08x\n",
-                                 t, ld, i, mixed_magnitudes, reference[i], actual[i]);
-                    throw std::runtime_error("HC GSU3 FP32 equality or padding");
+                    std::fprintf(stderr, "GSU3 mismatch at T=%d N=%d K=%d ld=%d cell=%zu mixed=%d ref=%08x actual=%08x\n",
+                                 t, n, k, ld, i, mixed_magnitudes, reference[i], actual[i]);
+                    throw std::runtime_error("GSU3 FP32 equality or padding");
                 }
             }
             ++checks;
         }
     }
     for (const Shape s : {Shape{15,n,k,0}, {64,n,k,0}, {19,n-1,k,0}, {19,n,k-16,0}, {19,n,k,-1}}) {
-        if (strata_pf_hcdown_gsu3_f16((uint16_t*)x.p,(uint16_t*)w.p,(float*)y.p,s.t,s.n,s.k,s.n+s.pad,stream))
-            throw std::runtime_error("unsupported HC GSU3 shape accepted");
+        if (dispatch((uint16_t*)x.p,(uint16_t*)w.p,(float*)y.p,s.t,s.n,s.k,s.n+s.pad,stream))
+            throw std::runtime_error("unsupported GSU3 shape accepted");
         ++checks;
     }
     return checks;
@@ -246,7 +248,11 @@ int main() {
             if(!strata_pf_padded_gemm_available()) throw std::runtime_error("gfx11 required");
             hipStream_t stream;ck(hipStreamCreate(&stream));hipblasHandle_t blas;cb(hipblasCreate(&blas));cb(hipblasSetStream(blas,stream));
             if (const char* exact = std::getenv("FNX_PF_HC_DOWN_GSU3"); exact && !std::strcmp(exact, "1"))
-                cases += check_hc_gsu3(stream, blas);
+                cases += check_gsu3(320, 10240, stream, blas);
+            if (const char* wide = std::getenv("FNX_PF_WIDE_GSU3"); wide && !std::strcmp(wide, "1")) {
+                for (int n : {512, 640, 1664, 5760, 6528}) cases += check_gsu3(n, 2560, stream, blas);
+                cases += check_gsu3(2560, 3072, stream, blas);
+            }
             const Shape shapes[]={{64,512,32,0},{65,513,96,13},{129,1031,68*32,7},
                 {256,2560,320,0},{1024,640,2560,0},{4096,2560,6144,0},{1100,10240,320,0},{64,512,10240,0},
                 {65,319,64,5},{65,320,64,7},{64,320,10240,0},{113,320,10240,9},{353,320,10240,0},

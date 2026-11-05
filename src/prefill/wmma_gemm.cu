@@ -356,19 +356,19 @@ __global__ void __launch_bounds__(128) kernel_hc_down_increment(const _Float16* 
 #endif
 }
 
-// rocBLAS 5.2 on gfx1100 uses three FP32 accumulators for this small HC
-// projection. Within each 128-column tile it rotates the 16-element segments
-// along K. The three waves below follow that order and share one output tile.
-__global__ void __launch_bounds__(96) kernel_hc_down_gsu3(const _Float16* __restrict__ x, const _Float16* __restrict__ w,
-                                                          float* __restrict__ y, int rows, int ldy) {
-    constexpr int k = 10240, segments = k / 16;
+// rocBLAS 5.2 on gfx1100 uses three FP32 accumulators for these small-row
+// projections. Each 128-column tile rotates its 16-element segments along K.
+template<int k, int stagger_mask>
+__global__ void __launch_bounds__(96) kernel_gsu3(const _Float16* __restrict__ x, const _Float16* __restrict__ w,
+                                                  float* __restrict__ y, int rows, int ldy) {
+    constexpr int segments = k / 16;
     const int group = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int row = blockIdx.y * 4 + lane / 8, col = blockIdx.x * 8 + lane % 8;
     __shared__ float partial[3][32];
     float sum = 0.f;
     if (row < rows) {
         const int count = (segments + 2 - group) / 3;
-        const int start = (col / 128) * 8;
+        const int start = ((col / 128) & stagger_mask) * 8;
         for (int pass = 0; pass < 2; ++pass) {
             const int begin = pass == 0 ? start : 0, end = pass == 0 ? count : start;
             for (int step = begin; step < end; ++step) {
@@ -1145,13 +1145,25 @@ bool strata_pf_gemm_narrow_f16(const uint16_t* X, const uint16_t* W, float* Y, i
     return strata_pf_gemm_narrow_f16_ld(X, K, W, K, Y, T, N, K, ldy, stream);
 }
 
-bool strata_pf_hcdown_gsu3_f16(const uint16_t* x, const uint16_t* w, float* y, int rows, int n, int k, int ldy, void* stream) {
-    if (!x || !w || !y || rows < 16 || rows >= 64 || n != 320 || k != 10240 || ldy < n ||
+template<int k, int mask>
+static bool launch_gsu3(const uint16_t* x, const uint16_t* w, float* y, int rows, int n, int ldy, void* stream) {
+    if (!x || !w || !y || rows < 16 || rows >= 64 || ldy < n ||
         ((reinterpret_cast<uintptr_t>(x) | reinterpret_cast<uintptr_t>(w)) & 15) || !strata_wmma_gfx11_device())
         return false;
-    pfg::kernel_hc_down_gsu3<<<dim3(320 / 8, (rows + 3) / 4), 96, 0, static_cast<hipStream_t>(stream)>>>(
+    pfg::kernel_gsu3<k, mask><<<dim3(n / 8, (rows + 3) / 4), 96, 0, static_cast<hipStream_t>(stream)>>>(
         (const _Float16*) x, (const _Float16*) w, y, rows, ldy);
     return hipGetLastError() == hipSuccess;
+}
+
+bool strata_pf_hcdown_gsu3_f16(const uint16_t* x, const uint16_t* w, float* y, int rows, int n, int k, int ldy, void* stream) {
+    return n == 320 && k == 10240 && launch_gsu3<10240, 15>(x, w, y, rows, n, ldy, stream);
+}
+
+bool strata_pf_wide_gsu3_f16(const uint16_t* x, const uint16_t* w, float* y, int rows, int n, int k, int ldy, void* stream) {
+    if (k == 2560 && (n == 512 || n == 640 || n == 1664 || n == 5760 || n == 6528))
+        return launch_gsu3<2560, 3>(x, w, y, rows, n, ldy, stream);
+    if (k == 3072 && n == 2560) return launch_gsu3<3072, 7>(x, w, y, rows, n, ldy, stream);
+    return false;
 }
 
 bool strata_pf_gemm_narrow_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t* W, int64_t ldw, float* Y,
@@ -1221,6 +1233,9 @@ bool strata_pf_gemm_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t* W, in
 #else
 // Non-HIP / Non-GFX11 compilation fallback
 bool strata_pf_hcdown_gsu3_f16(const uint16_t*, const uint16_t*, float*, int, int, int, int, void*) {
+    return false;
+}
+bool strata_pf_wide_gsu3_f16(const uint16_t*, const uint16_t*, float*, int, int, int, int, void*) {
     return false;
 }
 bool strata_pf_hcup_mix_f16(const uint16_t*, const uint16_t*, const float*, const float*, const float*, float*, uint16_t*,
