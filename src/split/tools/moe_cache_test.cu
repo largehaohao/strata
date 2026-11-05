@@ -113,6 +113,31 @@ void run_cache(int dev, int slots, int pattern, bool coherent, int groups = 1, b
     std::vector<int> oracle_hand(ec.s0, ec.s0 + EC_POOLS), got_hand(EC_POOLS);
     int lent = 0;
     for (int rep = 0; rep < 64; ++rep) {
+        if (shared_kv && ec.n_pools == 2 && env_flag("FNX_CACHE_R_TEST")) {
+            ExpertCache residual = ec;
+            const int pool = 1 - ec.arena_pool;
+            residual.arena_pool = pool;
+            const int take = 1 + (rep * 37) % (ec.n[pool] - 1), first = ec.s0[pool];
+            for (int i=0; i<take; ++i) {
+                const int slot=first+i, old=oracle_owner[slot];
+                if (old >= 0) oracle_slot[old]=-1;
+                oracle_owner[slot]=-1;
+                oracle_ref[slot]=0;
+                oracle_age[slot]=0;
+            }
+            oracle_hand[pool]=std::max(oracle_hand[pool], first+take);
+            arena_slots(residual,0,take,stream);
+            std::vector<int> during(EC_POOLS);
+            ck(cudaMemcpyAsync(during.data(),ec.lent,EC_POOLS*sizeof(int),cudaMemcpyDeviceToHost,stream),"residual ownership");
+            ck(cudaStreamSynchronize(stream),"residual borrow");
+            if(during[ec.arena_pool]!=lent || during[pool]!=take) throw std::runtime_error("residual loan changed KV ownership");
+            ck(cudaMemsetAsync(ec.pool[pool],0x6b,(size_t)take*ec.slot_bytes[pool],stream),"overwrite residual scratch");
+            // Return also models cancellation after a partly completed read.
+            arena_slots(residual,take,0,stream);
+            ck(cudaMemcpyAsync(during.data(),ec.lent,EC_POOLS*sizeof(int),cudaMemcpyDeviceToHost,stream),"residual return ownership");
+            ck(cudaStreamSynchronize(stream),"residual return");
+            if(during[ec.arena_pool]!=lent || during[pool]!=0) throw std::runtime_error("residual return changed KV ownership");
+        }
         if (shared_kv) {
             const int sizes[] = {0, plan.extra_slots, plan.extra_slots / 2, 1, plan.extra_slots, 0};
             const int next = sizes[rep % 6];

@@ -312,6 +312,8 @@ struct Engine::Pf {
     // above point at the chunk's while it runs; [0] are those)
     int pass = 1;                     // chunks per pass: FNX_PF_PASS (default 2; 4 with an ExpertCache)
     int borrow_pass = 1;              // optional larger pass backed temporarily by unused KV/cache pages
+    int cache_r_chunks = 0, residual_pool = -1;
+    bool cache_last_addend = false;
     float *Rk[Engine::PF_PASS], *bofk[Engine::PF_PASS], *injfk[Engine::PF_PASS], *boak[Engine::PF_PASS],
         *injak[Engine::PF_PASS];
     int* ctlk[Engine::PF_PASS];
@@ -907,9 +909,29 @@ void Engine::prefill_alloc() {
             p->borrow_pass = borrowed ? (int)borrowed : p->pass;
             if (p->borrow_pass > p->pass && (!static_arena_ || !alias_residual || static_stage != 2))
                 throw std::runtime_error("FNX_PF_BORROW_PASS requires static cache arena, residual aliasing and routed static stages (mode 2)");
+            const long long chunks = env_int("FNX_PF_CACHE_R_CHUNKS", 0);
+            if (chunks < 0 || chunks >= pass || (chunks && (!static_arena_ || !alias_residual || static_stage != 2 || !p->decode_cache)))
+                throw std::runtime_error("FNX_PF_CACHE_R_CHUNKS requires routed static stages and fewer chunks than the base pass");
+            p->cache_r_chunks = (int) chunks;
+            if (chunks) {
+                // The KV-backed pool owns a separate watermark. Borrow a
+                // prefix of a different, contiguous pool and leave a slot for its hand.
+                const size_t bytes = (size_t) chunks * pf_c_ * D * sizeof(float);
+                const auto& cache = b.static_cache;
+                for (int pool = 0; pool < cache.n_pools; ++pool) {
+                    if (pool != cache.arena_pool && cache.pool[pool] && cache.n[pool] > 1 &&
+                        bytes <= (size_t)(cache.n[pool]-1) * cache.slot_bytes[pool]) {
+                        p->residual_pool = pool;
+                        p->cache_last_addend = bytes + (size_t)pf_c_ * N * sizeof(float) <=
+                                               (size_t)(cache.n[pool]-1) * cache.slot_bytes[pool];
+                        break;
+                    }
+                }
+                if (p->residual_pool < 0) throw std::runtime_error("prefill: no independent cache pool fits the residual chunks");
+            }
             for (int k = 1; k < p->borrow_pass; ++k) {
-                p->Rk[k] = k < p->pass ? palloc<float>((size_t) pf_c_ * D) : nullptr;
-                p->bofk[k] = k < p->pass ? palloc<float>((size_t) pf_c_ * N) : nullptr;
+                p->Rk[k] = k < p->pass - p->cache_r_chunks ? palloc<float>((size_t) pf_c_ * D) : nullptr;
+                p->bofk[k] = k < p->pass - (int)p->cache_last_addend ? palloc<float>((size_t) pf_c_ * N) : nullptr;
                 p->injfk[k] = palloc<float>((size_t) pf_c_ * HC);
                 p->ctlk[k] = palloc<int>((size_t) (1 + (pf_c_ / MAXT)) * 2);
                 p->boak[k] = k >= p->pass ? nullptr : alias_residual ? p->bofk[k] : palloc<float>((size_t) pf_c_ * N);
@@ -1156,7 +1178,28 @@ void Engine::prefill(const std::vector<int>& tokens, int after) {
         same_base = same_base && p->pass == base_K;
     }
     bool borrowed = false;
+    std::array<int, NCARD> residual_slots{};
     auto release = [&] {
+        for (int c = 0; c < NCARD; ++c) {
+            if (!residual_slots[c]) continue;
+            auto& p = *pf_[c];
+            auto& b = *cb_[c];
+            ckc(cudaSetDevice(b.dev), "residual cache device");
+            // The caller can cancel between passes. Wait for both streams
+            // before making any of their scratch addresses admissible again.
+            ckc(cudaDeviceSynchronize(), "residual cache users finished");
+            ExpertCache pool = b.static_cache;
+            pool.arena_pool = p.residual_pool;
+            arena_slots(pool, residual_slots[c], 0, b.st);
+            ckc(cudaStreamSynchronize(b.st), "residual cache returned");
+            p.R = p.Rk[0];
+            for (int k = p.pass - p.cache_r_chunks; k < p.pass; ++k) p.Rk[k] = nullptr;
+            if (p.cache_last_addend) {
+                p.bo_a = p.boak[0]; p.bo_f = p.bofk[0];
+                p.boak[p.pass - 1] = p.bofk[p.pass - 1] = nullptr;
+            }
+            residual_slots[c] = 0;
+        }
         if (!borrowed) return;
         release_prefill_arena();
         for (Pf* p : pf_) {
@@ -1167,6 +1210,36 @@ void Engine::prefill(const std::vector<int>& tokens, int after) {
         borrowed=false;
     };
     try {
+        for (int c = 0; c < NCARD; ++c) {
+            auto& p = *pf_[c];
+            if (!p.cache_r_chunks) continue;
+            const int permanent = p.pass - p.cache_r_chunks;
+            const int needed = (int)std::min<size_t>(p.pass, (tokens.size() + pf_c_ - 1) / pf_c_);
+            if (needed <= permanent) continue;
+            auto& b = *cb_[c];
+            ExpertCache pool = b.static_cache;
+            const int index = p.residual_pool;
+            pool.arena_pool = index;
+            const size_t stride = (size_t)pf_c_ * D * sizeof(float);
+            const size_t r_bytes = (needed - permanent) * stride;
+            const bool addend = p.cache_last_addend && needed == p.pass;
+            const size_t bytes = r_bytes + (addend ? (size_t)pf_c_ * N * sizeof(float) : 0);
+            const int slots = (int)((bytes + pool.slot_bytes[index] - 1) / pool.slot_bytes[index]);
+            if (slots >= pool.n[index]) throw std::runtime_error("prefill residual loan exceeds independent cache pool");
+            ckc(cudaSetDevice(b.dev), "residual cache device");
+            ckc(cudaDeviceSynchronize(), "residual cache readers finished");
+            int previous = 0;
+            ckc(cudaMemcpy(&previous, pool.lent + index, sizeof(previous), cudaMemcpyDeviceToHost), "residual cache ownership");
+            if (previous) throw std::runtime_error("prefill residual cache pool already lent");
+            arena_slots(pool, 0, slots, b.st);
+            residual_slots[c] = slots;
+            ckc(cudaStreamSynchronize(b.st), "residual cache invalidated");
+            for (int k = permanent; k < needed; ++k)
+                p.Rk[k] = reinterpret_cast<float*>(pool.pool[index] + (k - permanent) * stride);
+            if (addend) p.bofk[p.pass-1] = p.boak[p.pass-1] = reinterpret_cast<float*>(pool.pool[index] + r_bytes);
+            if (c == 0 && env_flag("FNX_PF_TIMING"))
+                std::fprintf(stderr, "prefill: %d residual chunks in %d slots of independent cache pool %d\n", needed-permanent, slots, index);
+        }
         if (staging && same_base && borrow_K>base_K && tokens.size()>(size_t)base_K*pf_c_ &&
             pos_<=max_ctx_ && tokens.size()<=(size_t)(max_ctx_-pos_)) {
             const size_t bytes=(size_t)(borrow_K-base_K)*pf_c_*(D+N)*sizeof(float);
