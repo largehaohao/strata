@@ -152,6 +152,54 @@ static void check_case(Shape s, int mode, hipStream_t stream, hipblasHandle_t bl
 // The original head projection zero-fills a full-model slice, runs GEMM with
 // that output stride, then gathers the local heads. Compare its actual slice
 // boundaries against compact products, including a shard crossing a slice.
+static int check_hc_gsu3(hipStream_t stream, hipblasHandle_t blas) {
+    constexpr int k = 10240, n = 320, max_t = 63, max_ld = n + 9;
+    Buffer x((size_t)max_t * k * 2), w((size_t)n * k * 2), y(((size_t)max_t * max_ld + 17) * 4);
+    std::vector<__half> hx((size_t)max_t * k), hw((size_t)n * k);
+    std::mt19937 rng(597);
+    std::uniform_real_distribution<float> uniform(-1.f, 1.f);
+    int checks = 0;
+    for (bool mixed_magnitudes : {false, true}) {
+        auto value = [&]() {
+            const float v = uniform(rng);
+            return __float2half(mixed_magnitudes ? std::ldexp(v, (int)(rng() % 33) - 21) : v);
+        };
+        std::generate(hx.begin(), hx.end(), value);
+        std::generate(hw.begin(), hw.end(), value);
+        ck(hipMemcpy(x.p, hx.data(), hx.size()*2, hipMemcpyHostToDevice));
+        ck(hipMemcpy(w.p, hw.data(), hw.size()*2, hipMemcpyHostToDevice));
+        for (int t = 16; t <= max_t; ++t) for (int ld : {n, max_ld}) {
+            const size_t size = (size_t)t * ld + 17;
+            std::vector<uint32_t> reference(size), actual(size);
+            const float one = 1.f, zero = 0.f;
+            ck(hipMemsetAsync(y.p, 0xa5, size*4, stream));
+            cb(hipblasGemmEx(blas, HIPBLAS_OP_T, HIPBLAS_OP_N, n, t, k, &one, w.p, HIPBLAS_R_16F, k,
+                x.p, HIPBLAS_R_16F, k, &zero, y.p, HIPBLAS_R_32F, ld, HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT));
+            ck(hipMemcpyAsync(reference.data(), y.p, size*4, hipMemcpyDeviceToHost, stream));
+            ck(hipMemsetAsync(y.p, 0xa5, size*4, stream));
+            if (!strata_pf_hcdown_gsu3_f16((uint16_t*)x.p, (uint16_t*)w.p, (float*)y.p, t, n, k, ld, stream))
+                throw std::runtime_error("HC GSU3 dispatch");
+            ck(hipMemcpyAsync(actual.data(), y.p, size*4, hipMemcpyDeviceToHost, stream));
+            ck(hipStreamSynchronize(stream));
+            for (size_t i=0; i<size; ++i) {
+                const bool padding = i >= (size_t)t*ld || i%ld >= n;
+                if (actual[i] != reference[i] || (padding && actual[i] != 0xa5a5a5a5u)) {
+                    std::fprintf(stderr, "HC GSU3 mismatch at T=%d ld=%d cell=%zu mixed=%d ref=%08x actual=%08x\n",
+                                 t, ld, i, mixed_magnitudes, reference[i], actual[i]);
+                    throw std::runtime_error("HC GSU3 FP32 equality or padding");
+                }
+            }
+            ++checks;
+        }
+    }
+    for (const Shape s : {Shape{15,n,k,0}, {64,n,k,0}, {19,n-1,k,0}, {19,n,k-16,0}, {19,n,k,-1}}) {
+        if (strata_pf_hcdown_gsu3_f16((uint16_t*)x.p,(uint16_t*)w.p,(float*)y.p,s.t,s.n,s.k,s.n+s.pad,stream))
+            throw std::runtime_error("unsupported HC GSU3 shape accepted");
+        ++checks;
+    }
+    return checks;
+}
+
 static void check_head_shard(int t, int full, int rows, int first, hipStream_t stream) {
     constexpr int k=2560, guard_rows=16;
     const int slice=std::min(full,(16*1024*1024/k/128)*128);
@@ -197,9 +245,12 @@ int main() {
             ck(hipSetDevice(dev));
             if(!strata_pf_padded_gemm_available()) throw std::runtime_error("gfx11 required");
             hipStream_t stream;ck(hipStreamCreate(&stream));hipblasHandle_t blas;cb(hipblasCreate(&blas));cb(hipblasSetStream(blas,stream));
+            if (const char* exact = std::getenv("FNX_PF_HC_DOWN_GSU3"); exact && !std::strcmp(exact, "1"))
+                cases += check_hc_gsu3(stream, blas);
             const Shape shapes[]={{64,512,32,0},{65,513,96,13},{129,1031,68*32,7},
                 {256,2560,320,0},{1024,640,2560,0},{4096,2560,6144,0},{1100,10240,320,0},{64,512,10240,0},
-                {65,319,64,5},{65,320,64,7},{2048,320,10240,0},{4096,320,10240,0}};
+                {65,319,64,5},{65,320,64,7},{64,320,10240,0},{113,320,10240,9},{353,320,10240,0},
+                {512,320,10240,7},{513,320,10240,0},{2048,320,10240,0},{4096,320,10240,0}};
             for(auto s:shapes) for(int mode:{0,1,3,4}) {check_case(s,mode,stream,blas);++cases;}
             for(int t:{64,65,1024,4096,8192})for(int card=0;card<2;++card) {
                 check_head_shard(t,12288,6144,card*6144,stream);++cases;

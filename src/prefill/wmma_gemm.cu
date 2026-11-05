@@ -321,6 +321,71 @@ __device__ __forceinline__ h16 frag(const _Float16* p) {
     const uint32_t w[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
     return __builtin_bit_cast(h16, w);
 }
+
+// HC down has 320 output columns and K=10240. For a cached prompt increment
+// the large prompt tile leaves most CUs idle. One wave per 16x16 output tile
+// preserves the native kernel's sequential FP32 WMMA accumulation along K.
+__global__ void __launch_bounds__(128) kernel_hc_down_increment(const _Float16* __restrict__ x,
+                                                                const _Float16* __restrict__ w,
+                                                                float* __restrict__ y, int rows,
+                                                                int ldx, int ldw, int ldy) {
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__)
+    constexpr int n = 320, k = 10240;
+    const int tile = blockIdx.x * 4 + threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int first_row = tile / (n / 16) * 16;
+    if (first_row >= rows) return;
+    const int col = tile % (n / 16) * 16 + lane % 16;
+    const _Float16* xr = x + (size_t) min(first_row + lane % 16, rows - 1) * ldx;
+    const _Float16* wr = w + (size_t) col * ldw;
+    f8 acc = {};
+    for (int offset = 0; offset < k; offset += 64) {
+        h16 a[4], b[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            a[i] = frag(xr + offset + 16 * i);
+            b[i] = frag(wr + offset + 16 * i);
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a[i], b[i], acc);
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int row = first_row + 2 * i + lane / 16;
+        if (row < rows) y[(size_t) row * ldy + col] = acc[i];
+    }
+#endif
+}
+
+// rocBLAS 5.2 on gfx1100 uses three FP32 accumulators for this small HC
+// projection. Within each 128-column tile it rotates the 16-element segments
+// along K. The three waves below follow that order and share one output tile.
+__global__ void __launch_bounds__(96) kernel_hc_down_gsu3(const _Float16* __restrict__ x, const _Float16* __restrict__ w,
+                                                          float* __restrict__ y, int rows, int ldy) {
+    constexpr int k = 10240, segments = k / 16;
+    const int group = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int row = blockIdx.y * 4 + lane / 8, col = blockIdx.x * 8 + lane % 8;
+    __shared__ float partial[3][32];
+    float sum = 0.f;
+    if (row < rows) {
+        const int count = (segments + 2 - group) / 3;
+        const int start = (col / 128) * 8;
+        for (int pass = 0; pass < 2; ++pass) {
+            const int begin = pass == 0 ? start : 0, end = pass == 0 ? count : start;
+            for (int step = begin; step < end; ++step) {
+                const int offset = 16 * (group + 3 * step);
+                const h16 a = frag(x + (size_t) row * k + offset);
+                const h16 b = frag(w + (size_t) col * k + offset);
+#pragma unroll
+                for (int i = 0; i < 16; ++i) sum = fmaf((float) a[i], (float) b[i], sum);
+            }
+        }
+    }
+    partial[group][lane] = sum;
+    __syncthreads();
+    if (group == 0 && row < rows)
+        y[(size_t) row * ldy + col] = (partial[0][lane] + partial[1][lane]) + partial[2][lane];
+}
+
 template <int BN, int WN>
 __global__ void __launch_bounds__(256) kernel(const _Float16* __restrict__ X, const _Float16* __restrict__ W,
                                               float* __restrict__ Y, int M, int N, int K, int ldy, int accumulate,
@@ -1080,12 +1145,31 @@ bool strata_pf_gemm_narrow_f16(const uint16_t* X, const uint16_t* W, float* Y, i
     return strata_pf_gemm_narrow_f16_ld(X, K, W, K, Y, T, N, K, ldy, stream);
 }
 
+bool strata_pf_hcdown_gsu3_f16(const uint16_t* x, const uint16_t* w, float* y, int rows, int n, int k, int ldy, void* stream) {
+    if (!x || !w || !y || rows < 16 || rows >= 64 || n != 320 || k != 10240 || ldy < n ||
+        ((reinterpret_cast<uintptr_t>(x) | reinterpret_cast<uintptr_t>(w)) & 15) || !strata_wmma_gfx11_device())
+        return false;
+    pfg::kernel_hc_down_gsu3<<<dim3(320 / 8, (rows + 3) / 4), 96, 0, static_cast<hipStream_t>(stream)>>>(
+        (const _Float16*) x, (const _Float16*) w, y, rows, ldy);
+    return hipGetLastError() == hipSuccess;
+}
+
 bool strata_pf_gemm_narrow_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t* W, int64_t ldw, float* Y,
                                   int64_t T, int64_t N, int64_t K, int64_t ldy, void* stream) {
     if (!X || !W || !Y || T < 64 || N < 1 || N >= 512 || K < pfg::BK || K % pfg::BK != 0 || ldy < N ||
         T > (1LL << 30) || K > (1LL << 30) || ldy > (1LL << 30) || ldx < K || ldw < K || ldx % 8 || ldw % 8 ||
         ldx > (1LL << 30) || ldw > (1LL << 30)) return false;
     if (!strata_wmma_gfx11_device()) return false;
+    static const bool hc_increment = [] {
+        const char* v = std::getenv("STRATA_PF_HC_DOWN_INCREMENT");
+        return v && std::strcmp(v, "1") == 0;
+    }();
+    if (hc_increment && T <= 512 && N == 320 && K == 10240) {
+        const unsigned blocks = (unsigned) (((T + 15) / 16) * (N / 16) / 4);
+        pfg::kernel_hc_down_increment<<<blocks, 128, 0, static_cast<hipStream_t>(stream)>>>(
+            (const _Float16*) X, (const _Float16*) W, Y, (int) T, (int) ldx, (int) ldw, (int) ldy);
+        return hipGetLastError() == hipSuccess;
+    }
     const unsigned grid = (unsigned) (((T + pfg::BM - 1) / pfg::BM) * ((N + 127) / 128));
     static const bool bk64 = [] { const char* v = std::getenv("STRATA_PF_NARROW_BK64"); return v && v[0] == '1'; }();
     if (bk64 && K % 64 == 0)
@@ -1136,6 +1220,9 @@ bool strata_pf_gemm_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t* W, in
 
 #else
 // Non-HIP / Non-GFX11 compilation fallback
+bool strata_pf_hcdown_gsu3_f16(const uint16_t*, const uint16_t*, float*, int, int, int, int, void*) {
+    return false;
+}
 bool strata_pf_hcup_mix_f16(const uint16_t*, const uint16_t*, const float*, const float*, const float*, float*, uint16_t*,
                             int64_t, int64_t, int64_t, void*) {
     return false;
