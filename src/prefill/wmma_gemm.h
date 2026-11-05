@@ -35,6 +35,11 @@ bool strata_pf_hcdown_gsu3_f16(const uint16_t* x, const uint16_t* w, float* y, i
 // three-part FP32 order. Other matrix shapes fall back to the caller.
 bool strata_pf_wide_gsu3_f16(const uint16_t* x, const uint16_t* w, float* y, int rows, int n, int k, int ldy,
                             void* stream = nullptr);
+// Split Q8 input weights. Dequantization rounds every weight to FP16 before
+// the same ordered FP32 product. A head shard keeps its original matrix shape
+// and column offset for the reference kernel's stagger along K.
+bool strata_pf_q8_gsu3_f16(const uint16_t* x, const int8_t* q, const uint16_t* d, float* y,
+                           int rows, int n, int k, int ldy, int reference_n, int first_column, void* stream = nullptr);
 /// The same with row strides ldx >= K and ldw >= K (multiples of 8): a 4 KB-multiple row stride (K 2048 / 4096 /
 /// 6144) camps on the memory channels, K + 64 does not (S23 gemm_probe7/8: K 6144 19 -> 35 TFLOPS).
 /// S23 (STRATA_PF_HCDOWN=1): lo[t, n] = sum_k X[t, k] Wd[n, k] (n < nd) and inj[t, n] = sum_k X[t, k] Wi[n, k]

@@ -1407,7 +1407,8 @@ static void qsa_select_positions(const float* scores, int* cells, int* n_cells, 
     static const bool paired = env_flag("FNX_QSA_PAIRED");
     if (paired && max_pools <= QSA_PAIR_MAX_POOLS) {
         static const bool sample = env_flag("FNX_QSA_SAMPLE_PIVOT");
-        if (sample && T <= 16)
+        static const bool prompt_sample = env_flag("FNX_PF_QSA_SAMPLE");
+        if (sample && (T <= 16 || (prompt_sample && stride <= 512)))
             k_idx_select_pair<true><<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, stride, lr);
         else
             k_idx_select_pair<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, stride, lr);

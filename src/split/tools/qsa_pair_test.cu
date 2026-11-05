@@ -4,6 +4,7 @@
 #include <array>
 #include <numeric>
 #include <random>
+#include <string_view>
 
 namespace fnx {
 std::vector<Q8Twin>& q8_twins() { static std::vector<Q8Twin> twins; return twins; }
@@ -48,10 +49,17 @@ void oracle(const float* scores, int pos, int row, int stride, std::vector<int>&
     for (int owner = 0; owner < 2; ++owner) counts[pad + owner * stride + row] = n[owner];
 }
 
-void run(int dev) {
+void run(int dev, bool prefill) {
     ck(cudaSetDevice(dev), "set device");
     Buffers mem;
-    constexpr int max_t = 16, capacity = 2 * (max_t + 3);
+    const int max_t = prefill ? 512 : 16, capacity = 2 * (max_t + 3);
+    const std::vector<int> prompt_rows = {19, 27, 64, 113, 256, 512};
+    std::vector<int> rows(max_t);
+    std::iota(rows.begin(), rows.end(), 1);
+    if (prefill) rows = prompt_rows;
+    const auto patterns = prefill ? std::vector<int>{0, 2, 6} : std::vector<int>{0, 1, 2, 3, 4, 5, 6};
+    const auto starts = prefill ? std::vector<int>{74401, 200257, pools * QSA_POOL - max_t}
+                                : std::vector<int>{0, 2046, 2051, 74401, 200751, pools * QSA_POOL - max_t};
     const size_t cell_size = 2 * pad + (size_t) capacity * QSA_MAXSEL, count_size = 2 * pad + capacity;
     auto* scores = mem.get<float>((size_t) max_t * pools);
     auto* cells = mem.get<int>(cell_size);
@@ -68,7 +76,7 @@ void run(int dev) {
     ck(cudaEventCreate(&end), "event");
     std::vector<float> keys((size_t) max_t * pools);
     int checks = 0;
-    for (int pattern = 0; pattern < 7; ++pattern) {
+    for (int pattern : patterns) {
         std::mt19937 rng(217 + pattern);
         for (size_t i = 0; i < keys.size(); ++i) {
             const unsigned u = rng();
@@ -83,7 +91,7 @@ void run(int dev) {
             }
         }
         ck(cudaMemcpy(scores, keys.data(), keys.size() * sizeof(float), cudaMemcpyHostToDevice), "scores");
-        for (int T = 1; T <= max_t; ++T) for (bool lanes : {false, true}) {
+        for (int T : rows) for (bool lanes : {false, true}) {
             const int stride = T + 3;
             LaneRows lr{};
             lr.pos = lanes ? lane_pos : nullptr;
@@ -106,7 +114,7 @@ void run(int dev) {
             launch(2);
             ck(cudaStreamEndCapture(s, &graph), "end capture");
             ck(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0), "instantiate");
-            for (int start : {0, 2046, 2051, 74401, 200751, pools * QSA_POOL - max_t}) {
+            for (int start : starts) {
                 std::vector<int> positions(T);
                 std::vector<int> expected_cells(cell_size, guard), expected_counts(count_size, guard);
                 for (int t = 0; t < T; ++t) {
@@ -136,7 +144,8 @@ void run(int dev) {
         }
     }
     std::printf("device=%d exact checks=%d\n", dev, checks);
-    for (int p : {74401, 200751}) for (int T : {1, 4, 6, 12, 16}) {
+    const auto timed_rows = prefill ? prompt_rows : std::vector<int>{1, 4, 6, 12, 16};
+    for (int p : {74401, 200257}) for (int T : timed_rows) {
         ck(cudaMemcpy(pos, &p, sizeof(p), cudaMemcpyHostToDevice), "timed position");
         auto timed = [&](int mode) {
             ck(cudaEventRecord(begin, s), "begin");
@@ -169,9 +178,14 @@ void run(int dev) {
 }  // namespace
 }  // namespace fnx
 
-int main() {
+int main(int argc, char** argv) {
+    const bool prefill = argc == 2 && std::string_view(argv[1]) == "--prefill";
+    if (argc != 1 && !prefill) {
+        std::fprintf(stderr, "usage: split_qsa_pair_test [--prefill]\n");
+        return 2;
+    }
     try {
-        for (int device = 0; device < 2; ++device) fnx::run(device);
+        for (int device = 0; device < 2; ++device) fnx::run(device, prefill);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "%s\n", e.what());
         return 1;

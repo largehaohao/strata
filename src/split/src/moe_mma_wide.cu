@@ -12,7 +12,7 @@ template<int TYPE>
 void fused_gate_launch(const MoeW& w, const BigJob* jobs, const int* count, int capacity,
                        const uint16_t* x, uint16_t* h, void* stream) {
     k_moe_mma<TYPE,MM_BM,true><<<dim3(w.nrows/MM_BM,capacity),MM_THREADS,mm_smem<MM_BM>(),(cudaStream_t)stream>>>(
-        w,jobs,count,reinterpret_cast<const __half*>(x),w.ncols,nullptr,reinterpret_cast<__half*>(h));
+        w,jobs,count,reinterpret_cast<const __half*>(x),w.ncols,nullptr,reinterpret_cast<__half*>(h),trim_token_tiles());
 }
 }
 bool moe_gate_up_swiglu_supported(const DW& a) {

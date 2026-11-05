@@ -80,6 +80,23 @@ The latest committed implementation borrows two residual scratch chunks from the
 
 The independent Pi repeat passed both coding tasks. It produced 9115 tokens in 85.42 seconds across 17 requests, with no truncations. The guarded 200579-input, 64-output request previously completed with v27b-matching output and draft counts. A later consecutive 200K check reached the guard's 100°C junction limit and was stopped. After cooling, the same prior V23 binary completed the isolated request with card junction peaks of 93°C and 96°C.
 
-Other screened builds approached each threshold individually. V37 measured 787.12 prefill and 194.72 decode tokens/s. V38 measured 787.71 prefill and 193.84 decode. Neither cleared both targets. The latest clean V23 release binary is strata-split-pi-cache-residual-v23-release, SHA-256 c21a273e451a6f9f4ad631d319efd836e4d56ff9bb50592b45438a4e30629018. The server's optional Pi JSON points to this release build.
+Other screened builds approached each threshold individually. V37 measured 787.12 prefill and 194.72 decode tokens/s. V38 measured 787.71 prefill and 193.84 decode. Neither cleared both targets. The latest clean V23 release binary is strata-split-pi-cache-residual-v23-release, SHA-256 c21a273e451a6f9f4ad631d319efd836e4d56ff9bb50592b45438a4e30629018. This binary was used for the V23 fixed replay.
 
 These measurements leave the 3× prefill and 1.2× decode targets unmet.
+
+
+## V37 release validation
+
+The V37 release build enables sampled QSA for prefill chunks up to 512 rows, fused Q8 weight expansion for ordered FP32 short-row products, and MoE kernels that skip unused token tiles. It reuses the activation storage for the prompt residual, while keeping the validated head projection and cache pool boundaries.
+
+| Fixed Pi replay in tokens/s | V23 | V37 release |
+| --- | ---: | ---: |
+| Small-increment prefill | 750.30 | 784.80 |
+| Decode across 21 requests | 193.95 | 194.59 |
+| Decode on the 17 small follow-ups | 192.14 | 192.71 |
+
+The clean HIP build matched v27b on all 21 requests, including text, reasoning, tool calls, token counts, cache reuse, and draft counts. Both independent Pi coding tasks passed with no truncation. The median of three cold 32K prompts was 4797.9 tokens/s. The guarded 200579-input, 64-output request matched v27b's text and draft counts at 4036.6 prefill and 107.0 decode tokens/s, and the following request passed.
+
+On this machine the release build had about 45 MiB free on each card after warm-up. The single 200K run on V23 measured 4091.8 prefill and 115.0 decode tokens/s.
+
+The optional Pi JSON uses strata-split-pi-prefill-select-v37-release with SHA-256 0dcc38354b2efc5005f0d5dd876f4687cddd1cfd6b324fcd80b679cfe580f987. The original launcher reads this JSON and uses the existing thermal guard.

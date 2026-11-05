@@ -243,6 +243,7 @@ constexpr int ATT_FLAG_ROWS = NCARD - 1 > 2 ? NCARD - 1 : 2;
 struct Engine::Pf {
     cublasHandle_t blas = nullptr;
     bool native_gemm = false;         // FNX_PF_GEMM=1: native RDNA3 WMMA, FP32 accumulation/output
+    bool q8_gsu3 = false;
     bool hc_streams = false;          // FNX_PF_HC_STREAMS=1: reduce all HC stream norms together
     bool hc_up_fused = false;         // FNX_PF_HC_UP_FUSED=1: large HC up products mix before the VRAM store
     bool compact_heads = false;       // native WMMA keeps its reduction order when missing heads are omitted
@@ -391,6 +392,10 @@ void pf_dense_xh(Engine::Pf& p, const Q8S& w, int rows, int cols, int C, float* 
     const int slice = (int) std::min<size_t>(rows, PF_WH / cols / 128 * 128);   // whole 128-row tiles
     for (int r0 = 0; r0 < rows; r0 += slice) {
         const int nr = std::min(slice, rows - r0);
+#if FNX_HIP
+        if (p.q8_gsu3 && strata_pf_q8_gsu3_f16(reinterpret_cast<const uint16_t*>(p.xh),
+                w.q + (size_t)r0*cols, w.d + (size_t)r0*cols/32, out + r0, C, nr, cols, ldo, nr, 0, s)) continue;
+#endif
         k_q8s_f16<<<grid_for((size_t) nr * cols), 256, 0, s>>>(w.q + (size_t) r0 * cols, w.d + (size_t) r0 * cols / 32, (size_t) nr * cols, p.wh);
         pf_gemm(p, p.wh, nr, cols, p.xh, C, out + r0, ldo, s);
     }
@@ -410,6 +415,11 @@ void pf_dense_head_xh(Engine::Pf& p, const Q8S& w, int rows, int full_rows, int 
         const int nr = std::min(slice, full_rows - r0);
         const int lo = std::max(first, r0), hi = std::min(first + rows, r0 + nr);
         if (hi <= lo) continue;
+#if FNX_HIP
+        if (p.q8_gsu3 && strata_pf_q8_gsu3_f16(reinterpret_cast<const uint16_t*>(p.xh),
+                w.q + (size_t)(lo-first)*cols, w.d + (size_t)(lo-first)*cols/32,
+                out + lo, C, hi-lo, cols, full_rows, nr, lo-r0, s)) continue;
+#endif
         ckc(cudaMemsetAsync(p.wh, 0, (size_t) nr * cols * sizeof(__half), s), "head weight padding");
         k_q8s_f16<<<grid_for((size_t) (hi - lo) * cols), 256, 0, s>>>(w.q + (size_t) (lo - first) * cols,
             w.d + (size_t) (lo - first) * cols / 32, (size_t) (hi - lo) * cols, p.wh + (size_t) (lo - r0) * cols);
@@ -438,8 +448,15 @@ void pf_hc_read(Engine::Pf& p, float* R, const float* bo, const float* inj_prev,
         k_hcb_prep_streams<<<C, HCB_THREADS, 0, s>>>(R, bo, inj_prev, w_norm, p.rs, p.xh, eps, w_inj, inject);
     else
         k_hcb_prep<<<C, HCB_THREADS, 0, s>>>(R, bo, inj_prev, w_norm, p.rs, p.xh, eps, w_inj, inject);
-    k_q8s_f16<<<grid_for((size_t) LR * D), 256, 0, s>>>(w_down.q, w_down.d, (size_t) LR * D, p.wh);
-    pf_gemm(p, p.wh, LR, D, p.xh, C, p.lo32, LR, s);
+    bool fused_down = false;
+#if FNX_HIP
+    if (p.q8_gsu3) fused_down = strata_pf_q8_gsu3_f16(reinterpret_cast<const uint16_t*>(p.xh),
+        w_down.q, w_down.d, p.lo32, C, LR, D, LR, LR, 0, s);
+#endif
+    if (!fused_down) {
+        k_q8s_f16<<<grid_for((size_t) LR * D), 256, 0, s>>>(w_down.q, w_down.d, (size_t) LR * D, p.wh);
+        pf_gemm(p, p.wh, LR, D, p.xh, C, p.lo32, LR, s);
+    }
     k_hcb_lo<<<grid_for((size_t) C * LR), 256, 0, s>>>(p.lo32, C * LR, p.lo16);
     k_q8s_f16<<<grid_for((size_t) D * LR), 256, 0, s>>>(w_up.q, w_up.d, (size_t) D * LR, p.wh);
     bool mixed_up = false;
@@ -624,6 +641,9 @@ void Engine::prefill_alloc() {
     const bool slim_transport = env_flag("FNX_PF_SLIM_BUFFERS");
     const bool alias_residual = env_flag("FNX_PF_RESIDUAL_ALIAS");
     const bool phase_scratch = env_flag("FNX_PF_PHASE_SCRATCH");
+    const bool tight_activations = env_flag("FNX_PF_TIGHT_ACTIVATIONS");
+    if (tight_activations && (!phase_scratch || !attn_head_split() || !env_flag("FNX_PF_COMPACT_HEADS") || D < 3 * N))
+        throw std::runtime_error("FNX_PF_TIGHT_ACTIVATIONS requires compact head-split phase scratch");
 #if FNX_HIP
     if ((slim_transport || alias_residual || phase_scratch) && (!attn_head_split() || !rccl_on_ || env_int("FNX_PF_RING_SM", 0)))
         throw std::runtime_error("slim prefill buffers and residual aliasing require head-split attention and RCCL prompt sums");
@@ -673,6 +693,7 @@ void Engine::prefill_alloc() {
         }
         p->f16acc = env_flag("FNX_PF_F16ACC");
         p->native_gemm = env_int("FNX_PF_GEMM", 0) != 0;
+        p->q8_gsu3 = env_flag("FNX_PF_Q8_GSU3") && p->native_gemm && !p->f16acc;
         p->hc_streams = env_flag("FNX_PF_HC_STREAMS");
         p->hc_up_fused = env_flag("FNX_PF_HC_UP_FUSED");
         p->compact_heads = env_flag("FNX_PF_COMPACT_HEADS");
@@ -723,9 +744,16 @@ void Engine::prefill_alloc() {
             p->h16 = a.take<uint16_t>((size_t) pf_c_ * TOPK * ffs);
         };
         auto attn_set = [&](Arena& a) {
-            p->qg = a.take<float>((size_t) pf_c_ * NQH * 2 * HD);
-            p->k = a.take<float>((size_t) pf_c_ * NKVH * HD);
-            p->v = a.take<float>((size_t) pf_c_ * NKVH * HD);
+            // Large chunks project only this card's heads. Short BLAS chunks
+            // still need the original padded output before its gather.
+            const size_t short_rows = std::min(pf_c_, 63);
+            const size_t q_rows = tight_activations ? std::max((size_t)pf_c_ * attn_projected_q_heads(), short_rows * NQH)
+                                                  : (size_t)pf_c_ * NQH;
+            const size_t kv_rows = tight_activations ? std::max((size_t)pf_c_ * attn_projected_kv_heads(), short_rows * NKVH)
+                                                   : (size_t)pf_c_ * NKVH;
+            p->qg = a.take<float>(q_rows * 2 * HD);
+            p->k = a.take<float>(kv_rows * HD);
+            p->v = a.take<float>(kv_rows * HD);
             p->att = a.take<float>((size_t) pf_c_ * w.nq * HD);
             p->yidx = a.take<float>((size_t) pf_c_ * qsa_rows());
             p->qidx = a.take<float>((size_t) pf_c_ * 512);
@@ -799,7 +827,12 @@ void Engine::prefill_alloc() {
         p->rs = palloc<float>((size_t) pf_c_ * HC);
         p->lo32 = palloc<float>((size_t) pf_c_ * LR);
         p->lo16 = palloc<__half>((size_t) pf_c_ * LR);
-        p->mixed = palloc<float>((size_t) pf_c_ * N);
+        // HC down consumes the D-wide half input before the N-wide mixed
+        // output exists. The final half input and float mixed rows occupy
+        // disjoint pieces of that same buffer. Wider later dense inputs
+        // overwrite mixed only after its last projection has consumed it.
+        p->mixed = tight_activations ? reinterpret_cast<float*>(p->xh + (size_t)pf_c_ * N)
+                                    : palloc<float>((size_t) pf_c_ * N);
         // ev_rf orders the attention HC read after the preceding FFN sum;
         // ev_ra orders the FFN HC read after the attention sum. Each read
         // consumes the old addend before this same stream writes the next one.

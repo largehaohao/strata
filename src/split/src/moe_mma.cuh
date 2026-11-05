@@ -314,7 +314,7 @@ constexpr size_t mm_smem() {
 template <int TYPE, int BM, bool FusedGate = false>
 __global__ void __launch_bounds__(MM_THREADS) k_moe_mma(MoeW w, const BigJob* __restrict__ jobs, const int* __restrict__ njobs,
                                                         const __half* __restrict__ x, int ldx, float* __restrict__ out,
-                                                        __half* __restrict__ hout = nullptr) {
+                                                        __half* __restrict__ hout = nullptr, bool trim_tokens = false) {
     using namespace nvcuda;
     constexpr int MM_NT = PF_JOB / 16;   // token tiles of a job
     constexpr int WR = BM / 32, WT = MM_THREADS / 32 / WR, TT = MM_NT / WT, NP = BM / MM_PASS, LO = 16 * TT;
@@ -413,11 +413,13 @@ __global__ void __launch_bounds__(MM_THREADS) k_moe_mma(MoeW w, const BigJob* __
 #pragma unroll
                 for (int r = 0; r < 2; ++r) a[r] = nvcuda::wmma::fnx_ld_ab(arow + r * 16 * MM_LD + kk);
 #pragma unroll
-                for (int t = 0; t < TT; ++t) b[t] = nvcuda::wmma::fnx_ld_ab(bcol + t * 16 * MM_LD + kk);
+                for (int t = 0; t < TT; ++t)
+                    if (!trim_tokens || tb + t < nt) b[t] = nvcuda::wmma::fnx_ld_ab(bcol + t * 16 * MM_LD + kk);
 #pragma unroll
                 for (int r = 0; r < 2; ++r)
 #pragma unroll
-                    for (int t = 0; t < TT; ++t) acc[r][t] = mma_wmma12(a[r], b[t], acc[r][t]);
+                    for (int t = 0; t < TT; ++t)
+                        if (!trim_tokens || tb + t < nt) acc[r][t] = mma_wmma12(a[r], b[t], acc[r][t]);
 #elif FNX_ARCH >= 80
                 uint32_t fa[2][4], fb[2 * TT][2];
 #pragma unroll
@@ -475,6 +477,9 @@ __global__ void __launch_bounds__(MM_THREADS) k_moe_mma(MoeW w, const BigJob* __
     // share each activation load. A tiled epilogue avoids a 34-KiB allocation.
 #pragma unroll
     for (int t = 0; t < TT; ++t) {
+        // nt belongs to the whole job, so every wave takes this branch together.
+        // No row consumes a token tile beyond nt, including split-K partials.
+        if (trim_tokens && t >= nt) break;
         float* sob = so + tg * 16 * SLD + rg * 32 + (FNX_WMMA_GFX11 ? lh : 8 * lh);
 #pragma unroll
         for (int r = 0; r < 2; ++r)

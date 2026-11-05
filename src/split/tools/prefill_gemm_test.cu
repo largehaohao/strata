@@ -202,6 +202,71 @@ static int check_gsu3(int n, int k, hipStream_t stream, hipblasHandle_t blas) {
     return checks;
 }
 
+// Reference the production dequantization, including the padding of a head shard.
+__global__ void expand_q8(const int8_t* bytes, const uint16_t* scales, __half* out,
+                          size_t elements, int k, int first, int owned) {
+    for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < elements; i += gridDim.x * blockDim.x) {
+        const size_t col = i / k;
+        const float value = col >= first && col < first + owned
+            ? __half2float(__ushort_as_half(scales[i / 32])) * bytes[i] : 0.f;
+        out[i] = __float2half(value);
+    }
+}
+
+static int check_q8_gsu3(int n, int k, int first, int owned, hipStream_t stream) {
+    constexpr int max_t = 63, pad = 9, guard = 17;
+    constexpr uint32_t guard_bits = 0xa5a5a5a5u;
+    const size_t weights = (size_t)n * k;
+    Buffer x((size_t)max_t * k * sizeof(__half)), q(weights), scales(weights / 32 * sizeof(uint16_t));
+    Buffer w(weights * sizeof(__half)), y(((size_t)max_t * (n + pad) + guard) * sizeof(float));
+    std::vector<__half> hx((size_t)max_t * k);
+    std::vector<int8_t> hq(weights);
+    std::vector<uint16_t> hs(weights / 32);
+    std::mt19937 rng(407 + n + first);
+    for (auto& value : hx) value = __float2half((int(rng() % 2049) - 1024) * 0x1p-10f);
+    for (auto& value : hq) value = (int)(rng() % 256) - 128;
+    constexpr uint16_t scale_bits[] = {0, 1, 3, 0x200, 0x3ff, 0x400, 0x1400, 0x2400, 0x3800};
+    for (size_t i = 0; i < hs.size(); ++i) hs[i] = scale_bits[i % 9] | (i % 11 == 0 ? 0x8000 : 0);
+    ck(hipMemcpy(x.p, hx.data(), hx.size() * sizeof(__half), hipMemcpyHostToDevice));
+    ck(hipMemcpy(q.p, hq.data(), hq.size(), hipMemcpyHostToDevice));
+    ck(hipMemcpy(scales.p, hs.data(), hs.size() * sizeof(uint16_t), hipMemcpyHostToDevice));
+    expand_q8<<<1024, 256, 0, stream>>>(static_cast<int8_t*>(q.p), static_cast<uint16_t*>(scales.p),
+        static_cast<__half*>(w.p), weights, k, first, owned);
+    ck(hipGetLastError());
+
+    const auto ref = n == 320 ? strata_pf_hcdown_gsu3_f16 : strata_pf_wide_gsu3_f16;
+    const auto* input = static_cast<const uint16_t*>(x.p);
+    const auto* bytes = static_cast<const int8_t*>(q.p) + (size_t)first * k;
+    const auto* scale = static_cast<const uint16_t*>(scales.p) + (size_t)first * k / 32;
+    auto* output = static_cast<float*>(y.p);
+    int checks = 0;
+    for (int rows : {16, 19, 27, max_t}) for (int ld : {n, n + pad}) {
+        const size_t cells = (size_t)rows * ld + guard;
+        const size_t size = cells * sizeof(float);
+        std::vector<uint32_t> expected(cells), actual(cells);
+        ck(hipMemsetAsync(output, 0xa5, size, stream));
+        if (!ref(input, static_cast<const uint16_t*>(w.p), output, rows, n, k, ld, stream))
+            throw std::runtime_error("Q8 reference dispatch");
+        ck(hipMemcpyAsync(expected.data(), output, size, hipMemcpyDeviceToHost, stream));
+        ck(hipMemsetAsync(output, 0xa5, size, stream));
+        if (!strata_pf_q8_gsu3_f16(input, bytes, scale, output + first, rows, owned, k, ld, n, first, stream))
+            throw std::runtime_error("Q8 GSU3 dispatch");
+        ck(hipMemcpyAsync(actual.data(), output, size, hipMemcpyDeviceToHost, stream));
+        ck(hipStreamSynchronize(stream));
+        for (size_t i = 0; i < cells; ++i) {
+            const size_t col = i % ld;
+            if (i >= (size_t)rows * ld || col < first || col >= first + owned) expected[i] = guard_bits;
+        }
+        if (expected != actual) {
+            std::fprintf(stderr, "Q8 GSU3 mismatch T=%d N=%d K=%d ld=%d shard=%d+%d\n",
+                         rows, n, k, ld, first, owned);
+            throw std::runtime_error("Q8 GSU3 rounding, sum or padding");
+        }
+        ++checks;
+    }
+    return checks;
+}
+
 static void check_head_shard(int t, int full, int rows, int first, hipStream_t stream) {
     constexpr int k=2560, guard_rows=16;
     const int slice=std::min(full,(16*1024*1024/k/128)*128);
@@ -252,6 +317,14 @@ int main() {
             if (const char* wide = std::getenv("FNX_PF_WIDE_GSU3"); wide && !std::strcmp(wide, "1")) {
                 for (int n : {512, 640, 1664, 5760, 6528}) cases += check_gsu3(n, 2560, stream, blas);
                 cases += check_gsu3(2560, 3072, stream, blas);
+            }
+            if (const char* q8 = std::getenv("FNX_PF_Q8_GSU3"); q8 && !std::strcmp(q8, "1")) {
+                int q8_checks = check_q8_gsu3(320, 10240, 0, 320, stream);
+                for (int n : {512, 640, 1664, 5760, 6528}) q8_checks += check_q8_gsu3(n, 2560, 0, n, stream);
+                q8_checks += check_q8_gsu3(2560, 3072, 0, 2560, stream);
+                q8_checks += check_q8_gsu3(512, 2560, 256, 256, stream);
+                q8_checks += check_q8_gsu3(6528, 2560, 6144, 384, stream);
+                std::printf("device=%d Q8 GSU3 exact checks=%d\n", dev, q8_checks);
             }
             const Shape shapes[]={{64,512,32,0},{65,513,96,13},{129,1031,68*32,7},
                 {256,2560,320,0},{1024,640,2560,0},{4096,2560,6144,0},{1100,10240,320,0},{64,512,10240,0},

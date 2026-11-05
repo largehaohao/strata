@@ -59,11 +59,24 @@ __device__ __forceinline__ float silu_(float x) { return x / (1.0f + __expf(-x))
 #include "moe_mma.cuh"
 #include "moe_mma_iq.cuh"
 
+bool trim_token_tiles() {
+#if FNX_HIP && defined(FNX_MOE_MMA_WIDE)
+    static const bool enabled = [] {
+        const char* value = std::getenv("FNX_PF_MOE_TRIM_TILES");
+        return value && value[0] == '1' && value[1] == 0;
+    }();
+    return enabled;
+#else
+    return false;
+#endif
+}
+
 template <int TYPE>
 void mma_launch(const MoeW& w, const BigJob* jobs, const int* njobs, int njobs_cap, const __half* x, float* out, cudaStream_t s) {
     constexpr size_t sm = mm_smem<MM_BM>();
     static_assert(sm <= 48 * 1024, "moe_mma: shared memory past the default limit");
-    k_moe_mma<TYPE, MM_BM><<<dim3((w.nrows + MM_BM - 1) / MM_BM, njobs_cap), MM_THREADS, sm, s>>>(w, jobs, njobs, x, w.ncols, out);
+    k_moe_mma<TYPE, MM_BM><<<dim3((w.nrows + MM_BM - 1) / MM_BM, njobs_cap), MM_THREADS, sm, s>>>(
+        w, jobs, njobs, x, w.ncols, out, nullptr, trim_token_tiles());
 }
 
 void moe_mma(const DW& A, size_t sa, const BigJob* jobs, const int* njobs, int njobs_cap, const __half* x, float* out, void* st) {
