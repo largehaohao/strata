@@ -45,3 +45,41 @@ The saved Pi profile now uses the same binary with a different existing-format e
 All 21 requests still matched the original outputs, tool arguments, draft counts and prefix reuse. A separate live run passed both tasks without truncation in 94.36 seconds. It generated 9233 tokens across 15 requests instead of 10444 across 21, so its 626.62 small-prefill tokens/s and task time are reported separately from the matched-input gain. Zero-prefix-reuse 4K/16K/32K medians were 3675.2/4687.0/4695.8 tokens/s. The 200579-input + 64-output case completed without OOM, with matching text and draft counts (3669.7 prefill, 88.9 decode tokens/s).
 
 The 196608-byte ranking is `bench/results/2026-11-05-rx7900xtx-pi-increment50/pi-small-fresh-routes-v1.bin` (SHA-256 `70f80eba6d9e28b9506958902ff6206d1bab77e9e4fbaa45c3d47a456495718c`). The 3× prefill and 1.2× decode targets remain unmet. A tighter chunk-dependent MoE launch bound was also checked against 10,476 exhaustive maxima and the real GPU jobs. It changed 524.15 to 524.64 tokens/s in the cache/staging configuration, so it was not selected.
+
+## Exact attention and prompt projections on two RX 7900 XTX cards
+
+The fixed panel still contains all 21 original v27b requests. Seventeen cached follow-ups read 1997 fresh tokens. Decode includes all 10444 generated tokens. The table uses total tokens divided by total engine time, with one request in flight and a 200768-token context.
+
+| Tokens/s | v27b | Paired QSA + Pi ranking | Ordered small-row GEMM + Q8 attention + sampled QSA | Goal |
+| --- | ---: | ---: | ---: | ---: |
+| Cached follow-up prefill | 263.03 | 607.19 | 701.79 | 789.08 |
+| Decode across all 21 requests | 162.87 | 177.05 | 188.19 | 195.45 |
+| Decode on the 17 follow-ups | 158.37 | 175.70 | 186.81 | 190.04 |
+
+The last measured build uses these options on top of the existing Pi ranking.
+
+- `FNX_QSA_PAIRED=1` shares one global cutoff between the two position partitions. `FNX_QSA_SAMPLE_PIVOT=1` proposes a pivot from a sample, then counts every visible key. It either proves the cutoff, selects exactly from the bounded candidate list, or uses full radix selection. Equal scores keep the earliest positions.
+- `FNX_ATTN_HEAD_Q8_GATHER=1` computes the paged Q8 key/value row and scale addresses once per selected position for the head-split decode kernel.
+- `STRATA_PF_HC_DOWN_INCREMENT=1` uses smaller output tiles for HC down at 64–512 rows. `FNX_PF_HC_DOWN_GSU3=1` and `FNX_PF_WIDE_GSU3=1` reproduce the serving wheel's three-way FP32 accumulation and tile-dependent K order for supported FP16 projections at 16–63 rows. Other shapes keep their existing dispatch. Elementwise comparisons used the actual rocBLAS 5.2.0.f7e037d2e5 wheel.
+
+All 21 fixed requests matched v27b in content, reasoning, tool names and arguments, finish reason, fresh/reused and generated tokens, and draft counts. The GPU checks covered 10752 selector comparisons, 21504 attention/append comparisons and 2944 GEMM cases. The independent repeat-1 Pi run passed both code tasks, with 18 requests, 9315 generated tokens, 89.17 seconds and no truncation. v27b's repeat-0 run had 21 requests and 10444 generated tokens. Only the fixed panel measures the same work. In a separate earlier repeat, the Python agent generated a nonterminating iterator after the final item. We stopped the isolated task early and counted it as failed. Replaying its first four requests on v27b reproduced the same code, reasoning and tool arguments. One request had different draft counts.
+
+Zero-prefix-reuse 4K, 16K and 32K API medians were 3615.8, 4759.2 and 4774.0 tokens/s. The guarded 200579-input, 64-output run reached 4068.6 prefill and 115.2 decode tokens/s. It matched v27b's output and draft counts. In an earlier continuous sequence on the wide-GEMM build, the original thermal guard stopped GPU 1 at its 100°C junction limit during the 200K request. The same binary completed the isolated request after cooling, with GPU junction peaks of 93°C and 96°C. Later long tests had separate cooling intervals.
+
+The measured executable is `strata-split-pi-qsa-sample2-v15`, SHA-256 `cd3b4ec27a8c9929369523caca26adbec7b0a2852472054791817ced61d0bb88`. The existing-format Pi JSON and shell launcher use the original local thermal supervisor. Current measured gains against v27b are 166.8% for small prefill and 15.5% for all-request decode.
+
+## V23 clean-build fixed-panel validation
+
+The latest committed implementation borrows two residual scratch chunks from the independent, non-KV cache pool for smaller prompt buffer allocation. It keeps the original four-chunk pass and 4096-row chunk size. The normal CMake build from commit 72e15fdd was replayed against the same 21 captured v27b requests with no differences in generated content, reasoning, tool calls, finish reason, token counts, cache reuse or draft counts.
+
+| Fixed 21-request panel | v27b | Clean V23 | Goal |
+| --- | ---: | ---: | ---: |
+| Cached follow-up prefill | 263.03 | 750.30 | 789.08 |
+| Decode across all requests | 162.87 | 193.95 | 195.45 |
+| Decode on the 17 small follow-ups | 158.37 | 192.14 | 190.04 |
+
+The independent Pi repeat passed both coding tasks. It produced 9115 tokens in 85.42 seconds across 17 requests, with no truncations. The guarded 200579-input, 64-output request previously completed with v27b-matching output and draft counts. A later consecutive 200K check reached the guard's 100°C junction limit and was stopped. After cooling, the same prior V23 binary completed the isolated request with card junction peaks of 93°C and 96°C.
+
+Other screened builds approached each threshold individually. V37 measured 787.12 prefill and 194.72 decode tokens/s. V38 measured 787.71 prefill and 193.84 decode. Neither cleared both targets. The latest clean V23 release binary is strata-split-pi-cache-residual-v23-release, SHA-256 c21a273e451a6f9f4ad631d319efd836e4d56ff9bb50592b45438a4e30629018. The server's optional Pi JSON points to this release build.
+
+These measurements leave the 3× prefill and 1.2× decode targets unmet.
