@@ -1406,7 +1406,11 @@ static void qsa_select_positions(const float* scores, int* cells, int* n_cells, 
 #if FNX_HIP && FNX_NCARD == 2 && !FNX_27B
     static const bool paired = env_flag("FNX_QSA_PAIRED");
     if (paired && max_pools <= QSA_PAIR_MAX_POOLS) {
-        k_idx_select_pair<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, stride, lr);
+        static const bool sample = env_flag("FNX_QSA_SAMPLE_PIVOT");
+        if (sample && T <= 16)
+            k_idx_select_pair<true><<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, stride, lr);
+        else
+            k_idx_select_pair<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, stride, lr);
         return;
     }
 #endif

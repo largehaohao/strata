@@ -68,7 +68,7 @@ void run(int dev) {
     ck(cudaEventCreate(&end), "event");
     std::vector<float> keys((size_t) max_t * pools);
     int checks = 0;
-    for (int pattern = 0; pattern < 5; ++pattern) {
+    for (int pattern = 0; pattern < 7; ++pattern) {
         std::mt19937 rng(217 + pattern);
         for (size_t i = 0; i < keys.size(); ++i) {
             const unsigned u = rng();
@@ -77,6 +77,8 @@ void run(int dev) {
                 case 1: keys[i] = (float) (i % pools); break;
                 case 2: keys[i] = (float) (u % 11); break;
                 case 3: keys[i] = 1.f + (u % 1024) * 0x1p-23f; break;
+                case 4: keys[i] = i % 64 == 0 ? 1e6f : (float)(u % 4096); break;
+                case 5: keys[i] = i % 64 == 0 ? 0.f : 2.f + (float)(u % 4096); break;
                 default: keys[i] = (float) u * 0x1p-28f; break;
             }
         }
@@ -85,8 +87,11 @@ void run(int dev) {
             const int stride = T + 3;
             LaneRows lr{};
             lr.pos = lanes ? lane_pos : nullptr;
-            auto launch = [&](bool paired) {
-                if (paired) {
+            auto launch = [&](int mode) {
+                if (mode == 2) {
+                    k_idx_select_pair<true><<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells + pad, counts + pad, pools,
+                        lanes ? nullptr : pos, stride, lr);
+                } else if (mode == 1) {
                     k_idx_select_pair<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells + pad, counts + pad, pools,
                         lanes ? nullptr : pos, stride, lr);
                 } else {
@@ -98,7 +103,7 @@ void run(int dev) {
             cudaGraph_t graph;
             cudaGraphExec_t exec;
             ck(cudaStreamBeginCapture(s, cudaStreamCaptureModeRelaxed), "capture");
-            launch(true);
+            launch(2);
             ck(cudaStreamEndCapture(s, &graph), "end capture");
             ck(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0), "instantiate");
             for (int start : {0, 2046, 2051, 74401, 200751, pools * QSA_POOL - max_t}) {
@@ -109,11 +114,11 @@ void run(int dev) {
                     oracle(keys.data() + (size_t) t * pools, positions[t], t, stride, expected_cells, expected_counts);
                 }
                 ck(cudaMemcpy(pos, positions.data(), T * sizeof(int), cudaMemcpyHostToDevice), "positions");
-                for (int mode = 0; mode < 3; ++mode) {
+                for (int mode = 0; mode < 4; ++mode) {
                     ck(cudaMemsetAsync(cells, 0x5a, cell_size * sizeof(int), s), "guard cells");
                     ck(cudaMemsetAsync(counts, 0x5a, count_size * sizeof(int), s), "guard counts");
-                    if (mode == 2) ck(cudaGraphLaunch(exec, s), "replay");
-                    else launch(mode == 1);
+                    if (mode == 3) ck(cudaGraphLaunch(exec, s), "replay");
+                    else launch(mode);
                     ck(cudaStreamSynchronize(s), "select");
                     std::vector<int> got_cells(cell_size), got_counts(count_size);
                     ck(cudaMemcpy(got_cells.data(), cells, cell_size * sizeof(int), cudaMemcpyDeviceToHost), "cells");
@@ -133,11 +138,12 @@ void run(int dev) {
     std::printf("device=%d exact checks=%d\n", dev, checks);
     for (int p : {74401, 200751}) for (int T : {1, 4, 6, 12, 16}) {
         ck(cudaMemcpy(pos, &p, sizeof(p), cudaMemcpyHostToDevice), "timed position");
-        auto timed = [&](bool pair) {
+        auto timed = [&](int mode) {
             ck(cudaEventRecord(begin, s), "begin");
             constexpr int repetitions = 40;
             for (int i = 0; i < repetitions; ++i) {
-                if (pair) k_idx_select_pair<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, counts, pools, pos, T, {});
+                if (mode == 2) k_idx_select_pair<true><<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, counts, pools, pos, T, {});
+                else if (mode == 1) k_idx_select_pair<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, counts, pools, pos, T, {});
                 else for (int c = 0; c < 2; ++c)
                     k_idx_select<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells + (size_t) c * T * QSA_MAXSEL,
                         counts + c * T, pools, pos, c, {});
@@ -148,12 +154,13 @@ void run(int dev) {
             ck(cudaEventElapsedTime(&ms, begin, end), "time");
             return ms * 1000.f / repetitions;
         };
-        for (bool pair : {false, true}) timed(pair);
-        std::array<std::array<float, 5>, 2> sample;
+        for (int mode = 0; mode < 3; ++mode) timed(mode);
+        std::array<std::array<float, 5>, 3> sample;
         for (int rep = 0; rep < 5; ++rep)
-            for (int pass = 0; pass < 2; ++pass) { int mode = (rep + pass) % 2; sample[mode][rep] = timed(mode); }
+            for (int pass = 0; pass < 3; ++pass) { int mode = (rep + pass) % 3; sample[mode][rep] = timed(mode); }
         for (auto& values : sample) std::sort(values.begin(), values.end());
-        std::printf("device=%d pos=%d T=%d separate_us=%.2f paired_us=%.2f\n", dev, p, T, sample[0][2], sample[1][2]);
+        std::printf("device=%d pos=%d T=%d separate_us=%.2f paired_us=%.2f sampled_us=%.2f\n",
+                    dev, p, T, sample[0][2], sample[1][2], sample[2][2]);
     }
     ck(cudaEventDestroy(begin), "destroy event");
     ck(cudaEventDestroy(end), "destroy event");

@@ -381,8 +381,102 @@ __device__ __forceinline__ unsigned qsa_block_offset(unsigned count, unsigned* w
     return waves[wave] + inclusive - count;
 }
 
+// Sort the CTA's 1024 register keys. Steps within a wave use shuffles.
+__device__ __forceinline__ unsigned qsa_sort_key(unsigned key, unsigned* scratch) {
+    const int tid = threadIdx.x;
+    for (int span = 2; span <= QSA_SEL_THREADS; span <<= 1) {
+        for (int step = span / 2; step; step >>= 1) {
+            unsigned peer;
+            if (step < 32) peer = __shfl_xor_sync(0xffffffffu, key, step);
+            else {
+                scratch[tid] = key;
+                __syncthreads();
+                peer = scratch[tid ^ step];
+                __syncthreads();
+            }
+            const bool low = ((tid & span) == 0) == ((tid & step) == 0);
+            key = low ? min(key, peer) : max(key, peer);
+        }
+    }
+    return key;
+}
+
+__device__ __forceinline__ unsigned qsa_count_greater(const unsigned* sorted, unsigned cutoff) {
+    int lo = 0, hi = QSA_SEL_THREADS;
+    while (lo < hi) {
+        const int mid = (lo + hi) / 2;
+        if (sorted[mid] <= cutoff) lo = mid + 1;
+        else hi = mid;
+    }
+    return QSA_SEL_THREADS - lo;
+}
+
+// Sampling only picks a pivot. Count all greater/equal scores before using
+// it. If the bounded winner buffer cannot certify the cutoff, use full radix.
+__device__ __forceinline__ QsaCutoff qsa_sample_cutoff(const unsigned* scores, int visible) {
+    if (visible < 4096) return qsa_cutoff(scores, visible);
+    const int tid = threadIdx.x, lane = tid & 31;
+    __shared__ unsigned scratch[2 * QSA_SEL_THREADS], waves[32];
+    __shared__ unsigned pivot, greater, equal, keep_ties;
+    const unsigned sample = qsa_sort_key(scores[tid * visible / QSA_SEL_THREADS], scratch);
+    const int rank = (2 * QSA_TOP * QSA_SEL_THREADS + visible - 1) / visible;
+    if (tid == QSA_SEL_THREADS - rank) pivot = sample;
+    if (tid == 0) greater = 0;
+    __syncthreads();
+    unsigned own_equal = 0;
+    for (int base = 0; base < visible; base += QSA_SEL_THREADS) {
+        const int j = base + tid;
+        const unsigned value = j < visible ? scores[j] : 0u;
+        const bool above = j < visible && value > pivot;
+        own_equal += j < visible && value == pivot;
+        const unsigned votes = __ballot_sync(0xffffffffu, above);
+        unsigned start = 0;
+        if (lane == 0 && votes) start = atomicAdd(&greater, (unsigned)__popc(votes));
+        start = __shfl_sync(0xffffffffu, start, 0);
+        const unsigned slot = start + __popc(votes & ((1u << lane) - 1));
+        if (above && slot < 2 * QSA_SEL_THREADS) scratch[slot] = value;
+    }
+    const unsigned before = qsa_block_offset(own_equal, waves);
+    if (tid == QSA_SEL_THREADS - 1) equal = before + own_equal;
+    __syncthreads();
+    if (greater < QSA_TOP && greater + equal >= QSA_TOP) return {pivot, QSA_TOP - greater};
+    if (greater < QSA_TOP || greater > 2 * QSA_SEL_THREADS) return qsa_cutoff(scores, visible);
+
+    // All buffered keys are strictly above a nonnegative pivot, so zero
+    // padding cannot enter the top 512 of these one or two sorted arrays.
+    const bool two = greater > QSA_SEL_THREADS;
+    unsigned key = tid < greater ? scratch[tid] : 0u;
+    unsigned second = tid + QSA_SEL_THREADS < greater ? scratch[tid + QSA_SEL_THREADS] : 0u;
+    __syncthreads();
+    key = qsa_sort_key(key, scratch);
+    if (two) second = qsa_sort_key(second, scratch + QSA_SEL_THREADS);
+    scratch[tid] = key;
+    if (two) scratch[tid + QSA_SEL_THREADS] = second;
+    __syncthreads();
+    if (tid == 0) {
+        unsigned cutoff = scratch[QSA_SEL_THREADS - QSA_TOP];
+        const unsigned* other = scratch + QSA_SEL_THREADS;
+        if (two) {
+            // Choose how many of the top 512 come from each sorted half.
+            int lo = 0, hi = QSA_TOP;
+            while (lo < hi) {
+                const int n = (lo + hi) / 2, m = QSA_TOP - n;
+                if (scratch[QSA_SEL_THREADS - n - 1] > other[QSA_SEL_THREADS - m]) lo = n + 1;
+                else hi = n;
+            }
+            const int m = QSA_TOP - lo;
+            cutoff = min(lo ? scratch[QSA_SEL_THREADS - lo] : ~0u, m ? other[QSA_SEL_THREADS - m] : ~0u);
+        }
+        pivot = cutoff;
+        keep_ties = QSA_TOP - qsa_count_greater(scratch, cutoff) - (two ? qsa_count_greater(other, cutoff) : 0);
+    }
+    __syncthreads();
+    return {pivot, keep_ties};
+}
+
 // Both position partitions select from the same global scores. Resolve the
 // cutoff and its ties once, then compact the two ordered lists independently.
+template<bool Sampled = false>
 __global__ void __launch_bounds__(QSA_SEL_THREADS) k_idx_select_pair(const float* __restrict__ scores, int* __restrict__ cells,
                                                                      int* __restrict__ n_cells, int max_pools, const int* pos0p,
                                                                      int stride, LaneRows lr) {
@@ -392,7 +486,7 @@ __global__ void __launch_bounds__(QSA_SEL_THREADS) k_idx_select_pair(const float
         return;
     }
     const unsigned* key = reinterpret_cast<const unsigned*>(scores + (size_t) t * max_pools);
-    const QsaCutoff cut = qsa_cutoff(key, nv);
+    const QsaCutoff cut = Sampled ? qsa_sample_cutoff(key, nv) : qsa_cutoff(key, nv);
     const int chunk = (nv + QSA_SEL_THREADS - 1) / QSA_SEL_THREADS;
     const int first = tid * chunk, length = max(0, min(chunk, nv - first));
     using Mask = unsigned long long;
