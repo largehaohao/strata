@@ -2,11 +2,13 @@
 // cache head slot p holds this card's single KV head for virtual partition p.
 // The computation and reduction order match the original kernels in kernels.cu
 // and attn_prompt.cuh; only the head and page addresses differ.
+template<bool FixedQ8 = false>
 __global__ void __launch_bounds__(HD) k_attn_part_head(const float* qg, const __half* kc, const __half* vc, KvPages g, float* acc_out,
                                                   AttPart* mz_out, int nq, int q0, int nkv, int kv0, const int* pos0p,
                                                   const int* __restrict__ cells, const int* __restrict__ n_cells, int owner, int T, LaneRows lr, int selection_stride) {
     // t: the window's row; its position and pages: its lane's (lr), or the sequence's *pos0p + t
     const int s = blockIdx.x, t = blockIdx.y, kvl = 0, card = blockIdx.z, i = threadIdx.x, lane = i & 31, warp = i >> 5;
+    if constexpr (FixedQ8) nq = ATT_OWN;
     g = row_pages(g, lr, t);
     acc_out += (size_t) card * T * nq * ATT_SPLITS * HD;
     mz_out += (size_t) card * T * nq * ATT_SPLITS;
@@ -17,13 +19,14 @@ __global__ void __launch_bounds__(HD) k_attn_part_head(const float* qg, const __
     const int ctx = list ? n_cells[t] : kv_owned(row_pos(lr, pos0p, t), card);
     // the local q heads of KV head kv0 + kvl: global heads [(kv0 + kvl) * QPK, + QPK) within [q0, q0 + nq)
     const int g0 = max(q0, (kv0 + kvl) * ATT_QPK), g1 = min(q0 + nq, (kv0 + kvl + 1) * ATT_QPK);
-    const int h0 = g0 - q0, nh = g1 - g0;
+    const int h0 = FixedQ8 ? 0 : g0 - q0, nh = FixedQ8 ? ATT_OWN : g1 - g0;
     const int len = ((ctx + ATT_SPLITS - 1) / ATT_SPLITS + ATT_CH - 1) / ATT_CH * ATT_CH;
     const int p0 = s * len, p1 = min(ctx, p0 + len);
     __shared__ float q[ATT_MAXH][HD];
     __shared__ float kk[ATT_CH][HD + 1];
     __shared__ float e[ATT_MAXH][ATT_CH];
     __shared__ float scale[ATT_MAXH];
+    __shared__ size_t byte_row[FixedQ8 ? ATT_CH : 1], scale_row[FixedQ8 ? ATT_CH : 1];
     for (int k = i; k < nh * HD; k += HD) q[k / HD][k % HD] = qg[((size_t) t * nq + h0 + k / HD) * 2 * HD + k % HD];
     constexpr int HPW = (ATT_MAXH + HD / 32 - 1) / (HD / 32);   // heads per warp: warp w keeps heads w, w + 8
     float m[HPW], z[HPW];
@@ -37,10 +40,33 @@ __global__ void __launch_bounds__(HD) k_attn_part_head(const float* qg, const __
 #pragma unroll 1
     for (int c0 = p0; c0 < p1; c0 += ATT_CH) {
         const int np = min(ATT_CH, p1 - c0);
+        if constexpr (FixedQ8) {
+            // Every head needs the same selected K/V positions. Resolve each
+            // page once for the tile and broadcast its byte and scale offsets.
+            if (i < np) {
+                const int pos = list ? list[c0 + i] : c0 + i;
+                const int local = pos % g.rows;
+                const size_t page = (size_t) g.pt[pos / g.rows] * g.page;
+                byte_row[i] = 2 * page + (size_t) local * NKVH * HD + (size_t) card * HD;
+                scale_row[i] = page + (size_t) g.rows * NKVH * HD / 2 + ((size_t) local * NKVH + card) * (HD / KV8_GROUP);
+            }
+            __syncthreads();
+        }
         // the chunk's K rows into shared memory and this thread's dimension of its V rows into registers
         float vr[ATT_CH];
 #pragma unroll
         for (int pp = 0; pp < ATT_CH; ++pp) {
+            if constexpr (FixedQ8) {
+                float key = 0.f, value = 0.f;
+                if (pp < np) {
+                    const size_t r = byte_row[pp] + i, sc = scale_row[pp] + i / KV8_GROUP;
+                    key = reinterpret_cast<const int8_t*>(kc)[r] * __half2float(kc[sc]);
+                    value = reinterpret_cast<const int8_t*>(vc)[r] * __half2float(vc[sc]);
+                }
+                kk[pp][i] = key;
+                vr[pp] = value;
+                continue;
+            }
             const int pos = pp < np ? (list ? list[c0 + pp] : c0 + pp) : 0;
             if (g.q8) {
                 const size_t r = kvq_row(g, pos) + (size_t) card * HD + i, sc = kvq_scale(g, pos) + ((size_t) card * HD + i) / KV8_GROUP;

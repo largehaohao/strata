@@ -1495,6 +1495,22 @@ size_t att_ring_words() { return (size_t) 2 * (NCARD - 1) * ATT_ROWS * ATT_OWN *
 int attn_rows() { return ATT_ROWS; }
 int kv_rows_per_card(int n_ctx) { return (n_ctx / 4 + NCARD - 1) / NCARD * 4 + 4; }
 
+static void attn_head_partials(const float* qg, const __half* kc, const __half* vc, const KvPages& g, float* acc,
+                               AttPart* mz, const int* pos, const int* cells, const int* counts, int card, int T,
+                               LaneRows lr, int stride, cudaStream_t s) {
+    const dim3 grid(ATT_SPLITS, T, 2);
+#if FNX_HIP && FNX_NCARD == 2 && !FNX_27B
+    static const bool gather = env_flag("FNX_ATTN_HEAD_Q8_GATHER");
+    if (gather && g.q8) {
+        k_attn_part_head<true><<<grid, HD, 0, s>>>(qg, kc, vc, g, acc, mz, ATT_OWN, card * ATT_OWN, 1, card,
+                                                   pos, cells, counts, card, T, lr, stride);
+        return;
+    }
+#endif
+    k_attn_part_head<<<grid, HD, 0, s>>>(qg, kc, vc, g, acc, mz, ATT_OWN, card * ATT_OWN, 1, card,
+                                         pos, cells, counts, card, T, lr, stride);
+}
+
 void attn(const float* qg, const uint16_t* kc16, const uint16_t* vc16, const KvPages& g, float* out, const AttRing& ar, const unsigned* tag,
           int call, const int* pos0, int T, float* scratch, void* st, const int* cells, const int* n_cells, int selection_stride) {
     ring_call_check(call, "attn");
@@ -1506,8 +1522,7 @@ void attn(const float* qg, const uint16_t* kc16, const uint16_t* vc16, const KvP
     const __half* vc = reinterpret_cast<const __half*>(vc16);
     cudaStream_t s = (cudaStream_t) st;
     if (attn_head_split()) {
-        k_attn_part_head<<<dim3(ATT_SPLITS, T, 2), HD, 0, s>>>(qg, kc, vc, g, acc, mz, ATT_OWN, ar.card * ATT_OWN,
-            1, ar.card, pos0, cells, n_cells, ar.card, T, LaneRows{}, selection_stride ? selection_stride : T);
+        attn_head_partials(qg, kc, vc, g, acc, mz, pos0, cells, n_cells, ar.card, T, {}, selection_stride ? selection_stride : T, s);
         k_attn_local_head<<<dim3(ATT_OWN, T, 2), HD, 0, s>>>(acc, mz, part, T);
         k_attn_merge_head<<<dim3(ATT_OWN, T), HD, 0, s>>>(qg, part, out, T, ar.onehop ? 0 : 1 - ar.card);
         ck_launch("attn head split");
@@ -1526,9 +1541,8 @@ void attn_part_lanes(const float* qg, const uint16_t* kc16, const uint16_t* vc16
     if (!lr.pos || !lr.pt) throw std::runtime_error("attn_part_lanes: no lane rows");
     AttPart* mz = reinterpret_cast<AttPart*>(scratch + (size_t) ATT_ROWS * NQH * ATT_SPLITS * HD);
     if (attn_head_split()) {
-        k_attn_part_head<<<dim3(ATT_SPLITS, T, 2), HD, 0, (cudaStream_t) st>>>(qg, reinterpret_cast<const __half*>(kc16),
-            reinterpret_cast<const __half*>(vc16), g, scratch, mz, ATT_OWN, card * ATT_OWN, 1, card, nullptr,
-            cells, n_cells, card, T, lr, T);
+        attn_head_partials(qg, reinterpret_cast<const __half*>(kc16), reinterpret_cast<const __half*>(vc16),
+                           g, scratch, mz, nullptr, cells, n_cells, card, T, lr, T, (cudaStream_t) st);
         ck_launch("attn head lanes");
         return;
     }

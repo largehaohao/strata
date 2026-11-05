@@ -121,7 +121,10 @@ int run(int dev, bool q8) {
                 else k_att_merge<<<dim3(ATT_OWN,T),HD,0,st>>>(ring,q,part[owner],out+pad,T,tag,3);
             };
             auto test = [&]() {
-                k_attn_part_head<<<dim3(ATT_SPLITS,T,2),HD,0,st>>>(hq[owner],hk[owner],hv[owner],g,ha,hm,ATT_OWN,owner*ATT_OWN,1,owner,pos,cells,ncells,owner,T,{},T);
+                if (q8 && env_flag("FNX_ATTN_HEAD_Q8_GATHER"))
+                    k_attn_part_head<true><<<dim3(ATT_SPLITS,T,2),HD,0,st>>>(hq[owner],hk[owner],hv[owner],g,ha,hm,ATT_OWN,owner*ATT_OWN,1,owner,pos,cells,ncells,owner,T,{},T);
+                else
+                    k_attn_part_head<<<dim3(ATT_SPLITS,T,2),HD,0,st>>>(hq[owner],hk[owner],hv[owner],g,ha,hm,ATT_OWN,owner*ATT_OWN,1,owner,pos,cells,ncells,owner,T,{},T);
                 k_attn_local_head<<<dim3(ATT_OWN,T,2),HD,0,st>>>(ha,hm,hp,T);
                 k_attn_merge_head<<<dim3(ATT_OWN,T),HD,0,st>>>(hq[owner],hp,out+pad,T,onehop ? 0 : 1-owner);
             };
