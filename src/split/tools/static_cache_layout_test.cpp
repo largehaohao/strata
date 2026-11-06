@@ -1,13 +1,14 @@
 #include "static_cache_layout.hpp"
 #include "static_kv_cache.hpp"
+#include "static_prefill_stage.hpp"
 #include <iostream>
 #include <cstdlib>
 #include <cstdint>
 #include <limits>
 using namespace fnx;
 static void need(bool b) { if (!b) throw std::runtime_error("cache layout assertion failed"); }
-static void invalid(const std::vector<StaticCacheShape>& s, int slots, int groups, int minimum = 160) {
-    try { (void) static_cache_layout(s, slots, groups, minimum); }
+static void invalid(const std::vector<StaticCacheShape>& s, int slots, int groups, int minimum = 160, int pool1 = 0) {
+    try { (void) static_cache_layout(s, slots, groups, minimum, true, pool1); }
     catch (const std::runtime_error&) { return; }
     throw std::runtime_error("invalid layout was accepted");
 }
@@ -67,6 +68,20 @@ int main() {
     const auto kv = static_kv_cache_plan(new_packed, size_t(172) * 1517568, size_t(16) * 1517568);
     need(kv.extra_slots == 218 && kv.cache.slots == 1402 && kv.cache.bytes == 1595417600);
     check(packed, 1024, 2, true);
+    const auto pi = static_cache_layout(packed, 1312, 2, 160, true, 288);
+    need(pi.pools[0].slots == 1248 && pi.pools[1].slots == 288);
+    need(pi.bytes <= size_t(1312) * 1331200);
+    const auto loan = prefill_cache_borrow(500695040, 4, size_t(160) << 20, size_t(120) << 20,
+                                           pi.pools[0].stride(), pi.pools[0].slots);
+    need(loan.slots == 1194 && loan.addend_offset == loan.phase_bytes + (size_t(640) << 20));
+    bool rejected = false;
+    try {
+        (void) prefill_cache_borrow(500695040, 4, size_t(160) << 20, size_t(120) << 20,
+                                    pi.pools[0].stride(), loan.slots);
+    } catch (const std::runtime_error&) { rejected = true; }
+    need(rejected);
+    invalid(packed, 1312, 1, 160, 288);
+    invalid(packed, 1312, 2, 160, 1312);
     for (auto& s : packed) s.dn = 460800;
     const auto old_expanded = static_cache_layout(packed, 1024, 2);
     const auto new_expanded = static_cache_layout(packed, 1024, 2, 160, true);

@@ -541,6 +541,9 @@ void moe_launch(bool down, const MoeW& w, const Job* jobs, const int* njobs, int
             if (reuse != 0 && reuse != 1) throw std::runtime_error("FNX_IQ_REUSE: expected 0 or 1");
             if (reuse) {
                 static const long long group = env_int("FNX_IQ_GROUP", 32);
+                static const long long fast_signs = env_int("FNX_IQ_FAST_SIGNS", 0);
+                if (fast_signs != 0 && fast_signs != 1)
+                    throw std::runtime_error("FNX_IQ_FAST_SIGNS: expected 0 or 1");
                 if (group != 16 && group != 32) throw std::runtime_error("FNX_IQ_GROUP: expected 16 or 32");
                 const dim3 grid16((w.nrows + 7) / 8, njobs_max);
                 if (copy && (group != 16 || copy->blocks < 1 || copy->blocks > 256 ||
@@ -554,7 +557,8 @@ void moe_launch(bool down, const MoeW& w, const Job* jobs, const int* njobs, int
                                 w.row_a != (size_t) N / ggml_cuda_type_traits<TA>::qk * ggml_cuda_type_traits<TA>::bs))
                     throw std::runtime_error("invalid IQ gate/up copy descriptor/shape");
 #define FNX_IQR(t) case t: \
-    if (gu_copy) k_moe_gu_iq_cache<TA, t, 16, true><<<fused_grid, MMVQ_THREADS, 0, s>>>(w, jobs, njobs, (const block_q8_1*) in, out, *copy, *gu_copy); \
+    if (gu_copy && fast_signs) k_moe_gu_iq_cache<TA, t, 16, true, true><<<fused_grid, MMVQ_THREADS, 0, s>>>(w, jobs, njobs, (const block_q8_1*) in, out, *copy, *gu_copy); \
+    else if (gu_copy) k_moe_gu_iq_cache<TA, t, 16, true><<<fused_grid, MMVQ_THREADS, 0, s>>>(w, jobs, njobs, (const block_q8_1*) in, out, *copy, *gu_copy); \
     else if (copy) k_moe_gu_iq<TA, t, 16, true><<<fused_grid, MMVQ_THREADS, 0, s>>>(w, jobs, njobs, (const block_q8_1*) in, out, *copy); \
     else if (group == 16) k_moe_gu_iq<TA, t, 16><<<grid16, MMVQ_THREADS, 0, s>>>(w, jobs, njobs, (const block_q8_1*) in, out); \
     else k_moe_gu_iq<TA, t><<<grid, MMVQ_THREADS, 0, s>>>(w, jobs, njobs, (const block_q8_1*) in, out); \

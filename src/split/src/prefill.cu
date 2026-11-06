@@ -28,6 +28,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <limits>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -334,6 +335,12 @@ struct Engine::Pf {
     bool routed_dma = false;          // 3: strata's actual-route DMA, overlapped with the shared expert
     bool routed_overlap = false;      // 4: GPU route checks on the copy stream, without host readback
     int copy_blocks = 8;
+    bool compact_phase = false, cache_phase = false, cache_carry = false;
+    int phase_pool = -1;
+    char* phase_base = nullptr;
+    size_t phase_bytes = 0;
+    size_t phase_loan_bytes = 0;       // active view before any borrowed residuals
+    std::function<size_t(int, char*, size_t)> bind_phase;
     unsigned char* stage_ready = nullptr;
     unsigned long long* stage_moved = nullptr;
     int* route_host = nullptr;        // pinned actual counts, read back before the shared expert runs
@@ -682,6 +689,15 @@ void Engine::prefill_alloc() {
         ckb(cublasSetStream(p->blas, b.st), "stream");
         ckb(cublasSetMathMode(p->blas, CUBLAS_TENSOR_OP_MATH), "math mode");
         p->decode_cache = env_flag("FNX_PF_DECODE_CACHE");
+        p->compact_phase = env_flag("FNX_PF_COMPACT_PHASE");
+        p->cache_phase = env_flag("FNX_PF_CACHE_PHASE");
+        p->cache_carry = env_flag("FNX_PF_CACHE_CARRY");
+        if (p->cache_carry && (!p->cache_phase || !alias_residual))
+            throw std::runtime_error("FNX_PF_CACHE_CARRY requires phase cache and aliased addends");
+        if (p->cache_phase && (!p->compact_phase || !static_arena_ || static_stage != 2 || !p->decode_cache))
+            throw std::runtime_error("FNX_PF_CACHE_PHASE requires compact phase views, a static cache arena, stage 2 and cache reads");
+        if (p->compact_phase && (!phase_scratch || !tight_activations))
+            throw std::runtime_error("FNX_PF_COMPACT_PHASE requires tight phase scratch");
         if (p->decode_cache && !b.static_cache.n_slots)
             throw std::runtime_error("FNX_PF_DECODE_CACHE requires a static decode cache");
         if (env_flag("FNX_PF_DECODE_CACHE_CHECK")) {
@@ -736,69 +752,80 @@ void Engine::prefill_alloc() {
         Arena big{(char*) b.snap_block, b.snap_block_bytes};
         // one region for the buffers of each phase of a layer: they never live at once (the FFN half's are read last
         // by the chunk sum's addend, on the stream before the next half starts)
-        auto ffn_set = [&](Arena& a) {
-            p->gu = p->moe_fused ? nullptr : a.take<float>((size_t) pf_c_ * TOPK * 2 * ffs);
-            p->part = a.take<float>((size_t) (pf_c_ * TOPK + pf_c_) * N);
-            p->shg = a.take<float>((size_t) pf_c_ * 2 * ffs);
-            p->shh = a.take<__half>((size_t) pf_c_ * ffs);
-            p->h16 = a.take<uint16_t>((size_t) pf_c_ * TOPK * ffs);
+        if (const char* qr = std::getenv("FNX_PF_QSA_ROWS")) {
+            char* end = nullptr;
+            const long v = std::strtol(qr, &end, 10);
+            if (end == qr || *end || v < MAXT || v > std::numeric_limits<int>::max() || v % MAXT)
+                throw std::runtime_error("FNX_PF_QSA_ROWS: a positive multiple of " + std::to_string(MAXT) + ", not '" + qr + "'");
+            p->qsa_pf_rows = (int) v;
+        }
+        // Bind the same phase layout to the rows used by this pass. The
+        // capacity is the actual loan before its residuals and addends.
+        p->bind_phase = [this, p, &w, ffs, rs_qkvz, tight_activations, phase_scratch]
+                        (int cap, char* region, size_t capacity) {
+            Arena ffn{region, capacity};
+            p->gu = p->moe_fused ? nullptr : ffn.take<float>((size_t) cap * TOPK * 2 * ffs);
+            p->part = ffn.take<float>((size_t) (cap * TOPK + cap) * N);
+            p->shg = ffn.take<float>((size_t) cap * 2 * ffs);
+            p->shh = ffn.take<__half>((size_t) cap * ffs);
+            p->h16 = ffn.take<uint16_t>((size_t) cap * TOPK * ffs);
+
+            Arena attn{region, capacity};
+            // Short BLAS chunks still need the padded output before gathering.
+            const size_t short_rows = std::min(cap, 63);
+            const size_t q_rows = tight_activations ? std::max((size_t) cap * attn_projected_q_heads(), short_rows * NQH)
+                                                   : (size_t) cap * NQH;
+            const size_t kv_rows = tight_activations ? std::max((size_t) cap * attn_projected_kv_heads(), short_rows * NKVH)
+                                                    : (size_t) cap * NKVH;
+            p->qg = attn.take<float>(q_rows * 2 * HD);
+            p->k = attn.take<float>(kv_rows * HD);
+            p->v = attn.take<float>(kv_rows * HD);
+            p->att = attn.take<float>((size_t) cap * w.nq * HD);
+            p->yidx = attn.take<float>((size_t) cap * qsa_rows());
+            p->qidx = attn.take<float>((size_t) cap * 512);
+            p->cells = attn.take<int>((size_t) attn_position_partitions() * cap * qsa_maxsel());
+            p->ncells = attn.take<int>(attn_position_partitions() * cap);
+            const int score_rows = p->compact_phase ? std::min(cap, p->qsa_pf_rows) : p->qsa_pf_rows;
+            p->scores = attn.take<float>((size_t) std::max(attn_rows(), score_rows) * (max_ctx_ / 4));
+            p->apart[0] = attn.take<float>(NCARD * attn_prompt_block_floats(cap));
+
+            Arena rec{region, capacity};
+            p->qkvz = rec.take<float>((size_t) cap * rs_qkvz);
+            p->ab = rec.take<float>((size_t) cap * 2 * w.nv());
+            p->y32 = rec.take<float>((size_t) cap * w.nv() * HS);
+            p->gdn_xc = rec.take<float>((size_t) cap * w.conv_ch());
+            p->gdn_sq = rec.take<float>((size_t) cap * w.nv() * 4);
+            p->gdn_ch = rec.take<float>(gdn_prompt_work_floats(cap, w.nv()));
+
+            Arena ple{region, capacity};
+            p->ple_key = ple.take<float>((size_t) cap * D);
+            p->ple_val = ple.take<float>((size_t) cap * N);
+            p->ple_tmp = ple.take<float>((size_t) 2 * MAXT * D);
+
+            const size_t up_bytes = phase_scratch ?
+                std::max<size_t>((size_t) cap * D, (size_t) cap * NQH * 2 * HD / 2 + 16) * sizeof(float) : 0;
+            const size_t bytes = std::max({ffn.off, attn.off, rec.off, ple.off, up_bytes});
+            if (bytes > capacity) throw std::runtime_error("prefill phase view exceeds its allocation");
+            return bytes;
         };
-        auto attn_set = [&](Arena& a) {
-            // Large chunks project only this card's heads. Short BLAS chunks
-            // still need the original padded output before its gather.
-            const size_t short_rows = std::min(pf_c_, 63);
-            const size_t q_rows = tight_activations ? std::max((size_t)pf_c_ * attn_projected_q_heads(), short_rows * NQH)
-                                                  : (size_t)pf_c_ * NQH;
-            const size_t kv_rows = tight_activations ? std::max((size_t)pf_c_ * attn_projected_kv_heads(), short_rows * NKVH)
-                                                   : (size_t)pf_c_ * NKVH;
-            p->qg = a.take<float>(q_rows * 2 * HD);
-            p->k = a.take<float>(kv_rows * HD);
-            p->v = a.take<float>(kv_rows * HD);
-            p->att = a.take<float>((size_t) pf_c_ * w.nq * HD);
-            p->yidx = a.take<float>((size_t) pf_c_ * qsa_rows());
-            p->qidx = a.take<float>((size_t) pf_c_ * 512);
-            p->cells = a.take<int>((size_t) attn_position_partitions() * pf_c_ * qsa_maxsel());
-            p->ncells = a.take<int>(attn_position_partitions() * pf_c_);
-            if (const char* qr = std::getenv("FNX_PF_QSA_ROWS")) {
-                char* end = nullptr;
-                const long v = std::strtol(qr, &end, 10);
-                if (end == qr || *end || v < MAXT || v % MAXT)
-                    throw std::runtime_error("FNX_PF_QSA_ROWS: a positive multiple of " + std::to_string(MAXT) + ", not '" + qr + "'");
-                p->qsa_pf_rows = (int) v;
+        const size_t phase = p->bind_phase(pf_c_, nullptr, SIZE_MAX);
+        char* region = nullptr;
+        if (p->cache_phase) {
+            const auto& cache = b.static_cache;
+            for (int pool = 0; pool < cache.n_pools; ++pool) {
+                if (pool == cache.arena_pool || !cache.pool[pool] || cache.n[pool] <= 1 ||
+                    phase > (size_t) (cache.n[pool] - 1) * cache.slot_bytes[pool]) continue;
+                p->phase_pool = pool;
+                region = cache.pool[pool];
+                break;
             }
-            p->scores = a.take<float>((size_t) std::max(attn_rows(), p->qsa_pf_rows) * (max_ctx_ / 4));
-            p->apart[0] = a.take<float>(NCARD * attn_prompt_block_floats(pf_c_));
-        };
-        auto rec_set = [&](Arena& a) {
-            p->qkvz = a.take<float>((size_t) pf_c_ * rs_qkvz);
-            p->ab = a.take<float>((size_t) pf_c_ * 2 * w.nv());
-            p->y32 = a.take<float>((size_t) pf_c_ * w.nv() * HS);
-            p->gdn_xc = a.take<float>((size_t) pf_c_ * w.conv_ch());
-            p->gdn_sq = a.take<float>((size_t) pf_c_ * w.nv() * 4);
-            p->gdn_ch = a.take<float>(gdn_prompt_work_floats(pf_c_, w.nv()));
-        };
-        auto ple_set = [&](Arena& a) {
-            p->ple_key = a.take<float>((size_t) pf_c_ * D);
-            p->ple_val = a.take<float>((size_t) pf_c_ * N);
-            p->ple_tmp = a.take<float>((size_t) 2 * MAXT * D);
-        };
-        size_t phase = 0;
-        {
-            Arena dry{nullptr, SIZE_MAX};
-            ffn_set(dry), phase = std::max(phase, dry.off), dry.off = 0;
-            attn_set(dry), phase = std::max(phase, dry.off), dry.off = 0;
-            rec_set(dry), phase = std::max(phase, dry.off), dry.off = 0;
-            ple_set(dry), phase = std::max(phase, dry.off);
+            if (!region) throw std::runtime_error("prefill phase does not fit an independent cache pool");
+        } else {
+            region = big.fits(phase) ? big.take<char>(phase) : palloc<char>(phase);
         }
-        if (phase_scratch) phase = std::max(phase, up_floats * sizeof(float));
-        char* region = big.fits(phase) ? big.take<char>(phase) : palloc<char>(phase);
-        for (auto set : {0, 1, 2, 3}) {
-            Arena a{region, phase};
-            if (set == 0) ffn_set(a);
-            else if (set == 1) attn_set(a);
-            else if (set == 2) rec_set(a);
-            else ple_set(a);
-        }
+        p->phase_base = region;
+        p->phase_bytes = phase;
+        p->bind_phase(pf_c_, region, phase);
         auto from_big = [&](size_t floats) { return big.fits(floats * sizeof(float)) ? big.take<float>(floats) : palloc<float>(floats); };
         // HC reads precede every phase's projection, after the preceding
         // phase's addend has been consumed on b.st. The embedding expansion
@@ -823,7 +850,7 @@ void Engine::prefill_alloc() {
         p->widx = from_big((size_t) std::max(qsa_rows(), NEXP + 1) * N);
         p->wh = palloc<__half>(PF_WH);
         p->xh = palloc<__half>((size_t) pf_c_ * D);
-        p->R = palloc<float>((size_t) pf_c_ * D);
+        p->R = p->cache_carry ? nullptr : palloc<float>((size_t) pf_c_ * D);
         p->rs = palloc<float>((size_t) pf_c_ * HC);
         p->lo32 = palloc<float>((size_t) pf_c_ * LR);
         p->lo16 = palloc<__half>((size_t) pf_c_ * LR);
@@ -945,18 +972,24 @@ void Engine::prefill_alloc() {
             const long long chunks = env_int("FNX_PF_CACHE_R_CHUNKS", 0);
             if (chunks < 0 || chunks >= pass || (chunks && (!static_arena_ || !alias_residual || static_stage != 2 || !p->decode_cache)))
                 throw std::runtime_error("FNX_PF_CACHE_R_CHUNKS requires routed static stages and fewer chunks than the base pass");
-            p->cache_r_chunks = (int) chunks;
-            if (chunks) {
+            p->cache_r_chunks = p->cache_carry ? p->pass : (int)chunks;
+            if (p->cache_r_chunks) {
                 // The KV-backed pool owns a separate watermark. Borrow a
                 // prefix of a different, contiguous pool and leave a slot for its hand.
-                const size_t bytes = (size_t) chunks * pf_c_ * D * sizeof(float);
+                const size_t addend_bytes = (size_t) pf_c_ * N * sizeof(float);
+                const size_t bytes = (size_t) p->cache_r_chunks * pf_c_ * D * sizeof(float) +
+                                     (p->cache_carry ? (p->pass - 1) * addend_bytes : 0);
                 const auto& cache = b.static_cache;
                 for (int pool = 0; pool < cache.n_pools; ++pool) {
-                    if (pool != cache.arena_pool && cache.pool[pool] && cache.n[pool] > 1 &&
-                        bytes <= (size_t)(cache.n[pool]-1) * cache.slot_bytes[pool]) {
+                    if (pool == cache.arena_pool || !cache.pool[pool] || cache.n[pool] <= 1 ||
+                        (p->cache_phase && pool != p->phase_pool)) continue;
+                    const size_t slot_bytes = cache.slot_bytes[pool];
+                    const size_t reserved = p->cache_phase ?
+                        (p->phase_bytes / slot_bytes + (p->phase_bytes % slot_bytes != 0)) * slot_bytes : 0;
+                    const size_t total = (size_t) (cache.n[pool] - 1) * slot_bytes;
+                    if (reserved <= total && bytes <= total - reserved) {
                         p->residual_pool = pool;
-                        p->cache_last_addend = bytes + (size_t)pf_c_ * N * sizeof(float) <=
-                                               (size_t)(cache.n[pool]-1) * cache.slot_bytes[pool];
+                        p->cache_last_addend = p->cache_carry || addend_bytes <= total - reserved - bytes;
                         break;
                     }
                 }
@@ -964,7 +997,7 @@ void Engine::prefill_alloc() {
             }
             for (int k = 1; k < p->borrow_pass; ++k) {
                 p->Rk[k] = k < p->pass - p->cache_r_chunks ? palloc<float>((size_t) pf_c_ * D) : nullptr;
-                p->bofk[k] = k < p->pass - (int)p->cache_last_addend ? palloc<float>((size_t) pf_c_ * N) : nullptr;
+                p->bofk[k] = !p->cache_carry && k < p->pass - (int)p->cache_last_addend ? palloc<float>((size_t) pf_c_ * N) : nullptr;
                 p->injfk[k] = palloc<float>((size_t) pf_c_ * HC);
                 p->ctlk[k] = palloc<int>((size_t) (1 + (pf_c_ / MAXT)) * 2);
                 p->boak[k] = k >= p->pass ? nullptr : alias_residual ? p->bofk[k] : palloc<float>((size_t) pf_c_ * N);
@@ -1222,12 +1255,17 @@ void Engine::prefill(const std::vector<int>& tokens, int after) {
             // before making any of their scratch addresses admissible again.
             ckc(cudaDeviceSynchronize(), "residual cache users finished");
             ExpertCache pool = b.static_cache;
-            pool.arena_pool = p.residual_pool;
+            pool.arena_pool = p.cache_phase ? p.phase_pool : p.residual_pool;
             arena_slots(pool, residual_slots[c], 0, b.st);
             ckc(cudaStreamSynchronize(b.st), "residual cache returned");
-            p.R = p.Rk[0];
             for (int k = p.pass - p.cache_r_chunks; k < p.pass; ++k) p.Rk[k] = nullptr;
-            if (p.cache_last_addend) {
+            p.R = p.Rk[0];
+            p.phase_loan_bytes = 0;
+            if (p.cache_carry) {
+                p.bo_a = p.boak[0];
+                p.bo_f = p.bofk[0];
+                for (int k = 1; k < p.pass; ++k) p.boak[k] = p.bofk[k] = nullptr;
+            } else if (p.cache_last_addend) {
                 p.bo_a = p.boak[0]; p.bo_f = p.bofk[0];
                 p.boak[p.pass - 1] = p.bofk[p.pass - 1] = nullptr;
             }
@@ -1245,20 +1283,28 @@ void Engine::prefill(const std::vector<int>& tokens, int after) {
     try {
         for (int c = 0; c < NCARD; ++c) {
             auto& p = *pf_[c];
-            if (!p.cache_r_chunks) continue;
+            if (!p.cache_r_chunks && !p.cache_phase) continue;
             const int permanent = p.pass - p.cache_r_chunks;
-            const int needed = (int)std::min<size_t>(p.pass, (tokens.size() + pf_c_ - 1) / pf_c_);
-            if (needed <= permanent) continue;
+            const int needed = (int) std::min<size_t>(p.pass, (tokens.size() + pf_c_ - 1) / pf_c_);
+            if (needed <= permanent && !p.cache_phase) continue;
             auto& b = *cb_[c];
             ExpertCache pool = b.static_cache;
-            const int index = p.residual_pool;
+            const int index = p.cache_phase ? p.phase_pool : p.residual_pool;
             pool.arena_pool = index;
-            const size_t stride = (size_t)pf_c_ * D * sizeof(float);
-            const size_t r_bytes = (needed - permanent) * stride;
+            const int r_chunks = std::max(0, needed - permanent);
             const bool addend = p.cache_last_addend && needed == p.pass;
-            const size_t bytes = r_bytes + (addend ? (size_t)pf_c_ * N * sizeof(float) : 0);
-            const int slots = (int)((bytes + pool.slot_bytes[index] - 1) / pool.slot_bytes[index]);
-            if (slots >= pool.n[index]) throw std::runtime_error("prefill residual loan exceeds independent cache pool");
+            size_t active_phase = 0;
+            int cap = pf_c_;
+            if (p.cache_phase) {
+                cap = std::min(pf_c_, std::max(MAXT, (int) ((tokens.size() + MAXT - 1) / MAXT * MAXT)));
+                active_phase = p.bind_phase(cap, nullptr, p.phase_bytes);
+            }
+            const size_t stride = (size_t) (p.cache_carry ? cap : pf_c_) * D * sizeof(float);
+            const size_t bo_stride = (size_t) (p.cache_carry ? cap : pf_c_) * N * sizeof(float);
+            const int addends = p.cache_carry ? std::max(0, needed - 1) : (int) addend;
+            const auto plan = prefill_cache_borrow(active_phase, r_chunks, stride, addends * bo_stride,
+                                                  pool.slot_bytes[index], pool.n[index]);
+            const int slots = plan.slots;
             ckc(cudaSetDevice(b.dev), "residual cache device");
             ckc(cudaDeviceSynchronize(), "residual cache readers finished");
             int previous = 0;
@@ -1267,11 +1313,22 @@ void Engine::prefill(const std::vector<int>& tokens, int after) {
             arena_slots(pool, 0, slots, b.st);
             residual_slots[c] = slots;
             ckc(cudaStreamSynchronize(b.st), "residual cache invalidated");
+            p.phase_loan_bytes = active_phase;
+            char* const scratch = pool.pool[index];
             for (int k = permanent; k < needed; ++k)
-                p.Rk[k] = reinterpret_cast<float*>(pool.pool[index] + (k - permanent) * stride);
-            if (addend) p.bofk[p.pass-1] = p.boak[p.pass-1] = reinterpret_cast<float*>(pool.pool[index] + r_bytes);
-            if (c == 0 && env_flag("FNX_PF_TIMING"))
-                std::fprintf(stderr, "prefill: %d residual chunks in %d slots of independent cache pool %d\n", needed-permanent, slots, index);
+                p.Rk[k] = reinterpret_cast<float*>(scratch + plan.phase_bytes + (k - permanent) * stride);
+            if (p.cache_carry) {
+                for (int k = 1; k < needed; ++k)
+                    p.bofk[k] = p.boak[k] = reinterpret_cast<float*>(scratch + plan.addend_offset + (k - 1) * bo_stride);
+            } else if (addend) {
+                p.bofk[p.pass - 1] = p.boak[p.pass - 1] = reinterpret_cast<float*>(scratch + plan.addend_offset);
+            }
+            if (c == 0 && env_flag("FNX_PF_TIMING")) {
+                std::fprintf(stderr, "prefill: %d residual chunks in %d slots of independent cache pool %d\n", r_chunks, slots, index);
+                if (p.cache_phase)
+                    std::fprintf(stderr, "prefill: active phase %zu KiB borrowed, %d of %d independent slots unavailable\n",
+                                 active_phase >> 10, slots, pool.n[index]);
+            }
         }
         if (staging && same_base && borrow_K>base_K && tokens.size()>(size_t)base_K*pf_c_ &&
             pos_<=max_ctx_ && tokens.size()<=(size_t)(max_ctx_-pos_)) {
@@ -1390,6 +1447,16 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
     for (int j = 0; j < nk; ++j) pos0[(size_t) j] = pos_ + rows, rows += (int) chunks[(size_t) j].tokens.size();
     if (pos_ + rows > max_ctx_) throw Refused("prefill: context full");
     ensure_pages(pos_ + rows);
+    if (pf_[0]->compact_phase) {
+        int active_capacity = MAXT;
+        for (const auto& chunk : chunks)
+            active_capacity = std::max(active_capacity, ((int) chunk.tokens.size() + MAXT - 1) / MAXT * MAXT);
+        for (int c = 0; c < NCARD; ++c) {
+            Pf& p = *pf_[c];
+            ckc(cudaSetDevice(cb_[c]->dev), "phase view device");
+            p.bind_phase(active_capacity, p.phase_base, p.cache_phase ? p.phase_loan_bytes : p.phase_bytes);
+        }
+    }
     const float eps = m_.eps;
     // each chunk's (position, tag) and each group's: a tag per group, so the recurrent history's parity steps per group
     for (int j = 0; j < nk; ++j) {

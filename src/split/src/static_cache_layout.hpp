@@ -23,10 +23,12 @@ struct StaticCacheLayout {
 };
 
 inline StaticCacheLayout static_cache_layout(const std::vector<StaticCacheShape>& shapes, int budget_slots, int groups,
-                                             int min_slots = 160, bool min_padding = false) {
+                                             int min_slots = 160, bool min_padding = false, int pool1_slots = 0) {
     if (shapes.empty() || shapes.size() > 1024 || min_slots < 32 || min_slots % 32 ||
         budget_slots < min_slots || budget_slots > 4096 || budget_slots % 32 || (groups != 1 && groups != 2))
         throw std::runtime_error("static cache layout: invalid shapes, slot count or group count");
+    if (pool1_slots && (groups != 2 || pool1_slots < min_slots || pool1_slots > 4096 || pool1_slots % 32))
+        throw std::runtime_error("static cache layout: invalid pool 1 slot count");
     size_t gu = 0, dn = 0;
     std::vector<size_t> sizes;
     for (const auto& s : shapes) {
@@ -105,7 +107,21 @@ inline StaticCacheLayout static_cache_layout(const std::vector<StaticCacheShape>
         pool.gu = std::max(pool.gu, s.gu); pool.dn = std::max(pool.dn, s.dn); ++pool.layers;
     }
     if (!split) {
+        if (pool1_slots) throw std::runtime_error("static cache layout: pool 1 requires two nonempty groups");
         layout.pools[0].slots = budget_slots;
+    } else if (pool1_slots) {
+        // Repartition the original byte budget. Extra K/V capacity is added
+        // later and must not be charged to both pools here.
+        auto& p0 = layout.pools[0];
+        auto& p1 = layout.pools[1];
+        if ((size_t)pool1_slots > budget / p1.stride() || pool1_slots > 2 * budget_slots - min_slots)
+            throw std::runtime_error("static cache layout: pool 1 exceeds the cache budget");
+        const size_t remaining = budget - (size_t)pool1_slots * p1.stride();
+        const size_t cap0 = (2 * budget_slots - pool1_slots) / 32;
+        p0.slots = (int)(std::min(remaining / p0.stride() / 32, cap0) * 32);
+        if (p0.slots < min_slots)
+            throw std::runtime_error("static cache layout: pool 0 cannot hold a complete window");
+        p1.slots = pool1_slots;
     } else {
         // Every pool can hold a complete MAXT * TOPK window. Divide the rest
         // by layer count; compare integer ratios to avoid rounding drift.

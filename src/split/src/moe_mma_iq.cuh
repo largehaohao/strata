@@ -46,6 +46,30 @@ struct MmTile4 {
             mq_zero32(sw + r * MM_LD + u * 32);
             return;
         }
+#if defined(FNX_MOE_MMA_WIDE) && FNX_HIP
+        if constexpr (!NL) {
+            // Every (nibble - 8) is exact in half. A single half FMA rounds
+            // the exact d*q product once, with the reference's canonical +0.
+            const __half2 d = __half2half2(__ushort_as_half(v[0]));
+            const __half2 bias = __half2half2(__ushort_as_half(0x6408));
+            const __half2 zero = __float2half2_rn(0.f);
+            __half2 lo[8], hi[8];
+#pragma unroll
+            for (int w = 0; w < 4; ++w) {
+                const uint32_t q = (uint32_t)v[1 + 2 * w] | ((uint32_t)v[2 + 2 * w] << 16);
+                __half2 a, b;
+                mm_bytes_h2(q & 0x0f0f0f0fu, bias, a, b);
+                lo[2 * w] = __hfma2(a, d, zero);
+                lo[2 * w + 1] = __hfma2(b, d, zero);
+                mm_bytes_h2((q >> 4) & 0x0f0f0f0fu, bias, a, b);
+                hi[2 * w] = __hfma2(a, d, zero);
+                hi[2 * w + 1] = __hfma2(b, d, zero);
+            }
+            mm_store8(sw + r * MM_LD + u * 32, lo);
+            mm_store8(sw + r * MM_LD + u * 32 + 16, hi);
+            return;
+        }
+#endif
         const float d = mq_half(v[0]);
         float f[32];
 #pragma unroll

@@ -100,3 +100,19 @@ The clean HIP build matched v27b on all 21 requests, including text, reasoning, 
 On this machine the release build had about 45 MiB free on each card after warm-up. The single 200K run on V23 measured 4091.8 prefill and 115.0 decode tokens/s.
 
 The optional Pi JSON uses strata-split-pi-prefill-select-v37-release with SHA-256 0dcc38354b2efc5005f0d5dd876f4687cddd1cfd6b324fcd80b679cfe580f987. The original launcher reads this JSON and uses the existing thermal guard.
+
+## ROCm 10.1 Pi release
+
+The two-card Swift-1.5 IQ3_S configuration uses the independent expert pool for prefill phase buffers, residuals and addends. The loan is bounded to the active view and returned after GPU work completes. Short Q8 projections share weight expansion across rows. The selected settings also use packed IQ signs, eight state partitions for longer GDN verification windows and paired peer sends.
+
+| Fixed Pi replay in tokens/s | V37 with ROCm 10.1 | Clean release |
+| --- | ---: | ---: |
+| Small-increment prefill | 786.87 | 835.15 |
+| Decode across 21 requests | 199.58 | 208.89 |
+| Decode on 17 small follow-ups | 197.80 | 206.64 |
+
+The 21 captured requests matched the reference in text, reasoning, tool arguments, finish reasons, token counts, prefix reuse and draft counts. Both live Pi tasks passed without truncation. Three zero-reuse 32K prompts reached a median of 4817.8 prefill tokens/s.
+
+The engine served 200579 input tokens plus 64 output tokens with matching text and draft counts. A separate request was cancelled during a prefill loan. Its retry and the cached follow-up matched the references. After warm-up the driver reported 28 and 29 MiB free on the two cards.
+
+The local Pi JSON selects `strata-split-pi-rocm101-20261106-release` with SHA-256 `89f0264121d236827a36f503c3d26b2a97fbb5326b4070d5d835a56c39b4fe8f`. The existing launcher uses the JSON's ROCm 10.1 library directories. The running engine's library mappings were checked during qualification.

@@ -8,6 +8,30 @@
 #include <vector>
 
 namespace fnx {
+struct PrefillCacheBorrow {
+    size_t phase_bytes;    // rounded up to a slot boundary
+    size_t addend_offset;
+    int slots;
+};
+
+// One prefix owns the phase view, residuals and addends. Leave at least
+// one slot outside the loan, as for residual-only borrowing.
+inline PrefillCacheBorrow prefill_cache_borrow(size_t phase, int chunks, size_t stride, size_t addend,
+                                               size_t slot_bytes, int capacity) {
+    const size_t limit = std::numeric_limits<size_t>::max();
+    if (chunks < 0 || !slot_bytes || capacity < 2 || (chunks && stride > limit / (size_t) chunks))
+        throw std::runtime_error("prefill cache borrow: invalid shape");
+    const size_t phase_slots = phase / slot_bytes + (phase % slot_bytes != 0);
+    if (phase_slots > limit / slot_bytes) throw std::runtime_error("prefill cache borrow: phase overflow");
+    const size_t aligned = phase_slots * slot_bytes, residual = (size_t) chunks * stride;
+    if (residual > limit - aligned || addend > limit - aligned - residual)
+        throw std::runtime_error("prefill cache borrow: size overflow");
+    const size_t total = aligned + residual + addend;
+    const size_t slots = total / slot_bytes + (total % slot_bytes != 0);
+    if (slots >= (size_t) capacity) throw std::runtime_error("prefill cache borrow exceeds independent pool");
+    return {aligned, aligned + residual, (int) slots};
+}
+
 struct PrefillStageCopy {
     const char* src;
     char* dst;

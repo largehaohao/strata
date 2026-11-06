@@ -29,7 +29,14 @@ __device__ __forceinline__ int iq_signed_grid(int grid, int mask) {
 #endif
 }
 
-template <ggml_type TA>
+// The magnitudes in these codebooks are positive signed bytes. Adding the
+// low bit after inversion negates a selected byte without a carry to its neighbour.
+__device__ __forceinline__ int iq_signed_nibble(int grid, unsigned nibble) {
+    const unsigned ones = ((nibble & 15u) * 0x00204081u) & 0x01010101u;
+    return (int) (((unsigned) grid ^ (ones * 255u)) + ones);
+}
+
+template <ggml_type TA, bool PACKED_SIGNS = false>
 __device__ __forceinline__ IqDot32 iq_decode32(const char* row, int kbx, int iqs) {
     IqDot32 r;
     if constexpr (TA == GGML_TYPE_IQ2_S) {
@@ -42,10 +49,15 @@ __device__ __forceinline__ IqDot32 iq_decode32(const char* row, int kbx, int iqs
 #pragma unroll
         for (int k = 0; k < 8; k += 2) {
             const int* grid = reinterpret_cast<const int*>(iq2s_grid + (qs[k / 2] | ((qh << (8 - k)) & 0x300)));
-            const int s0 = iq_sign_mask(((signs[k / 2] & 0x03) << 7) | ((signs[k / 2] & 0x0C) << 21));
-            const int s1 = iq_sign_mask(((signs[k / 2] & 0x30) << 3) | ((signs[k / 2] & 0xC0) << 17));
-            r.grid[k] = iq_signed_grid(grid[0], s0);
-            r.grid[k + 1] = iq_signed_grid(grid[1], s1);
+            if constexpr (PACKED_SIGNS) {
+                r.grid[k] = iq_signed_nibble(grid[0], signs[k / 2]);
+                r.grid[k + 1] = iq_signed_nibble(grid[1], signs[k / 2] >> 4);
+            } else {
+                const int s0 = iq_sign_mask(((signs[k / 2] & 0x03) << 7) | ((signs[k / 2] & 0x0C) << 21));
+                const int s1 = iq_sign_mask(((signs[k / 2] & 0x30) << 3) | ((signs[k / 2] & 0xC0) << 17));
+                r.grid[k] = iq_signed_grid(grid[0], s0);
+                r.grid[k + 1] = iq_signed_grid(grid[1], s1);
+            }
         }
         r.d = __half2float(b->d);
         r.scale0 = b->scales[iqs / 2] & 15;
@@ -58,10 +70,16 @@ __device__ __forceinline__ IqDot32 iq_decode32(const char* row, int kbx, int iqs
 #pragma unroll
         for (int k = 0; k < 8; k += 2) {
             const uint32_t signs = unpack_ksigns(aux >> (7 * k / 2));
-            const int s0 = iq_sign_mask(signs & 0x08040201);
-            const int s1 = iq_sign_mask(signs & 0x80402010);
-            r.grid[k] = iq_signed_grid(iq3xxs_grid[qs[k]], s0);
-            r.grid[k + 1] = iq_signed_grid(iq3xxs_grid[qs[k + 1]], s1);
+            if constexpr (PACKED_SIGNS) {
+                // unpack_ksigns broadcasts the same sign byte to all four bytes.
+                r.grid[k] = iq_signed_nibble(iq3xxs_grid[qs[k]], signs);
+                r.grid[k + 1] = iq_signed_nibble(iq3xxs_grid[qs[k + 1]], signs >> 4);
+            } else {
+                const int s0 = iq_sign_mask(signs & 0x08040201);
+                const int s1 = iq_sign_mask(signs & 0x80402010);
+                r.grid[k] = iq_signed_grid(iq3xxs_grid[qs[k]], s0);
+                r.grid[k + 1] = iq_signed_grid(iq3xxs_grid[qs[k + 1]], s1);
+            }
         }
         r.d = __half2float(b->d);
         r.scale0 = aux >> 28;
@@ -78,10 +96,15 @@ __device__ __forceinline__ IqDot32 iq_decode32(const char* row, int kbx, int iqs
         for (int k = 0; k < 8; k += 2) {
             const int g0 = iq3s_grid[qs[k] | ((qh << (8 - k)) & 0x100)];
             const int g1 = iq3s_grid[qs[k + 1] | ((qh << (7 - k)) & 0x100)];
-            const int s0 = iq_sign_mask(((signs[k / 2] & 0x03) << 7) | ((signs[k / 2] & 0x0C) << 21));
-            const int s1 = iq_sign_mask(((signs[k / 2] & 0x30) << 3) | ((signs[k / 2] & 0xC0) << 17));
-            r.grid[k] = iq_signed_grid(g0, s0);
-            r.grid[k + 1] = iq_signed_grid(g1, s1);
+            if constexpr (PACKED_SIGNS) {
+                r.grid[k] = iq_signed_nibble(g0, signs[k / 2]);
+                r.grid[k + 1] = iq_signed_nibble(g1, signs[k / 2] >> 4);
+            } else {
+                const int s0 = iq_sign_mask(((signs[k / 2] & 0x03) << 7) | ((signs[k / 2] & 0x0C) << 21));
+                const int s1 = iq_sign_mask(((signs[k / 2] & 0x30) << 3) | ((signs[k / 2] & 0xC0) << 17));
+                r.grid[k] = iq_signed_grid(g0, s0);
+                r.grid[k + 1] = iq_signed_grid(g1, s1);
+            }
         }
         r.d = __half2float(b->d);
         r.scale0 = 1 + 2 * ((b->scales[iqs / 4] >> ((iqs << 1) & 4)) & 15);

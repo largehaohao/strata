@@ -28,7 +28,11 @@ inline ExpertCache static_decode_cache(const Model& model, const CardW& weights,
     const long long pool_hint = full_kv_bytes ? env_int("FNX_STATIC_CACHE_ARENA_POOL", -1) : -1;
     if (pool_hint < -1 || pool_hint >= groups)
         throw std::runtime_error("FNX_STATIC_CACHE_ARENA_POOL: expected -1 (automatic) or an existing cache pool");
-    const auto plan = static_kv_cache_plan(static_cache_layout(shapes, slots, groups, MAXT * TOPK, padding == 1),
+    const auto pool1_slots = env_int("FNX_STATIC_CACHE_POOL1_SLOTS", 0);
+    if (pool1_slots < 0 || pool1_slots > 4096 || pool1_slots % 32 ||
+        (pool1_slots && (groups != 2 || pool1_slots < MAXT * TOPK)))
+        throw std::runtime_error("FNX_STATIC_CACHE_POOL1_SLOTS: 0 or room for a complete window, in multiples of 32 up to 4096 with two groups");
+    const auto plan = static_kv_cache_plan(static_cache_layout(shapes, slots, groups, MAXT * TOPK, padding == 1, (int)pool1_slots),
                                            full_kv_bytes, base_kv_bytes, (int) pool_hint);
     const auto& layout = plan.cache;
     ExpertCache ec;

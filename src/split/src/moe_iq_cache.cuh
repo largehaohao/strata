@@ -2,7 +2,7 @@
 // compute immediately while cold jobs read RAM. Kernel completion publishes all
 // copied gate/up and down bytes for subsequent layers/windows. Keep the IQ dot
 // and reduction order identical to k_moe_gu_iq; moe_cache_gu_test checks both.
-template <ggml_type TA, int TT, int G = 32, bool COPY = false>
+template <ggml_type TA, int TT, int G = 32, bool COPY = false, bool PACKED_SIGNS = false>
 __global__ void __launch_bounds__(MMVQ_THREADS) k_moe_gu_iq_cache(
     MoeW w, const Job* __restrict__ jobs, const int* __restrict__ njobs,
     const block_q8_1* __restrict__ y, float* __restrict__ out, CacheDownCopy copy = {}, CacheGateUpCopy cache = {}) {
@@ -76,7 +76,7 @@ __global__ void __launch_bounds__(MMVQ_THREADS) k_moe_gu_iq_cache(
             for (int p = 0; p < PARTS; ++p) {
 #pragma unroll 8
                 for (int kbx = (gl + p * G) / per_block; kbx < w.ncols / qk; kbx += 32 / per_block) {
-                    const IqDot32 decoded = iq_decode32<TA>(wr, kbx, kqs);
+                    const IqDot32 decoded = iq_decode32<TA, PACKED_SIGNS>(wr, kbx, kqs);
 #pragma unroll
                     for (int j = 0; j < TT; ++j)
                         if (j < jb.n) tmp[p][j] += iq_dot32<TA>(decoded, y[(size_t) jb.y[j] * (w.ncols / 32) + kbx * (qk / 32) + kqs / 2]);

@@ -356,9 +356,31 @@ __global__ void __launch_bounds__(128) kernel_hc_down_increment(const _Float16* 
 #endif
 }
 
-template<bool Quantized>
+template<bool Quantized, bool Packed = false>
 __device__ __forceinline__ h16 gsu_weight_fragment(const void* weights, const uint16_t* scales, size_t index) {
     if constexpr (!Quantized) return frag(static_cast<const _Float16*>(weights) + index);
+    else if constexpr (Packed) {
+        const uint4 raw = *reinterpret_cast<const uint4*>(static_cast<const signed char*>(weights) + index);
+        const uint32_t words[4] = {raw.x, raw.y, raw.z, raw.w};
+        const __half2 d = __half2half2(__ushort_as_half(scales[index / 32]));
+        // Place biased bytes under the exponent for 1024, then subtract 1152.
+        // Both the signed integers and the block scale are exact half values.
+        const __half2 bias = __half2half2(__ushort_as_half(0x6480));
+        const __half2 zero = __float2half2_rn(0.f);
+        using U8 = unsigned int __attribute__((ext_vector_type(8)));
+        U8 bits;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint32_t w = words[i] ^ 0x80808080u;
+            const uint32_t lo = __builtin_amdgcn_perm(0x64646464u, w, 0x04010400u);
+            const uint32_t hi = __builtin_amdgcn_perm(0x64646464u, w, 0x04030402u);
+            const __half2 x = __hsub2(__builtin_bit_cast(__half2, lo), bias);
+            const __half2 y = __hsub2(__builtin_bit_cast(__half2, hi), bias);
+            bits[2 * i] = __builtin_bit_cast(unsigned int, __hfma2(x, d, zero));
+            bits[2 * i + 1] = __builtin_bit_cast(unsigned int, __hfma2(y, d, zero));
+        }
+        return __builtin_bit_cast(h16, bits);
+    }
     else {
         using Bytes = signed char __attribute__((ext_vector_type(16)));
         Bytes q;
@@ -373,7 +395,7 @@ __device__ __forceinline__ h16 gsu_weight_fragment(const void* weights, const ui
 
 // rocBLAS 5.2 on gfx1100 uses three FP32 accumulators for these small-row
 // projections. Each 128-column tile rotates its 16-element segments along K.
-template<int k, int stagger_mask, bool Quantized = false>
+template<int k, int stagger_mask, bool Quantized = false, bool Packed = false>
 __global__ void __launch_bounds__(96) kernel_gsu3(const _Float16* __restrict__ x, const void* __restrict__ w,
                                                   float* __restrict__ y, int rows, int ldy,
                                                   const uint16_t* scales = nullptr, int first_column = 0) {
@@ -390,7 +412,7 @@ __global__ void __launch_bounds__(96) kernel_gsu3(const _Float16* __restrict__ x
             for (int step = begin; step < end; ++step) {
                 const int offset = 16 * (group + 3 * step);
                 const h16 a = frag(x + (size_t) row * k + offset);
-                const h16 b = gsu_weight_fragment<Quantized>(w, scales, (size_t) col * k + offset);
+                const h16 b = gsu_weight_fragment<Quantized,Packed>(w, scales, (size_t) col * k + offset);
 #pragma unroll
                 for (int i = 0; i < 16; ++i) sum = fmaf((float) a[i], (float) b[i], sum);
             }
@@ -400,6 +422,46 @@ __global__ void __launch_bounds__(96) kernel_gsu3(const _Float16* __restrict__ x
     __syncthreads();
     if (group == 0 && row < rows)
         y[(size_t) row * ldy + col] = (partial[0][lane] + partial[1][lane]) + partial[2][lane];
+}
+
+// Two output rows share each decoded weight fragment. Each row retains the
+// original three partial chains, segment rotation and final addition order.
+template <int K, int StaggerMask>
+__global__ void __launch_bounds__(96) kernel_gsu3_rowpair(const _Float16* __restrict__ x, const void* __restrict__ w,
+                                                        float* __restrict__ y, int rows, int ldy,
+                                                        const uint16_t* scales, int first_column) {
+    constexpr int segments = K / 16;
+    const int group = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int row = blockIdx.y * 8 + lane / 8, col = blockIdx.x * 8 + lane % 8;
+    __shared__ float partial[3][64];
+    float sum0 = 0.f, sum1 = 0.f;
+    if (row < rows) {
+        const int count = (segments + 2 - group) / 3;
+        const int start = (((first_column + col) / 128) & StaggerMask) * 8;
+        for (int pass = 0; pass < 2; ++pass) {
+            const int begin = pass == 0 ? start : 0, end = pass == 0 ? count : start;
+            for (int step = begin; step < end; ++step) {
+                const int offset = 16 * (group + 3 * step);
+                const h16 a0 = frag(x + (size_t) row * K + offset);
+                h16 a1 = {};
+                if (row + 4 < rows) a1 = frag(x + (size_t) (row + 4) * K + offset);
+                const h16 b = gsu_weight_fragment<true, true>(w, scales, (size_t) col * K + offset);
+#pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    sum0 = fmaf((float) a0[i], (float) b[i], sum0);
+                    sum1 = fmaf((float) a1[i], (float) b[i], sum1);
+                }
+            }
+        }
+    }
+    partial[group][lane] = sum0;
+    partial[group][32 + lane] = sum1;
+    __syncthreads();
+    if (group == 0) {
+        if (row < rows) y[(size_t) row * ldy + col] = (partial[0][lane] + partial[1][lane]) + partial[2][lane];
+        if (row + 4 < rows)
+            y[(size_t) (row + 4) * ldy + col] = (partial[0][32 + lane] + partial[1][32 + lane]) + partial[2][32 + lane];
+    }
 }
 
 template <int BN, int WN>
@@ -1175,21 +1237,40 @@ bool strata_pf_hcdown_gsu3_f16(const uint16_t* x, const uint16_t* w, float* y, i
     return n == 320 && k == 10240 && launch_gsu3<10240, 15>(x, w, y, rows, n, ldy, stream);
 }
 
+template <int K, int Mask>
+static bool q8_gsu_selected(const uint16_t* x, const int8_t* q, const uint16_t* d, float* y,
+                            int rows, int n, int ldy, int first_column, void* stream) {
+    static const int mode = [] {
+        const char* v = std::getenv("STRATA_PF_Q8_PAIR");
+        return v && v[0] >= '1' && v[0] <= '2' && v[1] == 0 ? v[0] - '0' : 0;
+    }();
+    auto st = static_cast<hipStream_t>(stream);
+    // Pair rows in measured shapes with enough blocks for the card.
+    const bool pair_rows = mode == 2 && (n >= 2048 || (K == 10240 && rows >= 32));
+    if (pair_rows)
+        pfg::kernel_gsu3_rowpair<K, Mask><<<dim3(n / 8, (rows + 7) / 8), 96, 0, st>>>(
+            (const _Float16*) x, q, y, rows, ldy, d, first_column);
+    else if (mode)
+        pfg::kernel_gsu3<K, Mask, true, true><<<dim3(n / 8, (rows + 3) / 4), 96, 0, st>>>(
+            (const _Float16*) x, q, y, rows, ldy, d, first_column);
+    else
+        pfg::kernel_gsu3<K, Mask, true><<<dim3(n / 8, (rows + 3) / 4), 96, 0, st>>>(
+            (const _Float16*) x, q, y, rows, ldy, d, first_column);
+    return hipGetLastError() == hipSuccess;
+}
+
 bool strata_pf_q8_gsu3_f16(const uint16_t* x, const int8_t* q, const uint16_t* d, float* y,
                            int rows, int n, int k, int ldy, int reference_n, int first_column, void* stream) {
     if (!x || !q || !d || !y || rows < 16 || rows >= 64 || n < 1 || n % 8 || ldy < n ||
         first_column < 0 || reference_n < n || first_column > reference_n - n ||
         ((reinterpret_cast<uintptr_t>(x) | reinterpret_cast<uintptr_t>(q)) & 15) || !strata_wmma_gfx11_device()) return false;
-    const dim3 grid(n / 8, (rows + 3) / 4);
-    auto s = static_cast<hipStream_t>(stream);
     if (k == 10240 && reference_n == 320)
-        pfg::kernel_gsu3<10240,15,true><<<grid,96,0,s>>>((const _Float16*)x,q,y,rows,ldy,d,first_column);
-    else if (k == 2560 && (reference_n == 512 || reference_n == 640 || reference_n == 1664 || reference_n == 5760 || reference_n == 6528))
-        pfg::kernel_gsu3<2560,3,true><<<grid,96,0,s>>>((const _Float16*)x,q,y,rows,ldy,d,first_column);
-    else if (k == 3072 && reference_n == 2560)
-        pfg::kernel_gsu3<3072,7,true><<<grid,96,0,s>>>((const _Float16*)x,q,y,rows,ldy,d,first_column);
-    else return false;
-    return hipGetLastError() == hipSuccess;
+        return q8_gsu_selected<10240, 15>(x, q, d, y, rows, n, ldy, first_column, stream);
+    if (k == 2560 && (reference_n == 512 || reference_n == 640 || reference_n == 1664 || reference_n == 5760 || reference_n == 6528))
+        return q8_gsu_selected<2560, 3>(x, q, d, y, rows, n, ldy, first_column, stream);
+    if (k == 3072 && reference_n == 2560)
+        return q8_gsu_selected<3072, 7>(x, q, d, y, rows, n, ldy, first_column, stream);
+    return false;
 }
 
 bool strata_pf_wide_gsu3_f16(const uint16_t* x, const uint16_t* w, float* y, int rows, int n, int k, int ldy, void* stream) {

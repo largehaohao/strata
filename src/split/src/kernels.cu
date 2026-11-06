@@ -1010,6 +1010,50 @@ __global__ void k_ring_a2a_push(Ring r, float* x, int T, const unsigned* tagp, i
     }
 }
 
+#if FNX_HIP
+// Send both words before waiting for the peer. Each still carries its own tag,
+// and the receiver sums the rounded values in the original card order.
+__global__ void k_ring_a2a_push_pair(Ring r, float* x, int T, const unsigned* tagp, int call, RingMoe m) {
+    const unsigned tag = *tagp * 256u + (unsigned) call + 1u;
+    const int card = r.card, step = gridDim.x * blockDim.x;
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t slot = (size_t) MAXT * NP, offset = (size_t) (tag & 1) * NCARD * slot;
+    auto* mine = (unsigned long long*) r.pk + offset;
+    for (int base = tid; base < T * NP; base += 2 * step) {
+        if (*(volatile const unsigned*) r.err & 1u) return;
+        __half2 sent[2];
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int e = base + j * step;
+            if (e < T * NP) {
+                const float2 v = ring_x2(x, m, T, e / NP, e % NP);
+                if (!(fabsf(v.x) <= RING_MAX && fabsf(v.y) <= RING_MAX)) atomicOr(r.err, 2u);
+                sent[j] = __floats2half2_rn(v.x, v.y);
+                const unsigned long long word = (unsigned long long) __builtin_bit_cast(unsigned, sent[j]) |
+                                                ((unsigned long long) tag << 32);
+#pragma unroll
+                for (int d = 0; d < NCARD; ++d)
+                    if (d != card)
+                        *(volatile unsigned long long*) ((unsigned long long*) r.peer_pk[d] + offset + (size_t) card * slot + e) = word;
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int e = base + j * step;
+            if (e < T * NP) {
+                float2 sum = make_float2(0.f, 0.f);
+#pragma unroll
+                for (int src = 0; src < NCARD; ++src) {
+                    const float2 v = src == card ? __half22float2(sent[j]) : rtake(mine + (size_t) src * slot + e, tag, r.err);
+                    sum = src == 0 ? v : add2(sum, v);
+                }
+                x[2 * e] = sum.x;
+                x[2 * e + 1] = sum.y;
+            }
+        }
+    }
+}
+#endif
 
 // ---------------------------------------------------------------- argmax
 // a float's bits made monotone as unsigned (larger float, larger key)
@@ -1755,7 +1799,13 @@ void ring_sum(const Ring& r, float* x, int T, const unsigned* tag, int call, voi
     }
 #endif
     if (r.peer && T <= MAXT) {
-        k_ring_a2a_push<<<grid, 256, 0, (cudaStream_t) st>>>(r, x, T, tag, call, m);
+#if FNX_HIP
+        static const auto paired = env_int("FNX_RING_PAIRED_PUSH", 0);
+        if (paired != 0 && paired != 1) throw std::runtime_error("FNX_RING_PAIRED_PUSH: expected 0 or 1");
+        if (paired) k_ring_a2a_push_pair<<<grid, 256, 0, (cudaStream_t) st>>>(r, x, T, tag, call, m);
+        else
+#endif
+            k_ring_a2a_push<<<grid, 256, 0, (cudaStream_t) st>>>(r, x, T, tag, call, m);
         ck_launch("ring_sum (one hop, peer push)");
         return;
     }
@@ -2093,8 +2143,14 @@ void gdn_core(const float* qkvz, const float* ab, float* hist, const float* conv
     float* td;
     twin_of(yq, nv * HS, tq, td);
 #if FNX_HIP && !FNX_27B
+    static const bool eight_parts = [] {
+        const auto value = env_int("FNX_GDN_EIGHT_PARTS", 0);
+        if (value != 0 && value != 1) throw std::runtime_error("FNX_GDN_EIGHT_PARTS: expected 0 or 1");
+        return value == 1;
+    }();
 #define FNX_GDN(t) \
-    if (replay_log) k_gdn_core<t, true><<<nv * GDN_Q, GDN_THREADS, 0, s>>>(qkvz, ab, hist, convw, dt, a, nw, S, y, ctl, scratch, snap, hsnap, nk, nv, vmap, eps, tq, td, y32, GdnLanes{}, replay_log); \
+    if (replay_log && eight_parts && t >= 6) k_gdn_core_8<t, true><<<nv * GDN_Q, 256, 0, s>>>(qkvz, ab, hist, convw, dt, a, nw, S, y, ctl, scratch, snap, hsnap, nk, nv, vmap, eps, tq, td, y32, GdnLanes{}, replay_log); \
+    else if (replay_log) k_gdn_core<t, true><<<nv * GDN_Q, GDN_THREADS, 0, s>>>(qkvz, ab, hist, convw, dt, a, nw, S, y, ctl, scratch, snap, hsnap, nk, nv, vmap, eps, tq, td, y32, GdnLanes{}, replay_log); \
     else k_gdn_core<t><<<nv * GDN_Q, GDN_THREADS, 0, s>>>(qkvz, ab, hist, convw, dt, a, nw, S, y, ctl, scratch, snap, hsnap, nk, nv, vmap, eps, tq, td, y32, GdnLanes{})
 #else
     if (replay_log) throw std::runtime_error("GDN replay requires the Flash-Next HIP build");
