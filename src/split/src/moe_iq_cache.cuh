@@ -66,7 +66,7 @@ __global__ void __launch_bounds__(MMVQ_THREADS) k_moe_gu_iq_cache(
     // Join them before the remaining shuffles to preserve the reduction order.
     constexpr int PARTS = 32 / G;
     float tmp[PARTS][TT] = {};
-    if constexpr (TA == GGML_TYPE_IQ2_S || TA == GGML_TYPE_IQ3_XXS || TA == GGML_TYPE_IQ3_S) {
+    if constexpr (TA == GGML_TYPE_IQ2_XXS || TA == GGML_TYPE_IQ2_S || TA == GGML_TYPE_IQ3_XXS || TA == GGML_TYPE_IQ3_S) {
         constexpr int qk = ggml_cuda_type_traits<TA>::qk, vdr = vdr_of<TA>();
         constexpr int per_block = ggml_cuda_type_traits<TA>::qi / vdr;
         static_assert(G >= per_block && G % per_block == 0, "lanes per weight block");

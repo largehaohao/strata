@@ -51,6 +51,12 @@ not replaced. All new execution paths are opt-in.
 - `FNX_IQ_REUSE=1` decodes an IQ2_S, IQ3_XXS or IQ3_S weight group once for
   all token rows in an expert job. Its integer divisions, scaling and reduction
   order match the existing Q8 dot product. Other weight types keep their path.
+- `FNX_IQ2_XXS_REUSE=1`, with IQ reuse, also reuses IQ2_XXS gate/up weights.
+  It preserves the original integer scaling and reduction order. With group 16,
+  it supports the fused cold gate/up and down copies below. Zero keeps the
+  original IQ2_XXS path and remains the default.
+  HIP's existing `FNX_PF_MOE_WIDE=1` prompt path also uses packed FP16 pairs
+  for IQ2_XXS dequantization, matching the original tile values exactly.
 - `FNX_IQ_GROUP=16`, with IQ reuse, assigns 16 lanes to each output row.
   Each lane keeps two partial sums, then joins them in the original 32-lane
   reduction order. The default remains 32 lanes.

@@ -27,6 +27,9 @@ __device__ __forceinline__ void mq_zero32(__half* dst) {
 // Unsloth Dynamic v3.1 keeps IQ2_XXS gate/up experts and a Q5_0 down layer.
 // Read their original blocks; the prompt operands are ggml's dequantized values
 // rounded once to FP16, as for the other expert formats below.
+#if defined(FNX_MOE_MMA_WIDE) && FNX_HIP
+__device__ __forceinline__ void mq_iq_packed4(__half2*, uint32_t, __half2, __half2, uint32_t, int);
+#endif
 template <> struct MmTile<GGML_TYPE_IQ2_XXS> {
     uint32_t codes, aux;
     uint16_t dh;
@@ -47,17 +50,37 @@ template <> struct MmTile<GGML_TYPE_IQ2_XXS> {
         if (!item) return;
         __half* dst = sw + threadIdx.x / MM_TPR * MM_LD + threadIdx.x % MM_TPR * 32;
         if (!live) { mq_zero32(dst); return; }
+#if defined(FNX_MOE_MMA_WIDE) && FNX_HIP
+        const __half2 d = __half2half2(__ushort_as_half(dh));
+        const __half2 scale = __float2half2_rn((float) (1 + 2 * (aux >> 28)) * 0.125f);
+        __half2 h[16];
+#else
         const float d = mq_half(dh) * (0.5f + (aux >> 28)) * 0.25f;
         float f[32];
+#endif
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
+#if defined(FNX_MOE_MMA_WIDE) && FNX_HIP
+            const uint64_t grid = iq2xxs_grid[(codes >> (8 * l)) & 255];
+#else
             const uint8_t* grid = (const uint8_t*) (iq2xxs_grid + ((codes >> (8 * l)) & 255));
+#endif
             const uint8_t signs = ksigns_iq2xs[(aux >> (7 * l)) & 127];
+#if defined(FNX_MOE_MMA_WIDE) && FNX_HIP
+            mq_iq_packed4(h + 4 * l, (uint32_t) grid, scale, d, signs, 0);
+            mq_iq_packed4(h + 4 * l + 2, (uint32_t) (grid >> 32), scale, d, signs, 4);
+#else
 #pragma unroll
             for (int j = 0; j < 8; ++j)
                 f[8 * l + j] = d * grid[j] * ((signs & kmask_iq2xs[j]) ? -1.f : 1.f);
+#endif
         }
+#if defined(FNX_MOE_MMA_WIDE) && FNX_HIP
+        mm_store8(dst, h);
+        mm_store8(dst + 16, h + 8);
+#else
         mq_put32(dst, f);
+#endif
     }
 };
 

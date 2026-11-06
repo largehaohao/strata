@@ -2459,7 +2459,7 @@ void router_route(const float* W, const float* x, float* logits, int T, int* top
 namespace {
 void moe_mm(bool down, const DW& A, size_t sa, const Job* jobs, const int* njobs, int njobs_max, const void* in, void* out,
             void* st, int tt = 0, const CacheDownCopy* copy = nullptr, const CacheGateUpCopy* gu_copy = nullptr) {
-    if ((copy || gu_copy) && (down || (A.type != T_IQ2_S && A.type != T_IQ3_XXS && A.type != T_IQ3_S)))
+    if ((copy || gu_copy) && (down || (A.type != T_IQ2_XXS && A.type != T_IQ2_S && A.type != T_IQ3_XXS && A.type != T_IQ3_S)))
         throw std::runtime_error("moe: cache copy requires IQ gate/up");
     if (gu_copy && !copy) throw std::runtime_error("moe: gate/up copy requires a fused down copy");
     const int T = tt ? tt : njobs_max / TOPK;   // the most rows a job has
@@ -2473,7 +2473,7 @@ void moe_mm(bool down, const DW& A, size_t sa, const Job* jobs, const int* njobs
         case T_Q5_K: moe_launch<GGML_TYPE_Q5_K>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
         case T_Q5_1: moe_launch<GGML_TYPE_Q5_1>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
         case T_Q5_0: moe_launch<GGML_TYPE_Q5_0>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
-        case T_IQ2_XXS: moe_launch<GGML_TYPE_IQ2_XXS>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
+        case T_IQ2_XXS: moe_launch<GGML_TYPE_IQ2_XXS>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T, copy, gu_copy); break;
         case T_Q4_0: moe_launch<GGML_TYPE_Q4_0>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
         case T_Q2_0: moe_launch<GGML_TYPE_Q4_0, true>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
         case T_Q8_0: moe_launch<GGML_TYPE_Q8_0>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;

@@ -129,6 +129,7 @@ int main() { try {
         checked += fnx::run(formats[2], 320, 2560, true);
         checked += fnx::run(formats[4], 2560, 640, true);
         checked += fnx::run(formats[5], 2560, 640, true);
+        checked += fnx::run(formats[6], 2560, 640, true);
     }
     std::cout << "PASS " << checked << " exact wide MoE comparisons\n";
 } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; } }

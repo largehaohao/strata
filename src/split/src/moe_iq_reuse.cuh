@@ -39,7 +39,22 @@ __device__ __forceinline__ int iq_signed_nibble(int grid, unsigned nibble) {
 template <ggml_type TA, bool PACKED_SIGNS = false>
 __device__ __forceinline__ IqDot32 iq_decode32(const char* row, int kbx, int iqs) {
     IqDot32 r;
-    if constexpr (TA == GGML_TYPE_IQ2_S) {
+    if constexpr (TA == GGML_TYPE_IQ2_XXS) {
+        const block_iq2_xxs* b = reinterpret_cast<const block_iq2_xxs*>(row) + kbx;
+        const int packed = get_int_b2(b->qs, iqs);
+        const uint8_t* qs = reinterpret_cast<const uint8_t*>(&packed);
+        const uint32_t aux = get_int_b2(b->qs, iqs + 1);
+#pragma unroll
+        for (int k = 0; k < 8; k += 2) {
+            const uint2 grid = reinterpret_cast<const uint2*>(iq2xxs_grid)[qs[k / 2]];
+            const unsigned signs = ksigns_iq2xs[(aux >> (7 * k / 2)) & 127];
+            r.grid[k] = iq_signed_nibble(grid.x, signs);
+            r.grid[k + 1] = iq_signed_nibble(grid.y, signs >> 4);
+        }
+        r.d = __half2float(b->d);
+        r.scale0 = (aux >> 27) | 1;
+        r.scale1 = 0;
+    } else if constexpr (TA == GGML_TYPE_IQ2_S) {
         const block_iq2_s* b = reinterpret_cast<const block_iq2_s*>(row) + kbx;
         const int packed = get_int_b2(b->qs, iqs / 2);
         const uint8_t* qs = reinterpret_cast<const uint8_t*>(&packed);
@@ -128,7 +143,8 @@ __device__ __forceinline__ float iq_dot32(const IqDot32& w, const block_q8_1& x)
     } else {
 #pragma unroll
         for (int k = 0; k < 8; ++k) sum = ggml_cuda_dp4a(w.grid[k], get_int_b4(x.qs, k), sum);
-        if constexpr (TA == GGML_TYPE_IQ3_XXS) sum = (w.scale0 * sum + sum / 2) / 2;
+        if constexpr (TA == GGML_TYPE_IQ2_XXS) sum = (sum * w.scale0) / 8;
+        else if constexpr (TA == GGML_TYPE_IQ3_XXS) sum = (w.scale0 * sum + sum / 2) / 2;
         else sum *= w.scale0;
     }
     const float d = w.d * __low2float(x.ds);
@@ -171,7 +187,7 @@ __global__ void __launch_bounds__(MMVQ_THREADS) k_moe_gu_iq(
     // Join them before the remaining shuffles to preserve the reduction order.
     constexpr int PARTS = 32 / G;
     float tmp[PARTS][TT] = {};
-    if constexpr (TA == GGML_TYPE_IQ2_S || TA == GGML_TYPE_IQ3_XXS || TA == GGML_TYPE_IQ3_S) {
+    if constexpr (TA == GGML_TYPE_IQ2_XXS || TA == GGML_TYPE_IQ2_S || TA == GGML_TYPE_IQ3_XXS || TA == GGML_TYPE_IQ3_S) {
         constexpr int qk = ggml_cuda_type_traits<TA>::qk, vdr = vdr_of<TA>();
         constexpr int per_block = ggml_cuda_type_traits<TA>::qi / vdr;
         static_assert(G >= per_block && G % per_block == 0, "lanes per weight block");

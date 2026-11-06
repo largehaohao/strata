@@ -1114,8 +1114,10 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
     const bool static_live = b.static_cache.n_slots && lyr >= 0 && lyr < NL;
     const ExpertCache& ec = static_live ? b.static_cache : w.ec;
     static const int fused_dn_blocks = (int) env_int("FNX_STATIC_CACHE_FUSED_DN", 0);
+    static const bool xxs_reuse = env_int("FNX_IQ2_XXS_REUSE", 0) == 1;
     const bool fused_dn = static_live && fused_dn_blocks &&
-        (L.gu_e.type == T_IQ2_S || L.gu_e.type == T_IQ3_XXS || L.gu_e.type == T_IQ3_S);
+        (L.gu_e.type == T_IQ2_S || L.gu_e.type == T_IQ3_XXS || L.gu_e.type == T_IQ3_S ||
+         (xxs_reuse && L.gu_e.type == T_IQ2_XXS));
     static const bool fused_gu_enabled = env_int("FNX_STATIC_CACHE_FUSED_GU", 0) == 1;
     const bool fused_gu = fused_dn && fused_gu_enabled;
     // the shared expert (rows P + t of part): its gate|up in the router's launch and its swiglu and down in the routed

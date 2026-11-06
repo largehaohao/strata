@@ -572,8 +572,16 @@ void moe_launch(bool down, const MoeW& w, const Job* jobs, const int* njobs, int
     } else {
         if (moe_g<TA>(w.ncols) != 32) throw std::runtime_error("moe gate|up: only 32 lanes a row are compiled (rows of N columns)");
         const dim3 grid((w.nrows + MMVQ_THREADS / 32 - 1) / (MMVQ_THREADS / 32), njobs_max);
-        if constexpr (TA == GGML_TYPE_IQ2_S || TA == GGML_TYPE_IQ3_XXS || TA == GGML_TYPE_IQ3_S) {
-            static const long long reuse = env_int("FNX_IQ_REUSE", 0);
+        if constexpr (TA == GGML_TYPE_IQ2_XXS || TA == GGML_TYPE_IQ2_S || TA == GGML_TYPE_IQ3_XXS || TA == GGML_TYPE_IQ3_S) {
+            static const long long reuse = [] {
+                const long long value = env_int("FNX_IQ_REUSE", 0);
+                if constexpr (TA == GGML_TYPE_IQ2_XXS) {
+                    const long long xxs = env_int("FNX_IQ2_XXS_REUSE", 0);
+                    if (xxs != 0 && xxs != 1) throw std::runtime_error("FNX_IQ2_XXS_REUSE: expected 0 or 1");
+                    return xxs ? value : 0LL;
+                }
+                return value;
+            }();
             if (copy && !reuse) throw std::runtime_error("down copy requires FNX_IQ_REUSE=1");
             if (reuse != 0 && reuse != 1) throw std::runtime_error("FNX_IQ_REUSE: expected 0 or 1");
             if (reuse) {
