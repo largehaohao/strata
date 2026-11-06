@@ -25,13 +25,16 @@ __device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache
     }
     const int s0 = ec.s0[p] + lent, n = ec.n[p] - lent;
     for (int j = lane; j < nj; j += 32)
-        if (const int s = ec.slot_of[base + jobs[j].w]; s >= 0) ec.ref[s] = 2;
+        if (const int s = ec.slot_of[base + jobs[j].w]; s >= 0) {
+            if (ec.age) ec.age[s] = min(ec.max_age, (int) ec.age[s] + 1);
+            ec.ref[s] = 2;
+        }
     __syncwarp();
     int hand = ec.hand[p] - s0, k = 0;   // within the slots not lent
     if (hand < 0 || hand >= n) hand = 0;
     // the misses found 32 jobs at a time (a load each, side by side), then taken in job order
     for (int j0 = 0; j0 < nj; j0 += 32) {
-        unsigned miss = __ballot_sync(0xffffffffu, j0 + lane < nj && ec.slot_of[base + jobs[j0 + lane].w] < 0);
+        unsigned miss = __ballot_sync(0xffffffffu, j0 + lane < nj && ec.slot_of[base + jobs[j0 + lane].w] == -1);
         while (miss) {
             const int g = base + jobs[j0 + __ffs(miss) - 1].w;
             miss &= miss - 1;
@@ -41,7 +44,13 @@ __device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache
                 const unsigned char r = ec.ref[idx];
                 const unsigned free = __ballot_sync(0xffffffffu, r == 0);
                 const int f = free ? __ffs(free) - 1 : 32;
-                if (lane < f && r == 1) ec.ref[idx] = 0;
+                if (lane < f && r == 1) {
+                    if (ec.age && ec.age[idx] > 1) --ec.age[idx];
+                    else {
+                        ec.ref[idx] = 0;
+                        if (ec.age) ec.age[idx] = 0;
+                    }
+                }
                 if (free) victim = s0 + (hand + f) % n;
                 hand = (hand + (free ? f + 1 : 32)) % n;
             }
@@ -54,6 +63,7 @@ __device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache
                 ec.owner[victim] = g;
                 ec.slot_of[g] = victim;
                 ec.ref[victim] = 2;
+                if (ec.age) ec.age[victim] = 1;
                 char* at = ec.pool[p] + (size_t) (victim - ec.s0[p]) * ec.slot_bytes[p];
                 ec.ep_gu[g] = at;
                 ec.ep_dn[g] = at + ec.dn_off[p];
@@ -63,15 +73,16 @@ __device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache
             __syncwarp();
         }
     }
-    for (int j = lane; j < nj; j += 32) ec.ref[ec.slot_of[base + jobs[j].w]] = 1;
+    for (int j = lane; j < nj; j += 32)
+        if (const int s = ec.slot_of[base + jobs[j].w]; s >= 0) ec.ref[s] = 1;
     if (lane == 0) {
         ec.hand[p] = s0 + hand;
         list[0] = k;
     }
 }
 
-template <int T>
-__global__ void __launch_bounds__(RR_THREADS) k_router_route(const float* __restrict__ W, const float* __restrict__ x,
+template <int T, bool BF16 = false>
+__global__ void __launch_bounds__(RR_THREADS) k_router_route(const void* __restrict__ W, const float* __restrict__ x,
                                                             float* __restrict__ logits, int* __restrict__ topi,
                                                             float* __restrict__ topw, Job* __restrict__ gu, Job* __restrict__ dn,
                                                             int* __restrict__ njobs, unsigned* __restrict__ counter,
@@ -87,10 +98,10 @@ __global__ void __launch_bounds__(RR_THREADS) k_router_route(const float* __rest
     const int row = blockIdx.x * RR_ROWS + rw;
     __shared__ float rsum[T][RR_THREADS / 32];
     if (row < L) {
-        const float4* w4 = reinterpret_cast<const float4*>(W + (size_t) row * N) + half * NC * 32;
+        const size_t first4 = (size_t) row * (N / 4) + half * NC * 32;
         float4 wv[NC];
 #pragma unroll
-        for (int i = 0; i < NC; ++i) wv[i] = __ldg(w4 + i * 32 + lane);
+        for (int i = 0; i < NC; ++i) wv[i] = load_weight4<BF16>(W, first4 + i * 32 + lane);
         // unrolled over the tokens: each pair's x loads and sums run beside the others' (rolled, the pairs waited on
         // each other: one wave of blocks, so latency set the time). Each logit's summation order is unchanged
 #pragma unroll
@@ -271,6 +282,10 @@ __global__ void __launch_bounds__(MMVQ_THREADS) k_moe_gu(MoeW w, const Job* __re
     job_store<G, TT>(tmp, jb.n, live, row, jb.out, out, w.nrows);
 }
 
+#include "moe_iq_reuse.cuh"
+#include "moe_iq_cache.cuh"
+#include "moe_q2_down.cuh"
+
 // down: one block per (job, rows_per_block rows). The block first makes its tokens' h = silu(gate) * up (gu rows
 // jb.y[j] of [gate (ffs) | up (ffs)]) as q8_1 in shared memory; thread (row, u) then dots its 32-column unit u of the
 // row with each token's h, and the block sums a row's units into out row jb.out[j]
@@ -296,9 +311,10 @@ __global__ void k_moe_h(const float* __restrict__ gu, int ffs, int npairs) {
 
 // PRE: the pairs' h made by k_moe_h (past 8 rows: kbench 16 rows 82.9 -> 70.7 us); else each block makes its own (the
 // extra launch costs more than it saves: 5 rows 30.7 -> 31.7)
-template <ggml_type TA, bool PRE>
+template <ggml_type TA, bool PRE, bool PACKED_Q2 = false>
 __global__ void __launch_bounds__(DN_THREADS) k_moe_down(MoeW w, const Job* __restrict__ jobs, const int* __restrict__ njobs,
                                                         const float* __restrict__ gu, float* __restrict__ out) {
+    static_assert(!PACKED_Q2 || TA == GGML_TYPE_Q4_0, "packed Q2 retains Q4_0 arithmetic");
     const int ji = blockIdx.y;
     if (ji >= *njobs) return;
     __shared__ Job jb;
@@ -332,7 +348,12 @@ __global__ void __launch_bounds__(DN_THREADS) k_moe_down(MoeW w, const Job* __re
     const bool live = r < rpb && row < w.nrows;
     if (live) {
         const char* wr = moe_expert(w, jb.w) + (size_t) row * w.row_a;
-        for (int j = 0; j < n; ++j) part[j][threadIdx.x] = unit_dot<TA, DN_U>(wr, u, hq[j]);
+        if constexpr (PACKED_Q2) {
+            const Q2Half decoded = q2_load_half(wr, u);
+            for (int j = 0; j < n; ++j) part[j][threadIdx.x] = q2_half_dot(decoded, hq[j] + u);
+        } else {
+            for (int j = 0; j < n; ++j) part[j][threadIdx.x] = unit_dot<TA, DN_U>(wr, u, hq[j]);
+        }
     }
     __syncthreads();
     for (int e = threadIdx.x; e < n * rpb; e += DN_THREADS) {
@@ -377,9 +398,10 @@ __global__ void __launch_bounds__(MMVQ_THREADS) k_moe_gu_big(MoeW w, const BigJo
 }
 
 // k_moe_down for BigJobs: per MAXT pairs, their h into shared memory, the dots, the sums
-template <ggml_type TA>
+template <ggml_type TA, bool PACKED_Q2 = false>
 __global__ void __launch_bounds__(DN_THREADS) k_moe_down_big(MoeW w, const BigJob* __restrict__ jobs, const int* __restrict__ njobs,
                                                             const float* __restrict__ gu, float* __restrict__ out) {
+    static_assert(!PACKED_Q2 || TA == GGML_TYPE_Q4_0, "packed Q2 retains Q4_0 arithmetic");
     const int ji = blockIdx.y;
     if (ji >= *njobs) return;
     __shared__ BigJob jb;
@@ -391,6 +413,10 @@ __global__ void __launch_bounds__(DN_THREADS) k_moe_down_big(MoeW w, const BigJo
     const int row = blockIdx.x * rpb + r;
     const bool live = r < rpb && row < w.nrows;
     const char* wr = moe_expert(w, jb.w) + (size_t) (live ? row : 0) * w.row_a;
+    Q2Half decoded{};
+    if constexpr (PACKED_Q2) {
+        if (live) decoded = q2_load_half(wr, u);
+    }
 #pragma unroll 1
     for (int b0 = 0; b0 < jb.n; b0 += MAXT) {
         const int n = min(MAXT, jb.n - b0);
@@ -404,8 +430,13 @@ __global__ void __launch_bounds__(DN_THREADS) k_moe_down_big(MoeW w, const BigJo
             if (lane == 0) hq[j][b].ds = make_half2(__float2half(d), __float2half(sm));
         }
         __syncthreads();
-        if (live)
-            for (int j = 0; j < n; ++j) part[j][threadIdx.x] = unit_dot<TA, DN_U>(wr, u, hq[j]);
+        if (live) {
+            if constexpr (PACKED_Q2) {
+                for (int j = 0; j < n; ++j) part[j][threadIdx.x] = q2_half_dot(decoded, hq[j] + u);
+            } else {
+                for (int j = 0; j < n; ++j) part[j][threadIdx.x] = unit_dot<TA, DN_U>(wr, u, hq[j]);
+            }
+        }
         __syncthreads();
         for (int e = threadIdx.x; e < n * rpb; e += DN_THREADS) {
             const int j = e / rpb, rr = e % rpb, orow = blockIdx.x * rpb + rr;
@@ -418,14 +449,18 @@ __global__ void __launch_bounds__(DN_THREADS) k_moe_down_big(MoeW w, const BigJo
     }
 }
 
-template <ggml_type TA>
+template <ggml_type TA, bool PACKED_Q2 = false>
 void moe_launch_big(bool down, const MoeW& w, const BigJob* jobs, const int* njobs, int njobs_cap, const void* in, float* out,
                     cudaStream_t s) {
+    if constexpr (PACKED_Q2) {
+        if (!down || w.ncols % 64 || w.row_a != (size_t) w.ncols / 64 * 18)
+            throw std::runtime_error("packed Q2_0 requires down rows of whole 64-value blocks");
+    }
     if (down) {
         if (!unit_ok<TA>(DN_U) || w.ncols / DN_U > DN_MAXB)
             throw std::runtime_error("moe_down: shape or type does not fit the units");
         const int rpb = DN_THREADS / (w.ncols / DN_U);
-        k_moe_down_big<TA><<<dim3((w.nrows + rpb - 1) / rpb, njobs_cap), DN_THREADS, 0, s>>>(w, jobs, njobs, (const float*) in, out);
+        k_moe_down_big<TA, PACKED_Q2><<<dim3((w.nrows + rpb - 1) / rpb, njobs_cap), DN_THREADS, 0, s>>>(w, jobs, njobs, (const float*) in, out);
         return;
     }
     const int G = moe_g<TA>(w.ncols);
@@ -503,21 +538,30 @@ void gu_sd_launch(int T, const MoeW& w, const Job* jobs, const int* njobs, int n
 #undef FNX_GS
 }
 
-template <ggml_type TA>
+template <ggml_type TA, bool PACKED_Q2 = false>
 void moe_launch(bool down, const MoeW& w, const Job* jobs, const int* njobs, int njobs_max, const void* in, float* out,
-                cudaStream_t s, int T) {
+                cudaStream_t s, int T, const CacheDownCopy* copy = nullptr, const CacheGateUpCopy* gu_copy = nullptr) {
+    if constexpr (PACKED_Q2) {
+        if (!down || w.ncols % 64 || w.row_a != (size_t) w.ncols / 64 * 18)
+            throw std::runtime_error("packed Q2_0 requires down rows of whole 64-value blocks");
+    }
     if (down) {
         if (!unit_ok<TA>(DN_U) || w.ncols / DN_U > DN_MAXB)
             throw std::runtime_error("moe_down: shape or type does not fit the units");
         const int rpb = DN_THREADS / (w.ncols / DN_U), nh = njobs_max * (w.ncols / DN_U);   // njobs_max: the window's pairs
         const dim3 grid((w.nrows + rpb - 1) / rpb, njobs_max);
         const size_t smem = sizeof(float) * T * DN_THREADS;
-        if (T > 8) {
+        static const int pre_rows = [] {
+            const long long v = env_int("FNX_MOE_PRE_ROWS", 9);
+            if (v < 1 || v > MAXT + 1) throw std::runtime_error("FNX_MOE_PRE_ROWS: expected 1..17");
+            return (int) v;
+        }();
+        if (T >= pre_rows) {
             if (njobs_max > MAXT * TOPK) throw std::runtime_error("moe_down: more pairs than g_moe_hq holds");
             k_moe_h<<<(nh + 7) / 8, 256, 0, s>>>((const float*) in, w.ncols, njobs_max);
-            k_moe_down<TA, true><<<grid, DN_THREADS, smem, s>>>(w, jobs, njobs, (const float*) in, out);
+            k_moe_down<TA, true, PACKED_Q2><<<grid, DN_THREADS, smem, s>>>(w, jobs, njobs, (const float*) in, out);
         } else {
-            k_moe_down<TA, false><<<grid, DN_THREADS, smem, s>>>(w, jobs, njobs, (const float*) in, out);
+            k_moe_down<TA, false, PACKED_Q2><<<grid, DN_THREADS, smem, s>>>(w, jobs, njobs, (const float*) in, out);
         }
         return;
     }
@@ -528,6 +572,45 @@ void moe_launch(bool down, const MoeW& w, const Job* jobs, const int* njobs, int
     } else {
         if (moe_g<TA>(w.ncols) != 32) throw std::runtime_error("moe gate|up: only 32 lanes a row are compiled (rows of N columns)");
         const dim3 grid((w.nrows + MMVQ_THREADS / 32 - 1) / (MMVQ_THREADS / 32), njobs_max);
+        if constexpr (TA == GGML_TYPE_IQ2_S || TA == GGML_TYPE_IQ3_XXS || TA == GGML_TYPE_IQ3_S) {
+            static const long long reuse = env_int("FNX_IQ_REUSE", 0);
+            if (copy && !reuse) throw std::runtime_error("down copy requires FNX_IQ_REUSE=1");
+            if (reuse != 0 && reuse != 1) throw std::runtime_error("FNX_IQ_REUSE: expected 0 or 1");
+            if (reuse) {
+                static const long long group = env_int("FNX_IQ_GROUP", 32);
+                static const long long fast_signs = env_int("FNX_IQ_FAST_SIGNS", 0);
+                if (fast_signs != 0 && fast_signs != 1)
+                    throw std::runtime_error("FNX_IQ_FAST_SIGNS: expected 0 or 1");
+                if (group != 16 && group != 32) throw std::runtime_error("FNX_IQ_GROUP: expected 16 or 32");
+                const dim3 grid16((w.nrows + 7) / 8, njobs_max);
+                if (copy && (group != 16 || copy->blocks < 1 || copy->blocks > 256 ||
+                             !copy->host || !copy->slots || !copy->list || !copy->pool ||
+                             !copy->bytes || copy->bytes % 16 || copy->offset % 16 || copy->slot_bytes % 16 ||
+                             copy->offset > copy->slot_bytes || copy->bytes > copy->slot_bytes - copy->offset))
+                    throw std::runtime_error("invalid IQ down copy descriptor/group");
+                const dim3 fused_grid(grid16.x * grid16.y + (copy ? copy->blocks : 0));
+                if (gu_copy && (!copy || !gu_copy->host || gu_copy->list != copy->list ||
+                                gu_copy->layer < 0 || gu_copy->layer >= NL || !w.ep || w.ncols != N ||
+                                w.row_a != (size_t) N / ggml_cuda_type_traits<TA>::qk * ggml_cuda_type_traits<TA>::bs))
+                    throw std::runtime_error("invalid IQ gate/up copy descriptor/shape");
+#define FNX_IQR(t) case t: \
+    if (gu_copy && fast_signs) k_moe_gu_iq_cache<TA, t, 16, true, true><<<fused_grid, MMVQ_THREADS, 0, s>>>(w, jobs, njobs, (const block_q8_1*) in, out, *copy, *gu_copy); \
+    else if (gu_copy) k_moe_gu_iq_cache<TA, t, 16, true><<<fused_grid, MMVQ_THREADS, 0, s>>>(w, jobs, njobs, (const block_q8_1*) in, out, *copy, *gu_copy); \
+    else if (copy) k_moe_gu_iq<TA, t, 16, true><<<fused_grid, MMVQ_THREADS, 0, s>>>(w, jobs, njobs, (const block_q8_1*) in, out, *copy); \
+    else if (group == 16) k_moe_gu_iq<TA, t, 16><<<grid16, MMVQ_THREADS, 0, s>>>(w, jobs, njobs, (const block_q8_1*) in, out); \
+    else k_moe_gu_iq<TA, t><<<grid, MMVQ_THREADS, 0, s>>>(w, jobs, njobs, (const block_q8_1*) in, out); \
+    break
+                switch (T) {
+                    FNX_IQR(1); FNX_IQR(2); FNX_IQR(3); FNX_IQR(4);
+                    FNX_IQR(5); FNX_IQR(6); FNX_IQR(7); FNX_IQR(8);
+                    FNX_IQR(9); FNX_IQR(10); FNX_IQR(11); FNX_IQR(12);
+                    FNX_IQR(13); FNX_IQR(14); FNX_IQR(15); FNX_IQR(16);
+                    default: throw std::runtime_error("moe gate|up: T out of range");
+                }
+#undef FNX_IQR
+                return;
+            }
+        }
         gu_launch<TA, 32>(T, grid, s, w, jobs, njobs, (const block_q8_1*) in, out);
     }
 }

@@ -1,0 +1,22 @@
+{
+  "comparisons": [
+    {
+      "candidate": "near-context-cache-padding-v11",
+      "reference": "near-context-mtp-last-head",
+      "all_ids_and_draft_acceptance_exact": true
+    },
+    {
+      "candidate": "heldout-cache-padding-v11",
+      "reference": "heldout-mtp-last-head",
+      "all_ids_and_draft_acceptance_exact": true
+    },
+    {
+      "candidate": "sampling-cache-padding-v11",
+      "reference": "sampling-mtp-last-head",
+      "all_ids_and_draft_acceptance_exact": true
+    }
+  ],
+  "churn_output_prefixes_exact": true,
+  "probe_output_prefixes_exact": true,
+  "reviewed_code_checks": 1326
+}

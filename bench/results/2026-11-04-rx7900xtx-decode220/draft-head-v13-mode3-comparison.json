@@ -1,0 +1,127 @@
+{
+  "reference": "bench/results/2026-11-04-rx7900xtx-decode220/draft-head-v13-mode0",
+  "candidate": "bench/results/2026-11-04-rx7900xtx-decode220/draft-head-v13-mode3",
+  "binary_sha256": "28e377099cf8c62facf1b73b897f9ee3a294de3844f4cba6185033b38c891328",
+  "all_input_and_output_streams_exact": true,
+  "draft_streams_exact": true,
+  "weighted_decode_tps": 216.62750048039547,
+  "reference_tps": 214.97926835668923,
+  "relative_gain": 0.007666935218011428,
+  "all_decode_major_faults_zero": true,
+  "runs": [
+    {
+      "case": "code",
+      "rep": 0,
+      "tokens": 2048,
+      "reference_tps": 224.2564933642854,
+      "candidate_tps": 225.8491398323776,
+      "faults": {
+        "minor": 252,
+        "major": 0
+      },
+      "reference_drafts": {
+        "accepted": 1559,
+        "offered": 2556
+      },
+      "candidate_drafts": {
+        "accepted": 1559,
+        "offered": 2556
+      }
+    },
+    {
+      "case": "prose",
+      "rep": 0,
+      "tokens": 2048,
+      "reference_tps": 191.25351362961442,
+      "candidate_tps": 192.85277084608504,
+      "faults": {
+        "minor": 75,
+        "major": 0
+      },
+      "reference_drafts": {
+        "accepted": 1391,
+        "offered": 2409
+      },
+      "candidate_drafts": {
+        "accepted": 1391,
+        "offered": 2409
+      }
+    },
+    {
+      "case": "edit",
+      "rep": 0,
+      "tokens": 2048,
+      "reference_tps": 235.41582849589057,
+      "candidate_tps": 237.05898694323545,
+      "faults": {
+        "minor": 56,
+        "major": 0
+      },
+      "reference_drafts": {
+        "accepted": 1606,
+        "offered": 2595
+      },
+      "candidate_drafts": {
+        "accepted": 1606,
+        "offered": 2595
+      }
+    },
+    {
+      "case": "code",
+      "rep": 1,
+      "tokens": 2048,
+      "reference_tps": 223.14959085609684,
+      "candidate_tps": 224.71663539506454,
+      "faults": {
+        "minor": 0,
+        "major": 0
+      },
+      "reference_drafts": {
+        "accepted": 1559,
+        "offered": 2556
+      },
+      "candidate_drafts": {
+        "accepted": 1559,
+        "offered": 2556
+      }
+    },
+    {
+      "case": "prose",
+      "rep": 1,
+      "tokens": 2048,
+      "reference_tps": 190.8151571336731,
+      "candidate_tps": 192.45768844032216,
+      "faults": {
+        "minor": 0,
+        "major": 0
+      },
+      "reference_drafts": {
+        "accepted": 1391,
+        "offered": 2409
+      },
+      "candidate_drafts": {
+        "accepted": 1391,
+        "offered": 2409
+      }
+    },
+    {
+      "case": "edit",
+      "rep": 1,
+      "tokens": 2048,
+      "reference_tps": 235.18063434464065,
+      "candidate_tps": 236.97121170045358,
+      "faults": {
+        "minor": 0,
+        "major": 0
+      },
+      "reference_drafts": {
+        "accepted": 1606,
+        "offered": 2595
+      },
+      "candidate_drafts": {
+        "accepted": 1606,
+        "offered": 2595
+      }
+    }
+  ]
+}

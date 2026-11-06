@@ -1,0 +1,33 @@
+card 0 PASS 524288 exact packed dot checks
+card 0 cols 64 PASS 512 exact down/guard checks
+card 0 cols 256 PASS 512 exact down/guard checks
+card 0 cols 320 PASS 512 exact down/guard checks
+card 0 T 1 packed 0 us 12.7606
+card 0 T 1 packed 1 us 11.1325
+card 0 T 1 packed 1 us 10.1023
+card 0 T 1 packed 0 us 9.75154
+card 0 T 7 packed 0 us 31.5784
+card 0 T 7 packed 1 us 35.4932
+card 0 T 7 packed 1 us 34.3909
+card 0 T 7 packed 0 us 31.0216
+card 0 T 16 packed 0 us 51.6992
+card 0 T 16 packed 1 us 49.95
+card 0 T 16 packed 1 us 49.2725
+card 0 T 16 packed 0 us 48.5795
+card 1 PASS 524288 exact packed dot checks
+card 1 cols 64 PASS 512 exact down/guard checks
+card 1 cols 256 PASS 512 exact down/guard checks
+card 1 cols 320 PASS 512 exact down/guard checks
+card 1 T 1 packed 0 us 12.4391
+card 1 T 1 packed 1 us 10.5908
+card 1 T 1 packed 1 us 10.3391
+card 1 T 1 packed 0 us 10.3311
+card 1 T 7 packed 0 us 32.3762
+card 1 T 7 packed 1 us 34.9462
+card 1 T 7 packed 1 us 34.7015
+card 1 T 7 packed 0 us 31.5327
+card 1 T 16 packed 0 us 51.0134
+card 1 T 16 packed 1 us 48.7571
+card 1 T 16 packed 1 us 47.9876
+card 1 T 16 packed 0 us 50.0316
+PASS 1048576 exact dot checks and 3072 exact down/guard checks and 648 prefill checks

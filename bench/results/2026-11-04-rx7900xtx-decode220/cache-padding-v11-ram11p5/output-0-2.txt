@@ -1,0 +1,176 @@
+# The Anatomy of Database Transactions: A Technical Deep Dive
+
+In distributed systems and data-intensive applications, the integrity of data is paramount. The **ACID** properties (Atomicity, Consistency, Isolation, Durability) are the foundational guarantees provided by relational database management systems (RDBMS) to ensure reliable data processing.
+
+This tutorial explains how these properties are implemented at the engine level, compares concurrency control mechanisms using a concrete bank transfer scenario, and discusses crash recovery and common pitfalls.
+
+---
+
+## 1. The ACID Properties: Implementation Mechanics
+
+### 1.1 Atomicity ("All or Nothing")
+**Definition:** A transaction is an indivisible unit of work. Either all operations within the transaction succeed, or none do.
+
+**Implementation:**
+- **Undo Logs:** The database maintains a log of changes. If a transaction fails midway, the system uses the undo log to reverse all changes made by that transaction.
+- **Savepoints:** Nested transactions allow partial rollbacks.
+- **Two-Phase Commit (2PC):** In distributed databases, atomicity is achieved via 2PC, where a coordinator ensures all participants are ready to commit before issuing the final commit command.
+
+### 1.2 Consistency
+**Definition:** A transaction must transform the database from one valid state to another, preserving all defined constraints (e.g., primary keys, foreign keys, check constraints).
+
+**Implementation:**
+- **Constraint Enforcement:** The database engine validates constraints *before* committing.
+- **Application Logic:** Consistency is often enforced by application code (e.g., ensuring account balances never go negative). The database supports this via triggers, stored procedures, and constraint checks.
+- **Note:** Consistency is primarily an application-level guarantee. The database provides the *tools* (constraints, transactions) to enforce it.
+
+### 1.3 Isolation
+**Definition:** Concurrent transactions must not interfere with each other. The intermediate state of a transaction must be invisible to other transactions.
+
+**Implementation:**
+- **Locking:** Pessimistic locking (e.g., `SELECT FOR UPDATE`) prevents concurrent writes.
+- **Multi-Version Concurrency Control (MVCC):** Each transaction sees a snapshot of the database at a specific point in time. Writers create new versions of rows; readers see the version consistent with their snapshot.
+- **Isolation Levels:** SQL defines four standard levels:
+  1. **Read Uncommitted:** Allows dirty reads.
+  2. **Read Committed:** Prevents dirty reads; allows non-repeatable reads.
+  3. **Repeatable Read:** Prevents non-repeatable reads; allows phantom reads.
+  4. **Serializable:** Prevents all anomalies; highest isolation.
+
+### 1.4 Durability
+**Definition:** Once a transaction is committed, its effects are permanent, even in the event of a system crash.
+
+**Implementation:**
+- **Write-Ahead Logging (WAL):** Changes are written to a durable log *before* being applied to the main data files.
+- **Fsync:** The database calls `fsync()` on the log file to ensure data is flushed to disk.
+- **Redo Logs:** After a crash, the system replays the WAL to recover committed transactions.
+
+---
+
+## 2. Concrete Example: Concurrent Bank Transfers
+
+Consider two accounts: **Alice** (balance: $100) and **Bob** (balance: $100).
+
+We have two concurrent transactions:
+- **T1:** Alice transfers $50 to Bob.
+- **T2:** Bob transfers $30 to Alice.
+
+**Initial State:**
+- Alice: $100
+- Bob: $100
+
+**Expected Final State (Serial Execution):**
+- Alice: $100 - $50 + $30 = $80
+- Bob: $100 + $50 - $30 = $120
+
+### Scenario A: Write-Ahead Logging (WAL) & Crash Recovery
+
+WAL ensures **Durability** and **Atomicity**.
+
+**Process:**
+1. **T1 Starts:**
+   - WAL Entry: `BEGIN T1`
+   - WAL Entry: `UPDATE Alice SET balance = 50` (Undo: 100)
+   - WAL Entry: `UPDATE Bob SET balance = 150` (Undo: 100)
+   - WAL Entry: `COMMIT T1`
+   - **fsync()** called on WAL.
+   - Data pages updated in memory (buffer pool).
+
+2. **Crash Occurs:**
+   - The system crashes *after* `COMMIT T1` is logged and fsynced, but *before* the data pages are written to disk.
+
+3. **Recovery:**
+   - The database scans the WAL.
+   - It finds `COMMIT T1` in the log.
+   - It **replays** the changes (Redo): Alice = 50, Bob = 150.
+   - **Result:** The transaction is durable. The data is consistent.
+
+**Key Insight:** WAL ensures that committed transactions are never lost, and uncommitted transactions are never applied.
+
+### Scenario B: Snapshot Isolation (SI)
+
+Snapshot Isolation is a form of MVCC. It provides **Isolation** at the "Snapshot" level, which is stronger than Read Committed but weaker than Serializable.
+
+**Process:**
+1. **T1 Starts (Snapshot at time t0):**
+   - Reads Alice: $100, Bob: $100.
+   - Writes: Alice = $50, Bob = $150.
+   - T1 is not yet committed.
+
+2. **T2 Starts (Snapshot at time t1, after T1 started but before commit):**
+   - Reads Alice: $100, Bob: $100. (Sees the *original* state, not T1's uncommitted changes).
+   - Writes: Bob = $70, Alice = $130.
+
+3. **Commit Phase:**
+   - **T1 Commits:** Success.
+   - **T2 Commits:**
+     - T2 tries to write Bob = $70.
+     - The database detects a **write-write conflict**: T1 already modified Bob.
+     - **Result:** T2 is **aborted** (serialization failure).
+
+**Why?** Snapshot Isolation prevents "lost updates." If T2 were allowed to commit, Bob's balance would be $70 (T2's view), ignoring T1's $50 addition. This violates consistency.
+
+**Outcome:**
+- T1 succeeds: Alice = $50, Bob = $150.
+- T2 fails: Application must retry T2.
+- **Final State:** Alice = $50, Bob = $150. (Consistent, but T2 was rejected).
+
+### Scenario C: Serializable Execution
+
+Serializable isolation ensures the result is equivalent to some serial execution of transactions.
+
+**Process:**
+1. **T1 Starts:**
+   - Locks Alice and Bob (or uses predicate locks).
+   - Reads Alice: $100, Bob: $100.
+   - Writes: Alice = $50, Bob = $150.
+
+2. **T2 Starts:**
+   - Tries to read Alice and Bob.
+   - **Blocked** by T1's locks (pessimistic) or detects a conflict (optimistic).
+   - T2 waits for T1 to commit.
+
+3. **T1 Commits:**
+   - Locks released.
+   - Alice = $50, Bob = $150.
+
+4. **T2 Proceeds:**
+   - Reads Alice: $50, Bob: $150.
+   - Writes: Bob = $120, Alice = $80.
+   - T2 Commits.
+
+**Final State:** Alice = $80, Bob = $120.
+
+**Comparison:**
+- **Snapshot Isolation:** T2 aborted. Requires application retry logic.
+- **Serializable:** T2 blocked, then succeeded. No data loss, but higher latency.
+
+---
+
+## 3. Crash Recovery: The WAL Protocol in Detail
+
+Crash recovery is a critical subsystem. The standard algorithm is **ARIES** (Analysis, Redo, Undo).
+
+### 3.1 The WAL Log Structure
+Each log record contains:
+- **LSN (Log Sequence Number):** Unique, monotonically increasing ID.
+- **Transaction ID:** Which transaction made the change.
+- **Page ID:** Which data page was modified.
+- **Before Image (Undo):** Old value.
+- **After Image (Redo):** New value.
+- **Type:** BEGIN, UPDATE, COMMIT, ABORT, CHECKPOINT.
+
+### 3.2 Recovery Steps
+
+1. **Analysis Phase:**
+   - Scan the WAL from the last checkpoint.
+   - Identify all transactions that were active at the time of the crash.
+   - Build a **Dirty Page Table** (pages in memory that were modified but not flushed to disk).
+
+2. **Redo Phase:**
+   - Scan the WAL forward from the last checkpoint.
+   - For every log record, apply the **After Image** to the data page.
+   - This ensures all **committed** transactions are reflected in the database.
+   - *Note:* This phase is idempotent. Re-applying a change is safe.
+
+3. **Undo Phase:**
+   - Scan the WAL

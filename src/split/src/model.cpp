@@ -1,7 +1,11 @@
+#include "lossless_bf16.hpp"
 #include "model.hpp"
 #include "card_check.hpp"
 #include "env.hpp"
+#include "attn_head_split.hpp"
 #include "rope_gguf.hpp"
+#include "static_experts.hpp"
+#include "mtp_head_q4.hpp"
 
 #include "store.hpp"
 #if FNX_HIP
@@ -236,6 +240,16 @@ void lock_in_ram(const Tensor& t) {
                                      "; run with RLIMIT_MEMLOCK raised (systemd-run -p LimitMEMLOCK=infinity)");
 }
 
+size_t resident_bytes(const Tensor& t) {
+    const size_t page = (size_t) sysconf(_SC_PAGESIZE);
+    const uintptr_t begin = (uintptr_t) t.data / page * page;
+    const size_t bytes = (uintptr_t) t.data + t.nbytes - begin;
+    std::vector<unsigned char> pages((bytes + page - 1) / page);
+    if (mincore((void*) begin, bytes, pages.data()) != 0)
+        throw std::runtime_error("embedding mincore: " + std::string(std::strerror(errno)));
+    return (size_t) std::count_if(pages.begin(), pages.end(), [](unsigned char p) { return p & 1; }) * page;
+}
+
 // the stager's groups for load_card: group l every tensor of layer l, group NL the output head's. The head is read
 // through the page cache: the draft layer (Mtp) takes its rows of output.weight from the mapping after the load
 std::vector<Stager::Group> stage_groups(const Gguf& g) {
@@ -271,6 +285,7 @@ struct Up {
     CardW& c;
     Store* store = nullptr;               // the lab's holder: the shared memory instead of cudaMalloc / cudaHostAlloc
     std::vector<void*>* track = nullptr;  // a worker placing its experts: what it allocates (Model::free_experts)
+    const std::vector<char>* static_res = nullptr;
     template <typename T> T* put(const void* host, size_t bytes) {
         void* d = nullptr;
         if (store) d = store->dev(c.dev, bytes);
@@ -303,6 +318,40 @@ struct Up {
                                      cudaGetErrorString(err));
         c.host_bytes += bytes;
         return (uint8_t*) hp;
+    }
+    // Assemble one layer's hot and cold slices separately. Unlike ExpertCache,
+    // immutable placement needs backing RAM only for the cold experts. This
+    // keeps a 50 GB expert set from pinning another 50 GB on a 64 GB host.
+    template <typename Fill>
+    void place_static(DW& w, size_t stride, size_t count, Fill fill) {
+        if (store || !static_res || static_res->size() != count)
+            throw std::runtime_error("static experts: plain load with one residency entry per expert required");
+        const StaticExpertPlan plan(*static_res);
+        std::vector<uint8_t> hot(plan.hot * stride);
+        void* cold = nullptr;
+        void* cold_device = nullptr;
+        if (plan.cold) {
+            unsigned flags = cudaHostAllocMapped;
+#if FNX_HIP
+            // Immutable weights need no CPU/GPU rendezvous inside a kernel.
+            // Do not combine NonCoherent with Mapped: Mapped would override it.
+            if (env_flag("FNX_STATIC_HOST_CACHE")) flags = hipHostMallocNonCoherent;
+#else
+            if (env_flag("FNX_STATIC_HOST_CACHE")) throw std::runtime_error("FNX_STATIC_HOST_CACHE requires HIP");
+#endif
+            ck(cudaHostAlloc(&cold, plan.cold * stride, flags), "static experts: cold host allocation");
+            ck(cudaHostGetDevicePointer(&cold_device, cold, 0), "static experts: cold mapped pointer");
+            c.host_bytes += plan.cold * stride;
+        }
+        for (size_t e = 0; e < count; ++e) {
+            uint8_t* dst = (*static_res)[e] ? hot.data() : (uint8_t*) cold;
+            fill(e, dst + plan.slot[e] * stride);
+        }
+        const char* hot_device = plan.hot ? put<char>(hot.data(), hot.size()) : nullptr;
+        std::vector<const char*> pointers(count);
+        for (size_t e = 0; e < count; ++e)
+            pointers[e] = ((*static_res)[e] ? hot_device : (const char*) cold_device) + plan.slot[e] * stride;
+        w.ep = put<const char*>(pointers.data(), pointers.size() * sizeof(const char*));
     }
     // routed experts (h from expert_buf: every expert's matrix, stride bytes apart): to VRAM at p, or with an
     // ExpertCache each one's address in host_of (the layer's row of the card's host addresses)
@@ -620,6 +669,13 @@ struct Up {
         w.row_bytes = t1.row_bytes();
         stride = (size_t) w.n_out * w.row_bytes;
         const size_t half = (size_t) (r1 - r0) * w.row_bytes, src_mat = (size_t) t1.ne[1] * w.row_bytes;
+        if (static_res) {
+            place_static(w, stride, (size_t) t1.ne[2], [&](size_t e, uint8_t* dst) {
+                std::memcpy(dst, t1.data + e * src_mat + (size_t) r0 * w.row_bytes, half);
+                std::memcpy(dst + half, t2.data + e * src_mat + (size_t) r0 * w.row_bytes, half);
+            });
+            return w;
+        }
         std::vector<uint8_t> tmp;
         const size_t bytes = (size_t) t1.ne[2] * stride;
         uint8_t* h = expert_buf(bytes, host_of, tmp);
@@ -631,18 +687,34 @@ struct Up {
         return w;
     }
     // f32 tensors' rows one after another
-    float* f32_cat(const Tensor& t1, const Tensor& t2, size_t row_floats) {
+    float* f32_cat(const Tensor& t1, const Tensor& t2, size_t row_floats, uint16_t** packed = nullptr) {
         if (t1.type != T_F32 || t2.type != T_F32 || t1.ne[0] != t2.ne[0]) throw std::runtime_error(t1.name + " and " + t2.name + " do not stack");
         if ((size_t) t1.ne[0] != row_floats)
             throw std::runtime_error(t1.name + " is " + std::to_string(t1.ne[0]) + " floats a row, not the " + std::to_string(row_floats) +
                                      " its reader takes");
         std::vector<float> h((const float*) t1.data, (const float*) t1.data + t1.ne[0] * t1.ne[1]);
         h.insert(h.end(), (const float*) t2.data, (const float*) t2.data + t2.ne[0] * t2.ne[1]);
+        static const long long compact = env_int("FNX_ROUTER_BF16", 0);
+        if (compact != 0 && compact != 1) throw std::runtime_error("FNX_ROUTER_BF16: expected 0 or 1");
+        if (compact && packed) {
+            std::vector<uint16_t> bits;
+            if (pack_lossless_bf16(h.data(), h.size(), bits)) {
+                *packed = put<uint16_t>(bits.data(), bits.size() * sizeof(uint16_t));
+                return nullptr;
+            }
+        }
         return put<float>(h.data(), h.size() * 4);
     }
     // per expert: every row, input blocks [b0, b1) (down), expert-major
     DW expert_cols(const Tensor& t, int b0, int b1, size_t& stride, const char** host_of = nullptr) {
-        const TypeInfo ti = block32(t);
+        const TypeInfo ti = t.type == T_Q2_0 ? type_info(t.type) : block32(t);
+        if (t.type == T_Q2_0) {
+            // Callers count 32-value blocks; Q2_0 stores pairs of those blocks
+            // under one scale. Never split a packed block across cards.
+            if (b0 % 2 || b1 % 2) throw std::runtime_error(t.name + ": Q2_0 column slices need 64-value alignment");
+            b0 /= 2;
+            b1 /= 2;
+        }
         DW w;
         w.type = t.type;
         w.n_in = (b1 - b0) * ti.block;
@@ -653,6 +725,14 @@ struct Up {
         if (b0 < 0 || b1 <= b0 || (size_t) b1 * ti.bytes > src_row)
             throw std::runtime_error(t.name + ": blocks [" + std::to_string(b0) + ", " + std::to_string(b1) + ") asked for, a row has " +
                                      std::to_string(src_row / ti.bytes));
+        if (static_res) {
+            place_static(w, stride, (size_t) t.ne[2], [&](size_t e, uint8_t* dst) {
+                for (int r = 0; r < w.n_out; ++r)
+                    std::memcpy(dst + (size_t) r * w.row_bytes,
+                                t.data + e * src_mat + (size_t) r * src_row + (size_t) b0 * ti.bytes, w.row_bytes);
+            });
+            return w;
+        }
         std::vector<uint8_t> tmp;
         const size_t bytes = (size_t) t.ne[2] * stride;
         uint8_t* h = expert_buf(bytes, host_of, tmp);
@@ -762,7 +842,7 @@ void load_layers_27b(Stager& st, CardW& c, Up& up, const std::vector<int>& conv_
 // once this card is through with it.
 // host_experts: every routed expert to a host copy (an ExpertCache, or the lab's holder); store: the holder's shared memory
 void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resident, const std::vector<double>* arena_score,
-               Store* store, bool host_experts) {
+               Store* store, bool host_experts, bool static_experts = false) {
     ck(cudaSetDevice(c.dev), "cudaSetDevice");
     Up up{c, store};
     auto L = [&](int l, const char* s) -> const Tensor& { return st.t(l, "blk." + std::to_string(l) + "." + s); };
@@ -808,10 +888,12 @@ void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resid
     std::vector<int> qrows_all, kvrows_all;
     for (int i = 0; i < NQH * 2 * HD; ++i) qrows_all.push_back(i);
     for (int i = 0; i < NKVH * HD; ++i) kvrows_all.push_back(i);
+    if (attn_head_split()) qrows_all = qrows, kvrows_all = kvrows;
     c.L.resize(NL);
     std::vector<const char*> hgu(host_experts ? (size_t) NL * NEXP : 0), hdn(hgu.size());   // the experts' host copies
     for (int l = 0; l < NL; ++l) {
         LayerW& w = c.L[l];
+        up.static_res = static_experts && !resident.empty() ? &resident[(size_t) l] : nullptr;
         const char** hg = host_experts ? hgu.data() + (size_t) l * NEXP : nullptr;
         const char** hd = host_experts ? hdn.data() + (size_t) l * NEXP : nullptr;
         const char* hp[2] = {"hc_attn_", "hc_ffn_"};
@@ -827,7 +909,7 @@ void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resid
             throw std::runtime_error("fnx: " + gi.name + " holds " + std::to_string(gi.ne[1]) + " rows and " + gs.name + " " +
                                      std::to_string(gs.ne[1]) + ", not the " + std::to_string(NEXP) +
                                      " gate rows and 1 shared row k_router_route reads");
-        w.router = up.f32_cat(gi, gs, N);
+        w.router = up.f32_cat(gi, gs, N, &w.router_bf16);
         if (!is_attn(l)) {
             w.qkvz = up.dense(up.rows2(L(l, "attn_qkv.weight"), conv_rows, L(l, "attn_gate.weight"), zrows));
             w.ab = up.f32_rows2(L(l, "ssm_alpha.weight"), L(l, "ssm_beta.weight"), vheads, N);
@@ -888,12 +970,16 @@ void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resid
         }
         st.done(l);
     }
+    int packed_routers = 0;
+    for (const LayerW& layer : c.L) packed_routers += layer.router_bf16 != nullptr;
+    if (packed_routers) std::fprintf(stderr, "fnx: card %d: %d lossless BF16 routers, %.2f MiB saved\n", c.dev, packed_routers,
+                                    (double) packed_routers * (NEXP + 1) * N * sizeof(uint16_t) / 1048576.0);
     c.head_norm = up.f32(st.t(NL, "output_hc_norm.weight"), D);
     c.head_down = up.q8split(st.t(NL, "output_hc_down.weight"));
     c.head_up = up.q8split(st.t(NL, "output_hc_up.weight"));
     c.out = up.dense(up.rows(st.t(NL, "output.weight"), range(c.v0, c.v1)));
     st.done(NL);
-    if (!resident.empty()) {   // tracked, so the engine can place them again with more in RAM (Engine: VRAM short)
+    if (!resident.empty() && !static_experts) {   // tracked, so the engine can place them again with more in RAM (Engine: VRAM short)
         const size_t before = c.bytes;
         Up ue{c, store, &c.expert_mem};
         ue.expert_cache(resident, hgu, hdn, arena_score);
@@ -1060,6 +1146,8 @@ void free_mtp_cards(std::vector<MtpCard>& cards) {
 }
 
 void load_mtp_card(const Model& m, const MtpFiles& f, const CardW& c, const std::vector<int>& vocab, MtpCard& mc) {
+    const long long q4_head = env_int("FNX_MTP_HEAD_Q4", 0);
+    if (q4_head != 0 && q4_head != 1) throw std::runtime_error("FNX_MTP_HEAD_Q4: expected 0 or 1");
     ck(cudaSetDevice(c.dev), "cudaSetDevice");
     CardW sink;   // Up counts bytes into a CardW
     sink.dev = c.dev;
@@ -1081,6 +1169,7 @@ void load_mtp_card(const Model& m, const MtpFiles& f, const CardW& c, const std:
     std::vector<int> qrows_all, kvrows_all;
     for (int i = 0; i < NQH * 2 * HD; ++i) qrows_all.push_back(i);
     for (int i = 0; i < NKVH * HD; ++i) kvrows_all.push_back(i);
+    if (attn_head_split()) qrows_all = qrows, kvrows_all = kvrows;
     LayerW& w = mc.L;
     const char* hp[2] = {"attn_hyper_connection.", "mlp_hyper_connection."};
     for (int h = 0; h < 2; ++h) {
@@ -1132,8 +1221,21 @@ void load_mtp_card(const Model& m, const MtpFiles& f, const CardW& c, const std:
     mc.mix_down = q8("hyper_connection_mixer.input_mix_weight_down.weight");
     mc.mix_up = q8("hyper_connection_mixer.input_mix_weight_up.weight");
     std::vector<int> rows(vocab.begin() + mc.dv0, vocab.begin() + mc.dv1);
-    mc.head = up.dense(up.rows(*m.g.find("output.weight"), rows));
-    for (const DW* d : {&mc.head, &w.wq, &w.wk, &w.wv, &w.wo, &w.idx_qk, &w.sh_gu, &w.sh_down, &mc.fc_emb, &mc.fc_hid})
+    if (q4_head) {
+        const Tensor& source = *m.g.find("output.weight");
+        const std::vector<uint8_t> packed = mtp_head_q4_rows(source, rows);
+        mc.head.type = T_Q4_0;
+        mc.head.n_in = (int) source.ne[0];
+        mc.head.n_out = (int) rows.size();
+        mc.head.row_bytes = (size_t) mc.head.n_in / 32 * 18;
+        mc.head.p = up.put<uint8_t>(packed.data(), packed.size());
+        std::fprintf(stderr, "fnx: card %d: Q4 draft head %zu rows, %.2f MiB (Q8 %.2f MiB); main head unchanged\n",
+                     c.dev, rows.size(), packed.size() / 1048576.0, rows.size() * source.row_bytes() / 1048576.0);
+    } else {
+        mc.head = up.dense(up.rows(*m.g.find("output.weight"), rows));
+        if (!mc.head.s.q) throw std::runtime_error("mtp: the output projection is not Q8_0");
+    }
+    for (const DW* d : {&w.wq, &w.wk, &w.wv, &w.wo, &w.idx_qk, &w.sh_gu, &w.sh_down, &mc.fc_emb, &mc.fc_hid})
         if (!d->s.q) throw std::runtime_error("mtp: a projection is not Q8_0");
 }
 
@@ -1144,6 +1246,7 @@ void load_mtp_card(const Model& m, const MtpFiles& f, const CardW& c, const std:
 // with the model). dir names where the layer comes from, so a Flash-Next runtime directory in a 27B config fails here
 Mtp::Mtp(const Model& m, const std::string& dir, const std::string& vocab_file) {
     if (dir != "nextn") throw std::runtime_error("mtp: the 27B's draft layer is the GGUF's own: its directory is \"nextn\", not \"" + dir + "\"");
+    if (env_int("FNX_MTP_HEAD_Q4", 0) != 0) throw std::runtime_error("FNX_MTP_HEAD_Q4 is currently for Flash-Next");
     if (vocab_file.empty()) throw std::runtime_error("mtp: the 27B needs a draft vocabulary file");
     {
         std::FILE* f = std::fopen(vocab_file.c_str(), "rb");
@@ -1238,19 +1341,49 @@ Mtp::~Mtp() { free_mtp_cards(cards); }
 
 // A file whose routed experts the engine has no kernel for is refused here, in one plain line, before anything is read into RAM or placed on
 // the cards (the app's rule, strata_control/split_engine.py, refuses it earlier; this is the same check for a start that skipped the rule). The
-// server then starts the normal layer split. Q2_0 is not listed: the Gguf has already repacked it to Q4_0.
+// server then starts the normal layer split. Q2_0 is accepted only for the optional packed down path.
 static void check_supported(const Gguf& g) {
-    const uint32_t ok[] = {T_Q4_K, T_Q5_K, T_Q5_1, T_Q8_0, T_Q4_0, T_IQ4_NL, T_IQ4_XS, T_IQ3_S, T_IQ3_XXS, T_IQ2_S};
+    const uint32_t ok[] = {T_IQ2_XXS, T_Q5_0, T_Q4_K, T_Q5_K, T_Q5_1, T_Q8_0, T_Q4_0, T_IQ4_NL, T_IQ4_XS, T_IQ3_S, T_IQ3_XXS, T_IQ2_S};
     for (const auto& kv : g.tensors()) {
         const std::string& n = kv.first;
         if (n.find("_exps.weight") == std::string::npos || n.find("shexp") != std::string::npos) continue;
+        const std::string down_suffix = ".ffn_down_exps.weight";
+        if (kv.second.type == T_Q2_0 && n.size() >= down_suffix.size() &&
+            n.compare(n.size() - down_suffix.size(), down_suffix.size(), down_suffix) == 0) continue;
         if (std::find(std::begin(ok), std::end(ok), kv.second.type) == std::end(ok))
             throw std::runtime_error("the all-cards split engine does not read this model's routed experts (" + n + " is ggml type " +
                                      std::to_string(kv.second.type) + "); use the normal layer split");
     }
 }
 
-Model::Model(const std::string& path, Load how, Store* store, const std::string* image) : g(path) {
+static bool packed_q2_down_setting() {
+    const auto setting = env_int("FNX_PACKED_Q2_DOWN", 0);
+    if (setting != 0 && setting != 1) throw std::runtime_error("FNX_PACKED_Q2_DOWN: expected 0 or 1");
+    if (setting) {
+#if !FNX_HIP || FNX_27B || FNX_NCARD != 2
+        throw std::runtime_error("FNX_PACKED_Q2_DOWN requires the two-card HIP Flash-Next engine");
+#else
+        if (env_int("FNX_STATIC_EXPERTS", 0) != 1)
+            throw std::runtime_error("FNX_PACKED_Q2_DOWN requires FNX_STATIC_EXPERTS=1");
+#endif
+    }
+    return setting == 1;
+}
+
+Model::Model(const std::string& path, Load how, Store* store, const std::string* image) : g(path, packed_q2_down_setting()) {
+    const long long static_setting = env_int("FNX_STATIC_EXPERTS", 0);
+    if (static_setting != 0 && static_setting != 1)
+        throw std::runtime_error("FNX_STATIC_EXPERTS: expected 0 or 1");
+    const bool static_experts = static_setting == 1;
+    const auto release_setting = env_int("FNX_RELEASE_COPIED_WEIGHTS", 0);
+    if (release_setting != 0 && release_setting != 1)
+        throw std::runtime_error("FNX_RELEASE_COPIED_WEIGHTS: expected 0 or 1");
+    if (release_setting && (!static_experts || how != Load::PLAIN))
+        throw std::runtime_error("FNX_RELEASE_COPIED_WEIGHTS requires plain static expert placement");
+    if (static_experts && how != Load::PLAIN)
+        throw std::runtime_error("FNX_STATIC_EXPERTS: only plain loads are supported");
+    if (env_flag("FNX_PACKED_Q2_DOWN"))
+        std::fprintf(stderr, "fnx: preserving lossless packed Q2_0 down weights (Q4_0 arithmetic order)\n");
     // the cards first: reading the embeddings into RAM below takes seconds on a cold cache
     {
         int ndev = 0;
@@ -1314,7 +1447,7 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
     {   // the host gathers its rows every window: a row read from the disk costs milliseconds, so keep it in RAM
         const auto t0 = std::chrono::steady_clock::now();
         lock_in_ram(*tok_embd);
-        std::fprintf(stderr, "27b: %s (%.1f GB) locked in RAM in %.1f s\n", tok_embd->name.c_str(), tok_embd->nbytes / 1e9,
+        std::fprintf(stderr, "27b: %s (%.1f GB) prefaulted in RAM in %.1f s\n", tok_embd->name.c_str(), tok_embd->nbytes / 1e9,
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     }
 #else
@@ -1327,7 +1460,7 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
     {
         const auto t0 = std::chrono::steady_clock::now();
         for (const Tensor* t : {tok_embd, ple_table}) lock_in_ram(*t);
-        std::fprintf(stderr, "fnx: %s and %s (%.1f GB) locked in RAM in %.1f s\n", tok_embd->name.c_str(), ple_table->name.c_str(),
+        std::fprintf(stderr, "fnx: %s and %s (%.1f GB) prefaulted in RAM in %.1f s\n", tok_embd->name.c_str(), ple_table->name.c_str(),
                      (tok_embd->nbytes + ple_table->nbytes) / 1e9, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     }
     for (int64_t v : g.ia(p + "ple.layer_multipliers")) ple_mult.push_back((uint64_t) v);
@@ -1441,29 +1574,66 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
 #if !FNX_27B
     if (how == Load::PLAIN) choose_residency();   // the holder leaves that to its workers: every expert to a host copy
 #endif
-    const auto t0 = std::chrono::steady_clock::now();
-    Stager st(g, stage_groups(g), NCARD);
-    std::vector<std::thread> th;
-    std::vector<std::string> errs(NCARD);
-    for (int c = 0; c < NCARD; ++c)
-        th.emplace_back([&, c] {
-            try {
-                load_card(st, cards[c], resident, arena ? &score : nullptr, how == Load::HOLD ? store : nullptr,
-                          how == Load::HOLD || !resident.empty());
-            } catch (const std::exception& e) {
-                errs[c] = e.what();
-                st.abort("card " + std::to_string(c) + " failed");   // the other cards wait on groups no one gives back
-            }
-        });
-    for (auto& t : th) t.join();
-    for (int c = 0; c < NCARD; ++c)
-        if (!errs[c].empty()) throw std::runtime_error("card " + std::to_string(c) + ": " + errs[c]);
-    // the disk rate only when the disk gave nearly all of it (tools/lab.sh estimates its next cold loads from it)
-    const double disk = st.disk_bytes() / 1e9, cache = st.cache_bytes() / 1e9;
-    char rate[64] = "";
-    if (cache < 0.05 * (disk + cache)) std::snprintf(rate, sizeof rate, " at %.2f GB/s", disk / st.read_seconds());
-    std::fprintf(stderr, "fnx: weights read in %.1f s of reading (%.1f GB from the disk%s, %.1f GB from the page cache), placed in %.1f s\n",
-                 st.read_seconds(), disk, rate, cache, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    {   // Release all staging buffers before refreshing the large CPU embedding table.
+        const auto t0 = std::chrono::steady_clock::now();
+        Stager st(g, stage_groups(g), NCARD);
+        std::vector<std::thread> th;
+        std::vector<std::string> errs(NCARD);
+        for (int c = 0; c < NCARD; ++c)
+            th.emplace_back([&, c] {
+                try {
+                    load_card(st, cards[c], resident, arena ? &score : nullptr, how == Load::HOLD ? store : nullptr,
+                              how == Load::HOLD || (!resident.empty() && !static_experts), static_experts);
+                } catch (const std::exception& e) {
+                    errs[c] = e.what();
+                    st.abort("card " + std::to_string(c) + " failed");   // the other cards wait on groups no one gives back
+                }
+            });
+        for (auto& t : th) t.join();
+        for (int c = 0; c < NCARD; ++c)
+            if (!errs[c].empty()) throw std::runtime_error("card " + std::to_string(c) + ": " + errs[c]);
+        if (static_experts) {
+            size_t host = 0;
+            for (const CardW& card : cards) host += card.host_bytes;
+            std::fprintf(stderr, "fnx: static experts: immutable hot/cold placement, %zu MiB host backing, no expert eviction or KV arena\n", host >> 20);
+        }
+        // the disk rate only when the disk gave nearly all of it (tools/lab.sh estimates its next cold loads from it)
+        const double disk = st.disk_bytes() / 1e9, cache = st.cache_bytes() / 1e9;
+        char rate[64] = "";
+        if (cache < 0.05 * (disk + cache)) std::snprintf(rate, sizeof rate, " at %.2f GB/s", disk / st.read_seconds());
+        std::fprintf(stderr, "fnx: weights read in %.1f s of reading (%.1f GB from the disk%s, %.1f GB from the page cache), placed in %.1f s\n",
+                     st.read_seconds(), disk, rate, cache, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }
+    if (release_setting) {
+        int previous = 0;
+        ck(cudaGetDevice(&previous), "current device before releasing copied weights");
+        for (const CardW& card : cards) {
+            ck(cudaSetDevice(card.dev), "device before releasing copied weights");
+            ck(cudaDeviceSynchronize(), "finish weight copies");
+        }
+        ck(cudaSetDevice(previous), "restore device after weight copies");
+        // CPU token/PLE lookups stay live. MTP can still build a draft head from
+        // output.weight after this constructor returns. All other converted
+        // tensors now have their own device or pinned expert-bank copies.
+        std::set<std::string> keep{tok_embd->name, "output.weight"};
+        if (ple_table) keep.insert(ple_table->name);
+        const size_t released = g.release_owned_except(keep);
+        std::fprintf(stderr, "fnx: released %zu MiB of copied GGUF conversion buffers\n", released >> 20);
+    }
+    if (env_flag("FNX_EMBED_WARM_AFTER_LOAD")) {
+        // Streaming the expert tensors can evict unlocked embedding pages read
+        // before load_card. Refresh only after those bulk reads have finished.
+        for (const Tensor* t : {tok_embd, ple_table}) {
+            if (!t) continue;
+            const size_t before = resident_bytes(*t);
+            const auto start = std::chrono::steady_clock::now();
+            lock_in_ram(*t);
+            const size_t after = resident_bytes(*t);
+            std::fprintf(stderr, "fnx: embedding refresh %s: resident %zu -> %zu / %zu MiB in %.2f s\n",
+                         t->name.c_str(), before >> 20, after >> 20, t->nbytes >> 20,
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+        }
+    }
 }
 
 void Model::choose_residency() {
@@ -1477,6 +1647,11 @@ void Model::choose_residency() {
     if (arena_s && std::strcmp(arena_s, "0") && std::strcmp(arena_s, "1"))
         throw std::runtime_error(std::string("fnx: FNX_ARENA: 0 or 1, not '") + arena_s + "'");
     arena = !arena_s || !std::strcmp(arena_s, "1");
+    if (env_int("FNX_STATIC_EXPERTS", 0) == 1) {
+        if (arena_s && !std::strcmp(arena_s, "1"))
+            throw std::runtime_error("FNX_STATIC_EXPERTS=1 conflicts with FNX_ARENA=1");
+        arena = false;
+    }
     const bool cache = !(ram_s && !std::strcmp(ram_s, "off"));
     double ram_gib = 3.0;
     if (ram_s && cache) {
@@ -1616,7 +1791,9 @@ void card_fields(CardW& c, F f) {
         f(c.ple_norm_query), f(c.ple_norm_conv), f(c.ple_conv), f(c.bytes), f(c.host_bytes);
 }
 #if !FNX_27B   // the 27B has no holder (plain loads only)
-static_assert(sizeof(CardW) == 896, "CardW changed: put what load_card stores in card_fields, then update this size");
+// ExpertCache is rebuilt by placement, after load_card; its optional static-cache
+// ages are allocated by the engine and add no holder-image weight fields.
+static_assert(sizeof(CardW) == 912, "CardW changed: put what load_card stores in card_fields, then update this size");
 #endif
 // every address load_card stores, in a card and in a layer: a worker moves them to where it mapped the holder's memory
 template <typename F>
@@ -1627,7 +1804,7 @@ void card_ptrs(CardW& c, F f) {
         f(c.ple_norm_query), f(c.ple_norm_conv), f(c.ple_conv);
     for (LayerW& w : c.L) {
         for (int h = 0; h < 2; ++h) f(w.hc_norm[h]), q8(w.hc_down[h]), q8(w.hc_up[h]), f(w.hc_inj[h]);
-        f(w.router), dw(w.qkv), dw(w.z), dw(w.ssm_out), dw(w.qkvz), f(w.ab), f(w.conv), f(w.alpha), f(w.beta), f(w.ssm_a),
+        f(w.router), f(w.router_bf16), dw(w.qkv), dw(w.z), dw(w.ssm_out), dw(w.qkvz), f(w.ab), f(w.conv), f(w.alpha), f(w.beta), f(w.ssm_a),
             f(w.dt_bias), f(w.ssm_norm);
         dw(w.wq), dw(w.wk), dw(w.wv), dw(w.wo), f(w.q_norm), f(w.k_norm), f(w.idx_wq), f(w.idx_wk), dw(w.idx_qk), f(w.idx_qn),
             f(w.idx_kn);
@@ -1637,13 +1814,13 @@ void card_ptrs(CardW& c, F f) {
     for (const char*& p : c.ec_host_dn) f(p);
 }
 #if !FNX_27B
-static_assert(sizeof(LayerW) == 952, "LayerW changed: put its new addresses in card_ptrs, then update this size");
+static_assert(sizeof(LayerW) == 960, "LayerW changed: put its new addresses in card_ptrs, then update this size");
 #endif
 }  // namespace
 
 std::string Model::image() const {
     Img m;
-    m.put((uint32_t) 0x31474d49);   // "IMG1"
+    m.put((uint32_t) 0x32474d49);   // "IMG2": LayerW includes the lossless BF16 router address
     for (const CardW& cc : cards) {
         CardW& c = const_cast<CardW&>(cc);
         card_fields(c, [&](auto& v) { m.put(v); });
@@ -1658,7 +1835,7 @@ void Model::restore(const std::string& image, const Store& store) {
     Img m{image};
     uint32_t magic = 0;
     m.get(magic);
-    if (magic != 0x31474d49) throw std::runtime_error("fnx: not a holder's image");
+    if (magic != 0x32474d49) throw std::runtime_error("fnx: not a holder's image");
     for (CardW& c : cards) {
         card_fields(c, [&](auto& v) { m.get(v); });
         m.get_vec(c.L);

@@ -1,0 +1,1 @@
+PASS 2020 layout/default-compatibility checks, 28 matching budget refusals, 915 lower-padding cases, real model/KV and large-integer boundaries

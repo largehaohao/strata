@@ -1,0 +1,7 @@
+card 0 cols 64 PASS 108 exact MMA/guard checks
+card 0 cols 256 PASS 108 exact MMA/guard checks
+card 0 cols 320 PASS 108 exact MMA/guard checks
+card 1 cols 64 PASS 108 exact MMA/guard checks
+card 1 cols 256 PASS 108 exact MMA/guard checks
+card 1 cols 320 PASS 108 exact MMA/guard checks
+PASS 648 exact packed Q2/Q4 MMA prefill checks

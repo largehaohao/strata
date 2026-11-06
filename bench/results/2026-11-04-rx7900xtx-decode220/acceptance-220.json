@@ -1,0 +1,169 @@
+{
+  "status": "passed",
+  "target_tokens_per_second": 220,
+  "binary_sha256": "83edcdb64b0b620c186b759dac207e458019a5eb7b358e5944b169e77a91cf45",
+  "model": "Swift-1.5 IQ3_S",
+  "request_concurrency": 1,
+  "context_allocation": 32768,
+  "metric": "Total generated tokens / engine DONE decode time; warmup and prefill excluded.",
+  "performance": [
+    {
+      "directory": "q8s-ab-v26-mode1",
+      "weighted_decode_tps": 222.14549011029538,
+      "output_tokens": 12288,
+      "decode_ms": 55315.1,
+      "loaded_free_vram_mib": [
+        34,
+        34
+      ],
+      "per_case": [
+        {
+          "case": "code",
+          "rep": 0,
+          "tokens": 2048,
+          "decode_tps": 231.23736832002888
+        },
+        {
+          "case": "prose",
+          "rep": 0,
+          "tokens": 2048,
+          "decode_tps": 198.05427151229134
+        },
+        {
+          "case": "edit",
+          "rep": 0,
+          "tokens": 2048,
+          "decode_tps": 242.95628447713386
+        },
+        {
+          "case": "code",
+          "rep": 1,
+          "tokens": 2048,
+          "decode_tps": 230.25724051088326
+        },
+        {
+          "case": "prose",
+          "rep": 1,
+          "tokens": 2048,
+          "decode_tps": 197.66241036183416
+        },
+        {
+          "case": "edit",
+          "rep": 1,
+          "tokens": 2048,
+          "decode_tps": 242.8612086139835
+        }
+      ]
+    },
+    {
+      "directory": "q8s-ab-v26-mode1-repeat",
+      "weighted_decode_tps": 222.6103087703534,
+      "output_tokens": 12288,
+      "decode_ms": 55199.6,
+      "loaded_free_vram_mib": [
+        34,
+        34
+      ],
+      "per_case": [
+        {
+          "case": "code",
+          "rep": 0,
+          "tokens": 2048,
+          "decode_tps": 231.76597068975272
+        },
+        {
+          "case": "prose",
+          "rep": 0,
+          "tokens": 2048,
+          "decode_tps": 198.42846208252996
+        },
+        {
+          "case": "edit",
+          "rep": 0,
+          "tokens": 2048,
+          "decode_tps": 243.68478041002822
+        },
+        {
+          "case": "code",
+          "rep": 1,
+          "tokens": 2048,
+          "decode_tps": 230.90626197938983
+        },
+        {
+          "case": "prose",
+          "rep": 1,
+          "tokens": 2048,
+          "decode_tps": 198.00065742405786
+        },
+        {
+          "case": "edit",
+          "rep": 1,
+          "tokens": 2048,
+          "decode_tps": 243.08893874111266
+        }
+      ]
+    }
+  ],
+  "control_directory": "q8s-ab-v26-mode0",
+  "control_tps": 220.0990875775129,
+  "combined_weighted_decode_tps": 222.3776565470476,
+  "prior_checkpoint": "draft-head-v13-mode3",
+  "input_output_and_draft_counts_exact": true,
+  "all_decode_major_faults_zero": true,
+  "quality": [
+    {
+      "directory": "quality-q8s-ab-v26",
+      "all_decode_major_faults_zero": true,
+      "engine_returncode": 0
+    },
+    {
+      "directory": "near-context-q8s-ab-v26",
+      "all_decode_major_faults_zero": true,
+      "engine_returncode": 0
+    },
+    {
+      "directory": "heldout-q8s-ab-v26",
+      "all_decode_major_faults_zero": true,
+      "engine_returncode": 0
+    },
+    {
+      "directory": "churn-q8s-ab-v26",
+      "all_decode_major_faults_zero": true,
+      "engine_returncode": 0
+    },
+    {
+      "directory": "probe-q8s-ab-v26",
+      "all_decode_major_faults_zero": true,
+      "engine_returncode": 0
+    },
+    {
+      "directory": "sampling-q8s-ab-v26",
+      "all_decode_major_faults_zero": true,
+      "engine_returncode": 0
+    }
+  ],
+  "quality_checks": 1326,
+  "bf16_gpu_checks": 576,
+  "bf16_host_exact_patterns": 65536,
+  "bf16_host_nonrepresentable_rejections": 65535,
+  "clock_policy_checks": 18432,
+  "q8s_ab_fusion_checks": 1152,
+  "loaded_free_vram_mib_per_card": 34,
+  "process_cpu_mask": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "all_engine_thread_masks_verified": true,
+  "q8s_ab_unfused_control_tps": 220.0990875775129,
+  "router_storage": "Lossless BF16, exact original FP32 bits before arithmetic.",
+  "router_saved_mib_per_card": 120.234375,
+  "limitations": [
+    "Recipe validated at context allocation 32768 on the recorded dual RX7900XTX host.",
+    "220 tokens/s is the six-request aggregate; individual prose requests are below 220.",
+    "The small margin above 220 is specific to the recorded host and run conditions.",
+    "Draft-head screening is approximate candidate selection; main-model verification remains enabled.",
+    "The 11.25 GiB RAM recipe leaves only about 34 MiB free VRAM per card at load."
+  ]
+}

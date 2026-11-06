@@ -102,9 +102,11 @@ struct ExpertCache {
     const char** ep_dn = nullptr;
     const char* const* host_gu = nullptr;  // [NL * NEXP]: its copy in host memory
     const char* const* host_dn = nullptr;
-    int* slot_of = nullptr;              // [NL * NEXP]: its slot, or -1
+    int* slot_of = nullptr;              // [NL * NEXP]: its slot, -1 in host memory, -2 fixed VRAM (decode-only cache)
     int* owner = nullptr;                // [n_slots]: the expert in it (layer * NEXP + expert)
     unsigned char* ref = nullptr;        // [n_slots]: used since the hand passed (2: by the layer being planned, 3: lent)
+    unsigned char* age = nullptr;        // optional CLOCK hit credit; null preserves the original policy
+    int max_age = 1;                     // saturating hit credit, only used when age is allocated
     int* hand = nullptr;                 // [EC_POOLS]: each pool's, a slot number in it
     // FNX_ARENA: the pool whose slots the K/V pool can borrow (the largest), its slots coldest first by the profile and
     // its memory the engine's (the arena: K/V pages, then these slots); a pool's first lent[p] slots are lent (empty,
@@ -121,6 +123,7 @@ struct LayerW {
     Q8S hc_up[2];                      // [D][LR]
     uint16_t* hc_inj[2] = {};          // bf16 [HC][D]
     float* router = nullptr;           // f32 [NEXP + 1][N]: the router's rows, then the shared expert's gate
+    uint16_t* router_bf16 = nullptr;    // optional lossless storage; exactly one router pointer is set
     // recurrent slice: this card's key heads and their value heads
     DW qkv, z, ssm_out;                // qkv rows: q (nk*HS), k (nk*HS), v (nv*HS); ssm_out: [N][nv*HS]
     DW qkvz;                           // qkv rows then z rows, one matrix

@@ -1,0 +1,908 @@
+diff --git a/src/split/CMakeLists.txt b/src/split/CMakeLists.txt
+index d43bde2e..2ac2c26e 100644
+--- a/src/split/CMakeLists.txt
++++ b/src/split/CMakeLists.txt
+@@ -139,7 +139,7 @@ endif()
+ list(GET STRATA_SPLIT_CARDS 0 _moe_cards)
+ set(_fnx_kernel_checks moe_iq moe_down moe_cache dense_q8 mtp_head_gpu)
+ if(_fnx_hip AND _moe_cards EQUAL 2)
+-  list(APPEND _fnx_kernel_checks attn_heads moe_cache_gu moe_q2_down moe_q2_mma mtp_head_gemv)
++  list(APPEND _fnx_kernel_checks attn_heads moe_cache_gu moe_q2_down moe_q2_mma mtp_head_gemv router_bf16 q8s_ab)
+ endif()
+ foreach(_kind ${_fnx_kernel_checks})
+   set(_target split_${_kind}_test)
+@@ -250,3 +250,8 @@ set_target_properties(split_attn_head_config_test PROPERTIES CXX_STANDARD 17 CXX
+ add_executable(split_static_kv_cache_test EXCLUDE_FROM_ALL ${_sp}/tools/static_kv_cache_test.cpp)
+ target_include_directories(split_static_kv_cache_test PRIVATE ${_sp}/src)
+ set_target_properties(split_static_kv_cache_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
++
++# Exact router storage conversion, including rejection instead of rounding.
++add_executable(split_lossless_bf16_test EXCLUDE_FROM_ALL ${_sp}/tools/lossless_bf16_test.cpp)
++target_include_directories(split_lossless_bf16_test PRIVATE ${_sp}/src)
++set_target_properties(split_lossless_bf16_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+diff --git a/src/split/src/bf16_weight_load.cuh b/src/split/src/bf16_weight_load.cuh
+new file mode 100644
+index 00000000..6983ea43
+--- /dev/null
++++ b/src/split/src/bf16_weight_load.cuh
+@@ -0,0 +1,11 @@
++// Four weights in the same order as an FP32 float4 load. BF16 is storage only;
++// expansion restores the exact original FP32 bits before arithmetic.
++#pragma once
++template<bool BF16>
++__device__ __forceinline__ float4 load_weight4(const void* weights, size_t index4) {
++    if constexpr (BF16) {
++        const uint2 bits = __ldg(reinterpret_cast<const uint2*>(weights) + index4);
++        return make_float4(__uint_as_float(bits.x << 16), __uint_as_float(bits.x & 0xffff0000u),
++                           __uint_as_float(bits.y << 16), __uint_as_float(bits.y & 0xffff0000u));
++    } else return __ldg(reinterpret_cast<const float4*>(weights) + index4);
++}
+diff --git a/src/split/src/engine.cu b/src/split/src/engine.cu
+index 47009ded..1be743be 100644
+--- a/src/split/src/engine.cu
++++ b/src/split/src/engine.cu
+@@ -30,9 +30,27 @@
+ 
+ namespace fnx {
+ 
++namespace {
++bool q8s_fused_ab() {
++    static const bool enabled = [] {
++        const auto value = env_int("FNX_Q8S_FUSED_AB", 0);
++        if (value != 0 && value != 1) throw std::runtime_error("FNX_Q8S_FUSED_AB: expected 0 or 1");
++#if !FNX_HIP || FNX_NCARD != 2 || FNX_27B
++        if (value) throw std::runtime_error("FNX_Q8S_FUSED_AB requires two-card HIP Flash-Next");
++#endif
++        if (value && env_int("FNX_Q8S_ROW_GROUP", 0) != 2)
++            throw std::runtime_error("FNX_Q8S_FUSED_AB requires FNX_Q8S_ROW_GROUP=2");
++        if (value) std::fprintf(stderr, "fnx: fused two-card Q8S and alpha/beta projections (8192 rows, two rows per warp)\n");
++        return value != 0;
++    }();
++    return enabled;
++}
++} // namespace
++
+ 
+ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
+     attn_head_check_runtime(lanes, batch_drafts() != BatchDrafts::off);
++    (void) q8s_fused_ab();
+     // the 27B build's settings: this Flash-Next engine has none of what they set, so one given is a mistake, not a
+     // run of the default
+     for (const char* k : {"FNX_PF_SKIP", "FNX_PF_SKIP_CONFIRM", "FNX_PF_SCORE_MIB", "FNX_PF_WINDOWS", "FNX_PF_SCORES",
+@@ -1030,7 +1048,7 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
+     const bool live = (static_live || cache_live()) && lyr >= 0 && lyr < NL;
+     const bool plan_in_router = live && !b.probe_cnt;
+     router_route(L.router, b.mixed, b.logits, T, b.topi, b.topw, b.jobs_gu, b.jobs_dn, b.njobs, b.st, plan_in_router ? &ec : nullptr,
+-                 lyr, b.cache_list, sh_in ? &L.sh_gu.s : nullptr, 2 * ffs, b.xq, b.sh_gu);
++                 lyr, b.cache_list, sh_in ? &L.sh_gu.s : nullptr, 2 * ffs, b.xq, b.sh_gu, L.router_bf16);
+     if (const int l = lyr; l >= 0 && l < NL) {
+         if (b.route_cnt) route_count(b.topi, P, b.route_cnt + (size_t) l * NEXP, b.st);
+         if (b.route_trace) fnx::route_trace(b.topi, P, l, b.route_trace, b.route_trace_len, b.route_trace_cap, b.st);
+@@ -1039,7 +1057,7 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
+                 probe_score(b.topi, b.probe_guess + (size_t) l * MAXT * TOPK, T, w.ec.n_slots ? w.ec.slot_of + (size_t) l * NEXP : nullptr,
+                             b.probe_cnt, b.st);
+             if (l + 1 < NL) {
+-                gemv_f32(w.L[(size_t) l + 1].router, b.mixed, b.probe_logits, NEXP, N, T, b.st);
++                gemv_f32(w.L[(size_t) l + 1].router, b.mixed, b.probe_logits, NEXP, N, T, b.st, w.L[(size_t) l + 1].router_bf16);
+                 probe_guess(b.probe_logits, T, b.probe_guess + (size_t) (l + 1) * MAXT * TOPK, b.st);
+             }
+         }
+@@ -1107,8 +1125,10 @@ void Engine::enqueue(int T, bool dumps) {
+                     b.inj_a, b.hcs, b.ring.err, T, b.st, b.xq);
+             if (!is_attn(l)) {
+                 const int nv = w.nv(), ch = w.conv_ch();
+-                // ab beside qkvz in one launch (a fork and a join: ~5 us more; compiled for 4096..8191 rows)
+-                if (L.qkvz.s.q && 2 * nv <= 160 && L.qkvz.n_out >= 4096 && L.qkvz.n_out < 8192) {
++                // The two-card 8192-row projection uses the same R=2 arithmetic
++                // with FNX_Q8S_ROW_GROUP=2; optionally fuse AB to avoid fork/join.
++                if (L.qkvz.s.q && 2 * nv <= 160 && L.qkvz.n_out >= 4096 &&
++                    (L.qkvz.n_out < 8192 || (L.qkvz.n_out == 8192 && q8s_fused_ab()))) {
+                     q8s_gemv_f32(L.qkvz.s, L.qkvz.n_out, L.qkvz.n_in, b.xq, b.qkvz, L.ab, b.mixed, b.ab, 2 * nv, T, b.st);
+                 } else {
+                     ck(cudaEventRecord(b.fork, b.st), "fork");
+diff --git a/src/split/src/kernels.cu b/src/split/src/kernels.cu
+index fe0a8e3b..0d578fe7 100644
+--- a/src/split/src/kernels.cu
++++ b/src/split/src/kernels.cu
+@@ -203,14 +203,15 @@ __global__ void __launch_bounds__(MMVQ_THREADS) k_mmvq(const char* __restrict__
+ }
+ 
+ #include "mtp_head_gemv.cuh"
++#include "bf16_weight_load.cuh"
+ #include "dense.cuh"
+ #include "moe.cuh"
+ #include "moe_q4k.cuh"
+ 
+ // ---------------------------------------------------------------- f32 matrix x vectors (router, alpha / beta, gates)
+ // y[t][row] = W[row] . x[t]: a warp per row (WPR = 1) or a block per row (WPR = 4 warps, the columns split), n = N
+-template <int T, int WPR>
+-__global__ void __launch_bounds__(256) k_gemv_f32(const float* __restrict__ W, const float* __restrict__ x, float* __restrict__ y,
++template <int T, int WPR, bool BF16 = false>
++__global__ void __launch_bounds__(256) k_gemv_f32(const void* __restrict__ W, const float* __restrict__ x, float* __restrict__ y,
+                                                  int rows) {
+     constexpr int NC = N / 4 / (32 * WPR);   // float4 chunks per lane
+     static_assert(N % (4 * 32 * WPR) == 0, "chunks per lane");
+@@ -218,10 +219,10 @@ __global__ void __launch_bounds__(256) k_gemv_f32(const float* __restrict__ W, c
+     const int row = WPR == 1 ? blockIdx.x * 8 + warp : blockIdx.x;
+     const int part = WPR == 1 ? 0 : warp;     // this warp's share of the columns
+     if (row >= rows) return;
+-    const float4* w4 = reinterpret_cast<const float4*>(W + (size_t) row * N) + part * NC * 32;
++    const size_t first4 = (size_t) row * (N / 4) + part * NC * 32;
+     float4 wv[NC];
+ #pragma unroll
+-    for (int i = 0; i < NC; ++i) wv[i] = __ldg(w4 + i * 32 + lane);
++    for (int i = 0; i < NC; ++i) wv[i] = load_weight4<BF16>(W, first4 + i * 32 + lane);
+     float s[T];
+ #pragma unroll
+     for (int t = 0; t < T; ++t) {
+@@ -1132,34 +1133,34 @@ void mtp_head_gemv(const DW& W, const void* y, float* out, int mode, void* st) {
+ }
+ 
+ namespace {
+-template <int T>
+-void gemv_f32_t(const float* W, const float* x, float* y, int rows, cudaStream_t s) {
++template <int T, bool BF16>
++void gemv_f32_t(const void* W, const float* x, float* y, int rows, cudaStream_t s) {
+     // a block per row while that still gives every SM a block or two; a warp per row beyond
+-    if (rows <= 160) k_gemv_f32<T, 4><<<rows, 128, 0, s>>>(W, x, y, rows);
+-    else k_gemv_f32<T, 1><<<(rows + 7) / 8, 256, 0, s>>>(W, x, y, rows);
++    if (rows <= 160) k_gemv_f32<T, 4, BF16><<<rows, 128, 0, s>>>(W, x, y, rows);
++    else k_gemv_f32<T, 1, BF16><<<(rows + 7) / 8, 256, 0, s>>>(W, x, y, rows);
+ }
+ }  // namespace
+ 
+-void gemv_f32(const float* W, const float* x, float* y, int rows, int n, int T, void* st) {
++void gemv_f32(const float* W, const float* x, float* y, int rows, int n, int T, void* st, const uint16_t* packed) {
+     if (n != N) throw std::runtime_error("gemv_f32: rows of N columns only");
+     cudaStream_t s = (cudaStream_t) st;
+     switch (T) {
+-        case 1: gemv_f32_t<1>(W, x, y, rows, s); break;
+-        case 2: gemv_f32_t<2>(W, x, y, rows, s); break;
+-        case 3: gemv_f32_t<3>(W, x, y, rows, s); break;
+-        case 4: gemv_f32_t<4>(W, x, y, rows, s); break;
+-        case 5: gemv_f32_t<5>(W, x, y, rows, s); break;
+-        case 6: gemv_f32_t<6>(W, x, y, rows, s); break;
+-        case 7: gemv_f32_t<7>(W, x, y, rows, s); break;
+-        case 8: gemv_f32_t<8>(W, x, y, rows, s); break;
+-        case 9: gemv_f32_t<9>(W, x, y, rows, s); break;
+-        case 10: gemv_f32_t<10>(W, x, y, rows, s); break;
+-        case 11: gemv_f32_t<11>(W, x, y, rows, s); break;
+-        case 12: gemv_f32_t<12>(W, x, y, rows, s); break;
+-        case 13: gemv_f32_t<13>(W, x, y, rows, s); break;
+-        case 14: gemv_f32_t<14>(W, x, y, rows, s); break;
+-        case 15: gemv_f32_t<15>(W, x, y, rows, s); break;
+-        case 16: gemv_f32_t<16>(W, x, y, rows, s); break;
++        case 1: if (packed) gemv_f32_t<1, true>(packed, x, y, rows, s); else gemv_f32_t<1, false>(W, x, y, rows, s); break;
++        case 2: if (packed) gemv_f32_t<2, true>(packed, x, y, rows, s); else gemv_f32_t<2, false>(W, x, y, rows, s); break;
++        case 3: if (packed) gemv_f32_t<3, true>(packed, x, y, rows, s); else gemv_f32_t<3, false>(W, x, y, rows, s); break;
++        case 4: if (packed) gemv_f32_t<4, true>(packed, x, y, rows, s); else gemv_f32_t<4, false>(W, x, y, rows, s); break;
++        case 5: if (packed) gemv_f32_t<5, true>(packed, x, y, rows, s); else gemv_f32_t<5, false>(W, x, y, rows, s); break;
++        case 6: if (packed) gemv_f32_t<6, true>(packed, x, y, rows, s); else gemv_f32_t<6, false>(W, x, y, rows, s); break;
++        case 7: if (packed) gemv_f32_t<7, true>(packed, x, y, rows, s); else gemv_f32_t<7, false>(W, x, y, rows, s); break;
++        case 8: if (packed) gemv_f32_t<8, true>(packed, x, y, rows, s); else gemv_f32_t<8, false>(W, x, y, rows, s); break;
++        case 9: if (packed) gemv_f32_t<9, true>(packed, x, y, rows, s); else gemv_f32_t<9, false>(W, x, y, rows, s); break;
++        case 10: if (packed) gemv_f32_t<10, true>(packed, x, y, rows, s); else gemv_f32_t<10, false>(W, x, y, rows, s); break;
++        case 11: if (packed) gemv_f32_t<11, true>(packed, x, y, rows, s); else gemv_f32_t<11, false>(W, x, y, rows, s); break;
++        case 12: if (packed) gemv_f32_t<12, true>(packed, x, y, rows, s); else gemv_f32_t<12, false>(W, x, y, rows, s); break;
++        case 13: if (packed) gemv_f32_t<13, true>(packed, x, y, rows, s); else gemv_f32_t<13, false>(W, x, y, rows, s); break;
++        case 14: if (packed) gemv_f32_t<14, true>(packed, x, y, rows, s); else gemv_f32_t<14, false>(W, x, y, rows, s); break;
++        case 15: if (packed) gemv_f32_t<15, true>(packed, x, y, rows, s); else gemv_f32_t<15, false>(W, x, y, rows, s); break;
++        case 16: if (packed) gemv_f32_t<16, true>(packed, x, y, rows, s); else gemv_f32_t<16, false>(W, x, y, rows, s); break;
+         default: throw std::runtime_error("gemv_f32: T out of range");
+     }
+     ck_launch("gemv_f32");
+@@ -1981,6 +1982,7 @@ __global__ void k_arena_slots(ExpertCache ec, int from, int to) {
+         }
+         ec.owner[s] = -1;
+         ec.ref[s] = lend ? 3 : 0;
++        if (ec.age) ec.age[s] = 0;
+     }
+     if (blockIdx.x == 0 && threadIdx.x == 0) {
+         ec.lent[p] = to;
+@@ -2210,7 +2212,7 @@ namespace fnx {
+ #if FNX_KPART == 8
+ void router_route(const float* W, const float* x, float* logits, int T, int* topi, float* topw, Job* jobs_gu, Job* jobs_dn,
+                   int* njobs, void* st, const ExpertCache* ec, int layer, int* list, const Q8S* sh_gu, int sh_rows, const void* sh_y,
+-                  float* sh_out) {
++                  float* sh_out, const uint16_t* packed) {
+     cudaStream_t s = (cudaStream_t) st;
+     ShexpUp su;
+     if (sh_gu) {
+@@ -2227,7 +2229,10 @@ void router_route(const float* W, const float* x, float* logits, int T, int* top
+     unsigned* counter = (unsigned*) (njobs + 1);
+     const ExpertCache none{};
+     if (ec && (layer < 0 || layer >= NL || !list)) throw std::runtime_error("router_route: a cache plan needs its layer and list");
+-#define FNX_RR(t) k_router_route<t><<<grid, RR_THREADS, 0, s>>>(W, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su)
++#define FNX_RR(t) do { \
++    if (packed) k_router_route<t, true><<<grid, RR_THREADS, 0, s>>>(packed, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su); \
++    else k_router_route<t, false><<<grid, RR_THREADS, 0, s>>>(W, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su); \
++} while (0)
+     switch (T) {
+         case 1: FNX_RR(1); break;
+         case 2: FNX_RR(2); break;
+@@ -2525,7 +2530,8 @@ void q8s_gemv_f32(const Q8S& w, int rows, int cols, const void* y, float* out, c
+     if (rows >= 8192) q8s_ab_launch<4>(g, rows, cols, yq, W, x, yf, rf, T, s);
+     else q8s_ab_launch<2>(g, rows, cols, yq, W, x, yf, rf, T, s);
+ #else
+-    if (rows < 4096 || rows >= 8192) throw std::runtime_error("q8s_gemv_f32: compiled for 4096..8191 rows (qkvz)");
++    if (rows < 4096 || (rows >= 8192 && env_int("FNX_Q8S_ROW_GROUP", 0) != 2))
++        throw std::runtime_error("q8s_gemv_f32: requires rows >= 4096 and FNX_Q8S_ROW_GROUP=2 for rows >= 8192");
+     q8s_ab_launch<2>(g, rows, cols, yq, W, x, yf, rf, T, s);
+ #endif
+     ck_launch("q8s_gemv_f32");
+diff --git a/src/split/src/kernels.hpp b/src/split/src/kernels.hpp
+index 9acdd469..cb919816 100644
+--- a/src/split/src/kernels.hpp
++++ b/src/split/src/kernels.hpp
+@@ -54,7 +54,7 @@ void mtp_head_gemv(const DW& W, const void* y, float* out, int mode, void* st);
+ // out[t][r] = W[r] . y[t] for t < T: W in the split Q8_0 layout [rows][cols], y q8_1 rows of cols
+ void q8s_gemv(const Q8S& w, int rows, int cols, const void* y, float* out, int out_stride, int T, void* st);
+ // y[t][r] = W[r] . x[t] (f32 weights [rows][n], f32 x)
+-void gemv_f32(const float* W, const float* x, float* y, int rows, int n, int T, void* st);
++void gemv_f32(const float* W, const float* x, float* y, int rows, int n, int T, void* st, const uint16_t* packed = nullptr);
+ 
+ // the hyper-connection read (build_hc_mix) with the previous half's write folded in when bo_prev is not null:
+ // R' = R + bo_prev * 2 sigmoid(inj_prev / HC); R <- R'; mixed = mean_c xn_c * sigmoid(up . silu(down . xn / HC));
+@@ -296,7 +296,7 @@ void ple_post(float* R, const float* key, const float* value, const float* nk, c
+ // sh_gu (rows sh_rows < 4096): the shared expert's gate|up over the q8_1 rows sh_y into sh_out, in the same launch
+ void router_route(const float* W, const float* x, float* logits, int T, int* topi, float* topw, Job* jobs_gu, Job* jobs_dn,
+                   int* njobs, void* st, const ExpertCache* ec = nullptr, int layer = -1, int* list = nullptr, const Q8S* sh_gu = nullptr,
+-                  int sh_rows = 0, const void* sh_y = nullptr, float* sh_out = nullptr);
++                  int sh_rows = 0, const void* sh_y = nullptr, float* sh_out = nullptr, const uint16_t* packed = nullptr);
+ // Down weights to fill beside IQ gate/up arithmetic. The preceding cache plan
+ // must complete first; GU is already resident or filled by CacheGateUpCopy below.
+ // The list/slots stay fixed until this launch finishes. Bytes and offsets are
+@@ -413,7 +413,7 @@ void l2_prefetch(const void* p, size_t bytes, void* st);
+ void q8s_gemv_segs(const Q8S* w, const int* rows, float* const* out, const int* out_stride, int n, int cols, const void* y, int T,
+                    void* st);
+ // q8s_gemv(w, rows, cols, y, out, rows) and gemv_f32(W, x, yf, rf <= 160, N) in one launch, the same values; rows
+-// 4096..8191 only (q8s_gemv_segs: 8192 rows and more in all)
++// 4096..8191 normally; larger Flash-Next matrices require FNX_Q8S_ROW_GROUP=2.
+ void q8s_gemv_f32(const Q8S& w, int rows, int cols, const void* y, float* out, const float* W, const float* x, float* yf, int rf, int T,
+                   void* st);
+ 
+diff --git a/src/split/src/lossless_bf16.hpp b/src/split/src/lossless_bf16.hpp
+new file mode 100644
+index 00000000..e48656f6
+--- /dev/null
++++ b/src/split/src/lossless_bf16.hpp
+@@ -0,0 +1,18 @@
++// Compact only exact BF16 values. Never round a model weight.
++#pragma once
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <vector>
++namespace fnx {
++inline bool pack_lossless_bf16(const float* src, size_t n, std::vector<uint16_t>& out) {
++    out.resize(n);
++    for (size_t i = 0; i < n; ++i) {
++        uint32_t bits;
++        std::memcpy(&bits, src + i, sizeof(bits));
++        if (bits & 0xffffu) { out.clear(); return false; }
++        out[i] = (uint16_t) (bits >> 16);
++    }
++    return true;
++}
++} // namespace fnx
+diff --git a/src/split/src/model.cpp b/src/split/src/model.cpp
+index ecc08894..b270d3bf 100644
+--- a/src/split/src/model.cpp
++++ b/src/split/src/model.cpp
+@@ -1,3 +1,4 @@
++#include "lossless_bf16.hpp"
+ #include "model.hpp"
+ #include "card_check.hpp"
+ #include "env.hpp"
+@@ -686,13 +687,22 @@ struct Up {
+         return w;
+     }
+     // f32 tensors' rows one after another
+-    float* f32_cat(const Tensor& t1, const Tensor& t2, size_t row_floats) {
++    float* f32_cat(const Tensor& t1, const Tensor& t2, size_t row_floats, uint16_t** packed = nullptr) {
+         if (t1.type != T_F32 || t2.type != T_F32 || t1.ne[0] != t2.ne[0]) throw std::runtime_error(t1.name + " and " + t2.name + " do not stack");
+         if ((size_t) t1.ne[0] != row_floats)
+             throw std::runtime_error(t1.name + " is " + std::to_string(t1.ne[0]) + " floats a row, not the " + std::to_string(row_floats) +
+                                      " its reader takes");
+         std::vector<float> h((const float*) t1.data, (const float*) t1.data + t1.ne[0] * t1.ne[1]);
+         h.insert(h.end(), (const float*) t2.data, (const float*) t2.data + t2.ne[0] * t2.ne[1]);
++        static const long long compact = env_int("FNX_ROUTER_BF16", 0);
++        if (compact != 0 && compact != 1) throw std::runtime_error("FNX_ROUTER_BF16: expected 0 or 1");
++        if (compact && packed) {
++            std::vector<uint16_t> bits;
++            if (pack_lossless_bf16(h.data(), h.size(), bits)) {
++                *packed = put<uint16_t>(bits.data(), bits.size() * sizeof(uint16_t));
++                return nullptr;
++            }
++        }
+         return put<float>(h.data(), h.size() * 4);
+     }
+     // per expert: every row, input blocks [b0, b1) (down), expert-major
+@@ -899,7 +909,7 @@ void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resid
+             throw std::runtime_error("fnx: " + gi.name + " holds " + std::to_string(gi.ne[1]) + " rows and " + gs.name + " " +
+                                      std::to_string(gs.ne[1]) + ", not the " + std::to_string(NEXP) +
+                                      " gate rows and 1 shared row k_router_route reads");
+-        w.router = up.f32_cat(gi, gs, N);
++        w.router = up.f32_cat(gi, gs, N, &w.router_bf16);
+         if (!is_attn(l)) {
+             w.qkvz = up.dense(up.rows2(L(l, "attn_qkv.weight"), conv_rows, L(l, "attn_gate.weight"), zrows));
+             w.ab = up.f32_rows2(L(l, "ssm_alpha.weight"), L(l, "ssm_beta.weight"), vheads, N);
+@@ -960,6 +970,10 @@ void load_card(Stager& st, CardW& c, const std::vector<std::vector<char>>& resid
+         }
+         st.done(l);
+     }
++    int packed_routers = 0;
++    for (const LayerW& layer : c.L) packed_routers += layer.router_bf16 != nullptr;
++    if (packed_routers) std::fprintf(stderr, "fnx: card %d: %d lossless BF16 routers, %.2f MiB saved\n", c.dev, packed_routers,
++                                    (double) packed_routers * (NEXP + 1) * N * sizeof(uint16_t) / 1048576.0);
+     c.head_norm = up.f32(st.t(NL, "output_hc_norm.weight"), D);
+     c.head_down = up.q8split(st.t(NL, "output_hc_down.weight"));
+     c.head_up = up.q8split(st.t(NL, "output_hc_up.weight"));
+@@ -1777,7 +1791,9 @@ void card_fields(CardW& c, F f) {
+         f(c.ple_norm_query), f(c.ple_norm_conv), f(c.ple_conv), f(c.bytes), f(c.host_bytes);
+ }
+ #if !FNX_27B   // the 27B has no holder (plain loads only)
+-static_assert(sizeof(CardW) == 896, "CardW changed: put what load_card stores in card_fields, then update this size");
++// ExpertCache is rebuilt by placement, after load_card; its optional static-cache
++// ages are allocated by the engine and add no holder-image weight fields.
++static_assert(sizeof(CardW) == 912, "CardW changed: put what load_card stores in card_fields, then update this size");
+ #endif
+ // every address load_card stores, in a card and in a layer: a worker moves them to where it mapped the holder's memory
+ template <typename F>
+@@ -1788,7 +1804,7 @@ void card_ptrs(CardW& c, F f) {
+         f(c.ple_norm_query), f(c.ple_norm_conv), f(c.ple_conv);
+     for (LayerW& w : c.L) {
+         for (int h = 0; h < 2; ++h) f(w.hc_norm[h]), q8(w.hc_down[h]), q8(w.hc_up[h]), f(w.hc_inj[h]);
+-        f(w.router), dw(w.qkv), dw(w.z), dw(w.ssm_out), dw(w.qkvz), f(w.ab), f(w.conv), f(w.alpha), f(w.beta), f(w.ssm_a),
++        f(w.router), f(w.router_bf16), dw(w.qkv), dw(w.z), dw(w.ssm_out), dw(w.qkvz), f(w.ab), f(w.conv), f(w.alpha), f(w.beta), f(w.ssm_a),
+             f(w.dt_bias), f(w.ssm_norm);
+         dw(w.wq), dw(w.wk), dw(w.wv), dw(w.wo), f(w.q_norm), f(w.k_norm), f(w.idx_wq), f(w.idx_wk), dw(w.idx_qk), f(w.idx_qn),
+             f(w.idx_kn);
+@@ -1798,13 +1814,13 @@ void card_ptrs(CardW& c, F f) {
+     for (const char*& p : c.ec_host_dn) f(p);
+ }
+ #if !FNX_27B
+-static_assert(sizeof(LayerW) == 952, "LayerW changed: put its new addresses in card_ptrs, then update this size");
++static_assert(sizeof(LayerW) == 960, "LayerW changed: put its new addresses in card_ptrs, then update this size");
+ #endif
+ }  // namespace
+ 
+ std::string Model::image() const {
+     Img m;
+-    m.put((uint32_t) 0x31474d49);   // "IMG1"
++    m.put((uint32_t) 0x32474d49);   // "IMG2": LayerW includes the lossless BF16 router address
+     for (const CardW& cc : cards) {
+         CardW& c = const_cast<CardW&>(cc);
+         card_fields(c, [&](auto& v) { m.put(v); });
+@@ -1819,7 +1835,7 @@ void Model::restore(const std::string& image, const Store& store) {
+     Img m{image};
+     uint32_t magic = 0;
+     m.get(magic);
+-    if (magic != 0x31474d49) throw std::runtime_error("fnx: not a holder's image");
++    if (magic != 0x32474d49) throw std::runtime_error("fnx: not a holder's image");
+     for (CardW& c : cards) {
+         card_fields(c, [&](auto& v) { m.get(v); });
+         m.get_vec(c.L);
+diff --git a/src/split/src/model.hpp b/src/split/src/model.hpp
+index 218e67c7..cbdb777e 100644
+--- a/src/split/src/model.hpp
++++ b/src/split/src/model.hpp
+@@ -105,6 +105,8 @@ struct ExpertCache {
+     int* slot_of = nullptr;              // [NL * NEXP]: its slot, -1 in host memory, -2 fixed VRAM (decode-only cache)
+     int* owner = nullptr;                // [n_slots]: the expert in it (layer * NEXP + expert)
+     unsigned char* ref = nullptr;        // [n_slots]: used since the hand passed (2: by the layer being planned, 3: lent)
++    unsigned char* age = nullptr;        // optional CLOCK hit credit; null preserves the original policy
++    int max_age = 1;                     // saturating hit credit, only used when age is allocated
+     int* hand = nullptr;                 // [EC_POOLS]: each pool's, a slot number in it
+     // FNX_ARENA: the pool whose slots the K/V pool can borrow (the largest), its slots coldest first by the profile and
+     // its memory the engine's (the arena: K/V pages, then these slots); a pool's first lent[p] slots are lent (empty,
+@@ -121,6 +123,7 @@ struct LayerW {
+     Q8S hc_up[2];                      // [D][LR]
+     uint16_t* hc_inj[2] = {};          // bf16 [HC][D]
+     float* router = nullptr;           // f32 [NEXP + 1][N]: the router's rows, then the shared expert's gate
++    uint16_t* router_bf16 = nullptr;    // optional lossless storage; exactly one router pointer is set
+     // recurrent slice: this card's key heads and their value heads
+     DW qkv, z, ssm_out;                // qkv rows: q (nk*HS), k (nk*HS), v (nv*HS); ssm_out: [N][nv*HS]
+     DW qkvz;                           // qkv rows then z rows, one matrix
+diff --git a/src/split/src/moe.cuh b/src/split/src/moe.cuh
+index 3fd092aa..cedcb040 100644
+--- a/src/split/src/moe.cuh
++++ b/src/split/src/moe.cuh
+@@ -25,7 +25,10 @@ __device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache
+     }
+     const int s0 = ec.s0[p] + lent, n = ec.n[p] - lent;
+     for (int j = lane; j < nj; j += 32)
+-        if (const int s = ec.slot_of[base + jobs[j].w]; s >= 0) ec.ref[s] = 2;
++        if (const int s = ec.slot_of[base + jobs[j].w]; s >= 0) {
++            if (ec.age) ec.age[s] = min(ec.max_age, (int) ec.age[s] + 1);
++            ec.ref[s] = 2;
++        }
+     __syncwarp();
+     int hand = ec.hand[p] - s0, k = 0;   // within the slots not lent
+     if (hand < 0 || hand >= n) hand = 0;
+@@ -41,7 +44,13 @@ __device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache
+                 const unsigned char r = ec.ref[idx];
+                 const unsigned free = __ballot_sync(0xffffffffu, r == 0);
+                 const int f = free ? __ffs(free) - 1 : 32;
+-                if (lane < f && r == 1) ec.ref[idx] = 0;
++                if (lane < f && r == 1) {
++                    if (ec.age && ec.age[idx] > 1) --ec.age[idx];
++                    else {
++                        ec.ref[idx] = 0;
++                        if (ec.age) ec.age[idx] = 0;
++                    }
++                }
+                 if (free) victim = s0 + (hand + f) % n;
+                 hand = (hand + (free ? f + 1 : 32)) % n;
+             }
+@@ -54,6 +63,7 @@ __device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache
+                 ec.owner[victim] = g;
+                 ec.slot_of[g] = victim;
+                 ec.ref[victim] = 2;
++                if (ec.age) ec.age[victim] = 1;
+                 char* at = ec.pool[p] + (size_t) (victim - ec.s0[p]) * ec.slot_bytes[p];
+                 ec.ep_gu[g] = at;
+                 ec.ep_dn[g] = at + ec.dn_off[p];
+@@ -71,8 +81,8 @@ __device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache
+     }
+ }
+ 
+-template <int T>
+-__global__ void __launch_bounds__(RR_THREADS) k_router_route(const float* __restrict__ W, const float* __restrict__ x,
++template <int T, bool BF16 = false>
++__global__ void __launch_bounds__(RR_THREADS) k_router_route(const void* __restrict__ W, const float* __restrict__ x,
+                                                             float* __restrict__ logits, int* __restrict__ topi,
+                                                             float* __restrict__ topw, Job* __restrict__ gu, Job* __restrict__ dn,
+                                                             int* __restrict__ njobs, unsigned* __restrict__ counter,
+@@ -88,10 +98,10 @@ __global__ void __launch_bounds__(RR_THREADS) k_router_route(const float* __rest
+     const int row = blockIdx.x * RR_ROWS + rw;
+     __shared__ float rsum[T][RR_THREADS / 32];
+     if (row < L) {
+-        const float4* w4 = reinterpret_cast<const float4*>(W + (size_t) row * N) + half * NC * 32;
++        const size_t first4 = (size_t) row * (N / 4) + half * NC * 32;
+         float4 wv[NC];
+ #pragma unroll
+-        for (int i = 0; i < NC; ++i) wv[i] = __ldg(w4 + i * 32 + lane);
++        for (int i = 0; i < NC; ++i) wv[i] = load_weight4<BF16>(W, first4 + i * 32 + lane);
+         // unrolled over the tokens: each pair's x loads and sums run beside the others' (rolled, the pairs waited on
+         // each other: one wave of blocks, so latency set the time). Each logit's summation order is unchanged
+ #pragma unroll
+diff --git a/src/split/src/prefill.cu b/src/split/src/prefill.cu
+index 230661fb..f85740b5 100644
+--- a/src/split/src/prefill.cu
++++ b/src/split/src/prefill.cu
+@@ -729,7 +729,7 @@ void Engine::prefill_alloc() {
+         p->up32 = from_big(std::max<size_t>((size_t) pf_c_ * D, (size_t) pf_c_ * NQH * 2 * HD / 2 + 16));
+         p->xf = from_big((size_t) pf_c_ * D);
+         p->bo_a = from_big((size_t) pf_c_ * N);
+-        p->widx = from_big((size_t) qsa_rows() * N);
++        p->widx = from_big((size_t) std::max(qsa_rows(), NEXP + 1) * N);
+         p->wh = palloc<__half>(PF_WH);
+         p->xh = palloc<__half>((size_t) pf_c_ * D);
+         p->R = palloc<float>((size_t) pf_c_ * D);
+@@ -1312,7 +1312,14 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
+                 }
+                 pf_hc_read(p, p.R, p.bo_a, p.inj_a, L.hc_norm[1], L.hc_down[1], L.hc_up[1], L.hc_inj[1], eps, p.mixed, p.inj_f, C, s);
+                 if (p.moe_q8) quantize_q8_1(p.mixed, p.xq, N, C, s);   // else xh holds the hc read's f16 of mixed
+-                pf_sgemm(p, L.router, NEXP + 1, N, p.mixed, C, p.logits, NEXP + 1);
++                // Reuse the indexer conversion buffer (640 rows), now idle on this
++                // same stream. SGEMM receives exactly the original FP32 router bits.
++                const float* router = L.router;
++                if (L.router_bf16) {
++                    k_bf16_f32<<<grid_for((size_t) (NEXP + 1) * N), 256, 0, s>>>(L.router_bf16, (size_t) (NEXP + 1) * N, p.widx);
++                    router = p.widx;
++                }
++                pf_sgemm(p, router, NEXP + 1, N, p.mixed, C, p.logits, NEXP + 1);
+                 k_pf_top10<<<(C + 7) / 8, 256, 0, s>>>(p.logits, C, p.topi, p.topw);
+                 ckc(cudaMemsetAsync(p.cnt, 0, NEXP * 4, s), "cnt");
+                 k_pf_count<<<(P + 255) / 256, 256, 0, s>>>(p.topi, P, p.cnt);
+diff --git a/src/split/src/static_decode_cache.cuh b/src/split/src/static_decode_cache.cuh
+index 1040a33a..00830d7f 100644
+--- a/src/split/src/static_decode_cache.cuh
++++ b/src/split/src/static_decode_cache.cuh
+@@ -13,6 +13,9 @@ namespace fnx {
+ 
+ inline ExpertCache static_decode_cache(const Model& model, const CardW& weights, int slots, int groups = 1,
+                                        size_t full_kv_bytes = 0, size_t base_kv_bytes = 0) {
++    const auto max_age = env_int("FNX_STATIC_CACHE_MAX_AGE", 1);
++    if (max_age < 1 || max_age > 4)
++        throw std::runtime_error("FNX_STATIC_CACHE_MAX_AGE: expected 1..4");
+     const auto padding = env_int("FNX_STATIC_CACHE_MIN_PADDING", 0);
+     if ((padding != 0 && padding != 1) || (padding && groups != 2))
+         throw std::runtime_error("FNX_STATIC_CACHE_MIN_PADDING: expected 0 or 1; enabling requires two cache groups");
+@@ -49,6 +52,8 @@ inline ExpertCache static_decode_cache(const Model& model, const CardW& weights,
+     ec.slot_of = dalloc<int>(NL * NEXP);
+     ec.owner = dalloc<int>(ec.n_slots);
+     ec.ref = dalloc<unsigned char>(ec.n_slots);
++    ec.max_age = (int) max_age;
++    if (max_age > 1) ec.age = dalloc<unsigned char>(ec.n_slots);
+     ec.hand = dalloc<int>(EC_POOLS);
+     ec.lent = dalloc<int>(EC_POOLS);
+     std::vector<int> places(NL * NEXP, -1), owners(ec.n_slots, -1);
+diff --git a/src/split/tools/lossless_bf16_test.cpp b/src/split/tools/lossless_bf16_test.cpp
+new file mode 100644
+index 00000000..b3ea6dad
+--- /dev/null
++++ b/src/split/tools/lossless_bf16_test.cpp
+@@ -0,0 +1,20 @@
++#include "lossless_bf16.hpp"
++#include <iostream>
++#include <stdexcept>
++int main() {
++    std::vector<float> all(65536);
++    std::vector<uint16_t> compact;
++    for (uint32_t high=0; high<65536; ++high) {
++        const uint32_t bits=high<<16; std::memcpy(&all[high],&bits,4);
++    }
++    if (!fnx::pack_lossless_bf16(all.data(),all.size(),compact)) throw std::runtime_error("exact BF16 was rejected");
++    for (uint32_t high=0; high<65536; ++high)
++        if (compact[high]!=high) throw std::runtime_error("BF16 bits changed");
++    for (uint32_t low=1; low<65536; ++low) {
++        const uint32_t bits=0x3f800000u|low; float value; std::memcpy(&value,&bits,4);
++        if (fnx::pack_lossless_bf16(&value,1,compact)||!compact.empty()) throw std::runtime_error("inexact value accepted");
++    }
++    float mixed[3]={1.f,1.00000011920928955078125f,-2.f};
++    if (fnx::pack_lossless_bf16(mixed,3,compact)||!compact.empty()) throw std::runtime_error("partial conversion accepted");
++    std::cout<<"PASS 65536 exact BF16 bit patterns, 65535 nonrepresentable values and whole-tensor fallback\n";
++}
+diff --git a/src/split/tools/moe_cache_test.cu b/src/split/tools/moe_cache_test.cu
+index b2c6e374..157110b2 100644
+--- a/src/split/tools/moe_cache_test.cu
++++ b/src/split/tools/moe_cache_test.cu
+@@ -17,7 +17,7 @@ __global__ void read_cached(ExpertCache ec, int layer, const Job* jobs, const in
+         out[j * stride + i] = i < gu_bytes ? ec.ep_gu[g][i] : ec.ep_dn[g][i - gu_bytes];
+ }
+ 
+-void run_cache(int dev, int slots, int pattern, bool coherent, int groups = 1, bool shared_kv = false, int pool_hint = -1) {
++void run_cache(int dev, int slots, int pattern, bool coherent, int groups = 1, bool shared_kv = false, int pool_hint = -1, int max_age = 1) {
+     constexpr int layers = 4, experts = layers * NEXP, capacity = MAXT * TOPK;
+     constexpr size_t gu_max = 448, dn_max = 224, stride = gu_max + dn_max, guard = 256;
+     std::vector<StaticCacheShape> shapes;
+@@ -69,6 +69,8 @@ void run_cache(int dev, int slots, int pattern, bool coherent, int groups = 1, b
+     ck(cudaMemcpy(ec.slot_of, places.data(), experts * sizeof(int), cudaMemcpyHostToDevice), "places");
+     ck(cudaMemcpy(ec.owner, owners.data(), slots * sizeof(int), cudaMemcpyHostToDevice), "owners");
+     ec.ref = (unsigned char*) alloc(slots);
++    ec.max_age = max_age;
++    if (max_age > 1) { ec.age = (unsigned char*) alloc(slots); ck(cudaMemset(ec.age, 0, slots), "age reset"); }
+     ec.hand = (int*) alloc(EC_POOLS * sizeof(int));
+     ec.lent = (int*) alloc(EC_POOLS * sizeof(int));
+     std::vector<char*> pools;
+@@ -106,11 +108,21 @@ void run_cache(int dev, int slots, int pattern, bool coherent, int groups = 1, b
+     std::vector<unsigned char> got(capacity * stride + guard), expected(got.size()), guards(guard * 2);
+     std::vector<int> now(experts), owner(slots);
+     std::vector<const char*> ep_gu(experts), ep_dn(experts), backing(experts);
++    std::vector<int> oracle_slot = places, oracle_owner = owners;
++    std::vector<unsigned char> oracle_ref(slots, 0), oracle_age(slots, 0), got_ref(slots), got_age(slots);
++    std::vector<int> oracle_hand(ec.s0, ec.s0 + EC_POOLS), got_hand(EC_POOLS);
+     int lent = 0;
+     for (int rep = 0; rep < 64; ++rep) {
+         if (shared_kv) {
+             const int sizes[] = {0, plan.extra_slots, plan.extra_slots / 2, 1, plan.extra_slots, 0};
+             const int next = sizes[rep % 6];
++            const int p = ec.arena_pool, s0 = ec.s0[p];
++            for (int i = std::min(lent, next); i < std::max(lent, next); ++i) {
++                const int slot = s0 + i, old = oracle_owner[slot];
++                if (old >= 0) oracle_slot[old] = -1;
++                oracle_owner[slot] = -1; oracle_ref[slot] = next > lent ? 3 : 0; oracle_age[slot] = 0;
++            }
++            if (oracle_hand[p] < s0 + next) oracle_hand[p] = s0 + next;
+             arena_slots(ec, lent, next, stream);
+             lent = next;
+             // K/V may overwrite every byte of a lent slot. Neither direct launches
+@@ -127,6 +139,35 @@ void run_cache(int dev, int slots, int pattern, bool coherent, int groups = 1, b
+             std::memcpy(expected.data() + j * (gb + db), host + g * stride, gb);
+             std::memcpy(expected.data() + j * (gb + db) + gb, host + g * stride + gu_max, db);
+         }
++        // Sequential CLOCK oracle: same hit pinning and job-order insertion as the GPU warp.
++        const int cp = ec.pool_of[layer], start = ec.s0[cp] + (cp == ec.arena_pool ? lent : 0);
++        const int size = ec.n[cp] - (cp == ec.arena_pool ? lent : 0);
++        int hand = oracle_hand[cp] - start;
++        if (hand < 0 || hand >= size) hand = 0;
++        for (int j = 0; j < n; ++j) {
++            const int slot = oracle_slot[layer * NEXP + js[j].w];
++            if (slot >= 0) { oracle_ref[slot] = 2; oracle_age[slot] = std::min(max_age, (int) oracle_age[slot] + 1); }
++        }
++        for (int j = 0; j < n; ++j) {
++            const int expert = layer * NEXP + js[j].w;
++            if (oracle_slot[expert] != -1) continue;
++            int slot;
++            for (;;) {
++                slot = start + hand; hand = (hand + 1) % size;
++                if (oracle_ref[slot] == 0) break;
++                if (oracle_ref[slot] == 1) {
++                    if (oracle_age[slot] > 1) --oracle_age[slot];
++                    else { oracle_ref[slot] = 0; oracle_age[slot] = 0; }
++                }
++            }
++            if (oracle_owner[slot] >= 0) oracle_slot[oracle_owner[slot]] = -1;
++            oracle_owner[slot] = expert; oracle_slot[expert] = slot; oracle_ref[slot] = 2; oracle_age[slot] = 1;
++        }
++        for (int j = 0; j < n; ++j) {
++            const int slot = oracle_slot[layer * NEXP + js[j].w];
++            if (slot >= 0) oracle_ref[slot] = 1;
++        }
++        oracle_hand[cp] = start + hand;
+         ck(cudaMemcpyAsync(jobs, js.data(), js.size() * sizeof(Job), cudaMemcpyHostToDevice, stream), "jobs");
+         ck(cudaMemcpyAsync(count, &n, sizeof n, cudaMemcpyHostToDevice, stream), "count");
+         ck(cudaMemsetAsync(out, 0xA5, got.size(), stream), "output guard");
+@@ -151,6 +192,14 @@ void run_cache(int dev, int slots, int pattern, bool coherent, int groups = 1, b
+         }
+         ck(cudaMemcpy(now.data(), ec.slot_of, experts * sizeof(int), cudaMemcpyDeviceToHost), "read places");
+         ck(cudaMemcpy(owner.data(), ec.owner, slots * sizeof(int), cudaMemcpyDeviceToHost), "read owners");
++        ck(cudaMemcpy(got_ref.data(), ec.ref, slots, cudaMemcpyDeviceToHost), "read refs");
++        ck(cudaMemcpy(got_hand.data(), ec.hand, EC_POOLS * sizeof(int), cudaMemcpyDeviceToHost), "read hands");
++        if (now != oracle_slot || owner != oracle_owner || got_ref != oracle_ref || got_hand != oracle_hand)
++            throw std::runtime_error("CLOCK policy differs from sequential oracle");
++        if (ec.age) {
++            ck(cudaMemcpy(got_age.data(), ec.age, slots, cudaMemcpyDeviceToHost), "read ages");
++            if (got_age != oracle_age) throw std::runtime_error("CLOCK age differs from sequential oracle");
++        }
+         ck(cudaMemcpy(ep_gu.data(), ec.ep_gu, experts * sizeof(char*), cudaMemcpyDeviceToHost), "read gate/up table");
+         ck(cudaMemcpy(ep_dn.data(), ec.ep_dn, experts * sizeof(char*), cudaMemcpyDeviceToHost), "read down table");
+         for (int g = 0; g < experts; ++g) {
+@@ -172,23 +221,23 @@ void run_cache(int dev, int slots, int pattern, bool coherent, int groups = 1, b
+     cudaStreamDestroy(stream);
+     for (void* p : device) cudaFree(p);
+     cudaFreeHost(host);
+-    std::cout << "card " << dev << " slots " << slots << " pools " << ec.n_pools << " pattern " << pattern << " coherent " << coherent << " shared K/V " << shared_kv << ": 64 checks passed\n";
++    std::cout << "card " << dev << " slots " << slots << " pools " << ec.n_pools << " pattern " << pattern << " coherent " << coherent << " max age " << max_age << " shared K/V " << shared_kv << ": 64 checks passed\n";
+ }
+ } // namespace fnx
+ 
+ int main() {
+     int cards = 0; fnx::ck(cudaGetDeviceCount(&cards), "devices");
+     if (cards < 2) throw std::runtime_error("two physical devices required");
+-    for (int dev = 0; dev < 2; ++dev) {
++    for (int max_age : {1, 2, 4}) for (int dev = 0; dev < 2; ++dev) {
+         fnx::ck(cudaSetDevice(dev), "device");
+         for (int slots : {160, 256, 1024}) for (int pattern : {0, 1, 2}) for (bool coherent : {false, true})
+-            fnx::run_cache(dev, slots, pattern, coherent);
++            fnx::run_cache(dev, slots, pattern, coherent, 1, false, -1, max_age);
+         for (int slots : {352, 1024}) for (int pattern : {0, 1, 2}) for (bool coherent : {false, true})
+-            fnx::run_cache(dev, slots, pattern, coherent, 2);
++            fnx::run_cache(dev, slots, pattern, coherent, 2, false, -1, max_age);
+         for (int groups : {1, 2}) for (int pattern : {0, 1, 2}) for (bool coherent : {false, true})
+-            fnx::run_cache(dev, 352, pattern, coherent, groups, true);
++            fnx::run_cache(dev, 352, pattern, coherent, groups, true, -1, max_age);
+         for (int pattern : {0, 1, 2}) for (bool coherent : {false, true})
+-            fnx::run_cache(dev, 352, pattern, coherent, 2, true, 1);
++            fnx::run_cache(dev, 352, pattern, coherent, 2, true, 1, max_age);
+     }
+-    std::cout << "Static decode cache: 6144 exact direct/graph checks passed (2304 with K/V lending)\n";
++    std::cout << "Static decode cache: 18432 exact direct/graph/policy checks passed (6912 with K/V lending)\n";
+ }
+diff --git a/src/split/tools/q8s_ab_test.cu b/src/split/tools/q8s_ab_test.cu
+new file mode 100644
+index 00000000..1a0a44eb
+--- /dev/null
++++ b/src/split/tools/q8s_ab_test.cu
+@@ -0,0 +1,137 @@
++// Compare the existing fused R=2 kernel at the two-card 8192-row geometry
++// against the production fork / Q8S + FP32 / join sequence.
++#define FNX_KPART 7
++#include "../src/kernels.cu"
++#include <iostream>
++#include <random>
++namespace fnx {
++std::vector<Q8Twin>& q8_twins() { static std::vector<Q8Twin> x; return x; }
++void ck(cudaError_t e,const char* what) { if(e!=cudaSuccess)throw std::runtime_error(std::string(what)+": "+cudaGetErrorString(e)); }
++struct Streams {
++    cudaStream_t main,side;
++    cudaEvent_t fork,join;
++};
++template<int T,bool SPLIT>
++void launch(bool fused,const Q8Segs& g,int rows,const block_q8_1* y,const int8_t* tq,const float* td,
++            const float* W,const float* x,float* ab,int rf,const Streams& s) {
++    if(fused) {
++        k_q8s_ab<T,2,SPLIT><<<rf+(rows+15)/16,256,0,s.main>>>(g,rows,N,y,tq,td,W,x,ab,rf);
++    } else {
++        ck(cudaEventRecord(s.fork,s.main),"fork");
++        ck(cudaStreamWaitEvent(s.side,s.fork,0),"fork wait");
++        k_gemv_f32<T,4><<<rf,128,0,s.side>>>(W,x,ab,rf);
++        ck(cudaEventRecord(s.join,s.side),"join");
++        k_q8s<T,2,SPLIT,false><<<(rows+15)/16,256,0,s.main>>>(g,rows,N,y,tq,td);
++        ck(cudaStreamWaitEvent(s.main,s.join,0),"join wait");
++    }
++}
++void dispatch(int T,bool split,bool fused,const Q8Segs& g,int rows,const block_q8_1* y,const int8_t* tq,const float* td,
++              const float* W,const float* x,float* ab,int rf,const Streams& s) {
++    if(fused) {
++        q8_twins().clear();
++        if(split)q8_twins().push_back({(const char*)y,(size_t)MAXT*(N/32)*sizeof(block_q8_1),const_cast<int8_t*>(tq),const_cast<float*>(td)});
++        const Q8S weights{const_cast<int8_t*>(g.q[0]),const_cast<uint16_t*>(g.d[0])};
++        q8s_gemv_f32(weights,rows,N,y,g.out[0],W,x,ab,rf,T,s.main);
++        return;
++    }
++#define CASE(t) case t: if(split)launch<t,true>(fused,g,rows,y,tq,td,W,x,ab,rf,s);else launch<t,false>(fused,g,rows,y,tq,td,W,x,ab,rf,s);break
++    switch(T) { CASE(1);CASE(2);CASE(3);CASE(4);CASE(5);CASE(6);CASE(7);CASE(8);CASE(9);CASE(10);CASE(11);CASE(12);CASE(13);CASE(14);CASE(15);CASE(16); }
++#undef CASE
++}
++int run(int dev,int rows,int rf,bool bench) {
++    constexpr int guard=64,copies=8,nb=N/32;
++    const size_t qb=(size_t)rows*N,db=(size_t)rows*nb*2,wb=(size_t)rf*N*4;
++    const size_t ob=((size_t)MAXT*rows+2*guard)*4,ab=((size_t)MAXT*rf+2*guard)*4;
++    std::vector<void*> mem;
++    auto alloc=[&](size_t n){void* p;ck(cudaMalloc(&p,n),"alloc");mem.push_back(p);return p;};
++    auto* wq=(int8_t*)alloc(copies*qb);auto* wd=(uint16_t*)alloc(copies*db);
++    auto* wf=(float*)alloc(copies*wb);auto* x=(float*)alloc((size_t)MAXT*N*4);
++    auto* y=(block_q8_1*)alloc(MAXT*nb*sizeof(block_q8_1));
++    auto* tq=(int8_t*)alloc((size_t)MAXT*N);auto* td=(float*)alloc(MAXT*nb*4);
++    auto* ref=(float*)alloc(ob);auto* out=(float*)alloc(ob);
++    auto* ar=(float*)alloc(ab);auto* ao=(float*)alloc(ab);
++    std::mt19937 rng(260000+rows+rf);
++    std::vector<int8_t> hq(qb);std::vector<uint16_t> hd(db/2);std::vector<float> hf(wb/4);
++    for(auto& v:hq)v=int(rng()%255)-127;
++    for(auto& v:hd)v=0x2000+rng()%0x1000;
++    for(auto& v:hf)v=(int(rng()%4097)-2048)*0.001953125f;
++    for(int c=0;c<copies;++c) {
++        ck(cudaMemcpy(wq+c*qb,hq.data(),qb,cudaMemcpyHostToDevice),"weight q");
++        ck(cudaMemcpy(wd+c*db/2,hd.data(),db,cudaMemcpyHostToDevice),"weight d");
++        ck(cudaMemcpy(wf+c*wb/4,hf.data(),wb,cudaMemcpyHostToDevice),"weight f");
++    }
++    Streams s;ck(cudaStreamCreateWithFlags(&s.main,cudaStreamNonBlocking),"main stream");
++    ck(cudaStreamCreateWithFlags(&s.side,cudaStreamNonBlocking),"side stream");
++    ck(cudaEventCreateWithFlags(&s.fork,cudaEventDisableTiming),"fork event");
++    ck(cudaEventCreateWithFlags(&s.join,cudaEventDisableTiming),"join event");
++    std::vector<block_q8_1> hy(MAXT*nb);std::vector<int8_t> hq8(MAXT*N);
++    std::vector<float> hx(MAXT*N),hsc(MAXT*nb);
++    auto call=[&](int T,bool split,bool fused,int copy,bool reference){
++        Q8Segs g{};
++        for(int k=0;k<3;++k) {
++            g.q[k]=wq+copy*qb;g.d[k]=wd+copy*db/2;
++            g.out[k]=(reference?ref:out)+guard;g.end[k]=rows;g.stride[k]=rows;
++        }
++        dispatch(T,split,fused,g,rows,y,tq,td,wf+copy*wb/4,x,(reference?ar:ao)+guard,rf,s);
++    };
++    int checks=0;
++    for(bool split:{false,true})for(int T=1;T<=MAXT;++T)for(int rep=0;rep<3;++rep) {
++        for(size_t b=0;b<hy.size();++b) {
++            hsc[b]=rep==2?0.f:(b%2?0.0625f:0.03125f);
++            hy[b].ds=make_half2(__float2half(hsc[b]),__float2half(0.f));
++            for(int i=0;i<32;++i)hy[b].qs[i]=hq8[b*32+i]=rep==2?0:int(rng()%255)-127;
++        }
++        for(auto& v:hx)v=rep==2?0.f:(int(rng()%2049)-1024)*0.00390625f;
++        ck(cudaMemcpyAsync(y,hy.data(),hy.size()*sizeof(hy[0]),cudaMemcpyHostToDevice,s.main),"packed input");
++        ck(cudaMemcpyAsync(tq,hq8.data(),hq8.size(),cudaMemcpyHostToDevice,s.main),"split input");
++        ck(cudaMemcpyAsync(td,hsc.data(),hsc.size()*4,cudaMemcpyHostToDevice,s.main),"split scales");
++        ck(cudaMemcpyAsync(x,hx.data(),hx.size()*4,cudaMemcpyHostToDevice,s.main),"float input");
++        ck(cudaMemsetAsync(ref,0xa5,ob,s.main),"ref guard");ck(cudaMemsetAsync(ar,0xa5,ab,s.main),"ab ref guard");
++        call(T,split,false,0,true);ck(cudaStreamSynchronize(s.main),"reference sync");
++        std::vector<uint32_t> expected(ob/4),actual(ob/4),expected_ab(ab/4),actual_ab(ab/4);
++        ck(cudaMemcpy(expected.data(),ref,ob,cudaMemcpyDeviceToHost),"read ref");
++        ck(cudaMemcpy(expected_ab.data(),ar,ab,cudaMemcpyDeviceToHost),"read ab ref");
++        cudaGraph_t graph;cudaGraphExec_t exec;
++        ck(cudaStreamBeginCapture(s.main,cudaStreamCaptureModeRelaxed),"capture");call(T,split,true,1,false);
++        ck(cudaStreamEndCapture(s.main,&graph),"end capture");ck(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0),"instantiate");
++        for(bool replay:{false,true}) {
++            ck(cudaMemsetAsync(out,0xa5,ob,s.main),"out guard");ck(cudaMemsetAsync(ao,0xa5,ab,s.main),"ab guard");
++            if(replay)ck(cudaGraphLaunch(exec,s.main),"replay");else call(T,split,true,2,false);
++            ck(cudaStreamSynchronize(s.main),"candidate sync");
++            ck(cudaMemcpy(actual.data(),out,ob,cudaMemcpyDeviceToHost),"read out");
++            ck(cudaMemcpy(actual_ab.data(),ao,ab,cudaMemcpyDeviceToHost),"read ab");
++            if(actual!=expected||actual_ab!=expected_ab)throw std::runtime_error("fused Q8S/AB output or guard differs: T="+std::to_string(T));
++            ++checks;
++        }
++        ck(cudaGraphExecDestroy(exec),"destroy exec");ck(cudaGraphDestroy(graph),"destroy graph");
++        if(bench&&rows==8192&&rf==48&&split&&rep==0&&(T==1||T==3||T==5||T==7||T==16)) {
++            cudaGraph_t graphs[2][copies];cudaGraphExec_t execs[2][copies];
++            for(int m=0;m<2;++m)for(int c=0;c<copies;++c) {
++                ck(cudaStreamBeginCapture(s.main,cudaStreamCaptureModeRelaxed),"bench capture");call(T,true,m,c,false);
++                ck(cudaStreamEndCapture(s.main,&graphs[m][c]),"bench capture end");
++                ck(cudaGraphInstantiate(&execs[m][c],graphs[m][c],nullptr,nullptr,0),"bench instantiate");
++            }
++            cudaEvent_t begin,end;ck(cudaEventCreate(&begin),"begin");ck(cudaEventCreate(&end),"end");
++            for(int m:{0,1,1,0}) {
++                for(int i=0;i<64;++i)ck(cudaGraphLaunch(execs[m][i%copies],s.main),"warm graph");
++                ck(cudaEventRecord(begin,s.main),"begin time");
++                for(int i=0;i<160;++i)ck(cudaGraphLaunch(execs[m][i%copies],s.main),"timed graph");
++                ck(cudaEventRecord(end,s.main),"end time");ck(cudaEventSynchronize(end),"bench sync");
++                float ms;ck(cudaEventElapsedTime(&ms,begin,end),"elapsed");
++                std::cout<<"card "<<dev<<" T "<<T<<" fused "<<m<<" us "<<ms*6.25<<std::endl;
++            }
++            for(int m=0;m<2;++m)for(int c=0;c<copies;++c){cudaGraphExecDestroy(execs[m][c]);cudaGraphDestroy(graphs[m][c]);}
++            cudaEventDestroy(begin);cudaEventDestroy(end);
++        }
++    }
++    cudaEventDestroy(s.fork);cudaEventDestroy(s.join);cudaStreamDestroy(s.side);cudaStreamDestroy(s.main);
++    q8_twins().clear();for(void* p:mem)cudaFree(p);return checks;
++}
++}
++int main(int argc,char** argv) {try {
++    if(argc>2||(argc==2&&std::string(argv[1])!="--bench"))throw std::runtime_error("usage: split_q8s_ab_test [--bench]");
++    setenv("FNX_Q8S_ROW_GROUP","2",1);
++    int checks=0;
++    for(int dev=0;dev<2;++dev){fnx::ck(cudaSetDevice(dev),"device");checks+=fnx::run(dev,4097,48,false);checks+=fnx::run(dev,8192,48,argc==2);checks+=fnx::run(dev,8197,137,false);}
++    std::cout<<"PASS "<<checks<<" exact fused Q8S/AB direct/graph/guard checks\n";
++}catch(const std::exception& e){std::cerr<<e.what()<<std::endl;return 1;}}
+diff --git a/src/split/tools/router_bf16_test.cu b/src/split/tools/router_bf16_test.cu
+new file mode 100644
+index 00000000..5046f4ef
+--- /dev/null
++++ b/src/split/tools/router_bf16_test.cu
+@@ -0,0 +1,86 @@
++#define FNX_KPART 99
++#include "../src/kernels.cu"
++#include <iostream>
++#include <random>
++namespace fnx {
++std::vector<Q8Twin>& q8_twins(){static std::vector<Q8Twin>x;return x;}
++void ck(cudaError_t e,const char*s){if(e!=cudaSuccess)throw std::runtime_error(std::string(s)+cudaGetErrorString(e));}
++template<int T> void launch(bool packed,const void*w,const float*x,float*l,int*i,float*p,Job*g,Job*d,int*n,unsigned*c,cudaStream_t st){
++    const dim3 grid((NEXP+1+RR_ROWS-1)/RR_ROWS);
++    if(packed)k_router_route<T,true><<<grid,RR_THREADS,0,st>>>((const uint16_t*)w,x,l,i,p,g,d,n,c,ExpertCache{},0,nullptr,ShexpUp{});
++    else k_router_route<T><<<grid,RR_THREADS,0,st>>>((const float*)w,x,l,i,p,g,d,n,c,ExpertCache{},0,nullptr,ShexpUp{});
++}
++int run(int dev,bool bench){
++    constexpr int pad=64,cap=MAXT*TOPK,copies=64,L=NEXP+1;
++    const size_t wn=(size_t)L*N,lb=(MAXT*L+2*pad)*4,pb=(cap+2*pad)*4,jb=(cap+2)*sizeof(Job);
++    std::vector<uint16_t>hw(wn);std::vector<float>fw(wn),hx(MAXT*N);
++    std::mt19937 rng(20261104);
++    for(size_t i=0;i<wn;++i){hw[i]=(rng()%2?0x8000:0)|(0x3b00+rng()%0x300);uint32_t u=(uint32_t)hw[i]<<16;std::memcpy(&fw[i],&u,4);}
++    std::vector<void*>mem;auto alloc=[&](size_t n){void*p;ck(cudaMalloc(&p,n),"alloc");mem.push_back(p);return p;};
++    auto*wf=(float*)alloc(copies*wn*4);auto*wb=(uint16_t*)alloc(copies*wn*2);
++    for(int i=0;i<copies;++i){ck(cudaMemcpy(wf+i*wn,fw.data(),wn*4,cudaMemcpyHostToDevice),"float weights");ck(cudaMemcpy(wb+i*wn,hw.data(),wn*2,cudaMemcpyHostToDevice),"BF16 weights");}
++    auto*x=(float*)alloc(hx.size()*4);auto*logits=(float*)alloc(lb);auto*indices=(int*)alloc(pb);auto*prob=(float*)alloc(pb);
++    auto*gu=(Job*)alloc(jb);auto*dn=(Job*)alloc(jb);auto*nj=(int*)alloc(4);auto*counter=(unsigned*)alloc(4);
++    cudaStream_t st;ck(cudaStreamCreateWithFlags(&st,cudaStreamNonBlocking),"stream");ck(cudaMemset(counter,0,4),"counter");
++    cudaEvent_t a,b;ck(cudaEventCreate(&a),"event");ck(cudaEventCreate(&b),"event");int checks=0,copy=0;
++    auto reset=[&](){for(auto v:{std::pair<void*,size_t>{logits,lb},{indices,pb},{prob,pb},{gu,jb},{dn,jb}})ck(cudaMemsetAsync(v.first,0xa5,v.second,st),"guard");};
++    for(int T=1;T<=MAXT;++T){
++        auto call=[&](bool packed){int k=copy++%copies;const void*w=packed?(const void*)(wb+k*wn):(const void*)(wf+k*wn);switch(T){
++#define DO(t) case t:launch<t>(packed,w,x,logits+pad,indices+pad,prob+pad,gu+1,dn+1,nj,counter,st);break
++            DO(1);DO(2);DO(3);DO(4);DO(5);DO(6);DO(7);DO(8);DO(9);DO(10);DO(11);DO(12);DO(13);DO(14);DO(15);DO(16);
++#undef DO
++        }};
++        for(int rep=0;rep<3;++rep){
++            for(auto&v:hx)v=rep==2?0.f:(int(rng()%2049)-1024)/2048.f;
++            ck(cudaMemcpyAsync(x,hx.data(),hx.size()*4,cudaMemcpyHostToDevice,st),"activation");
++            std::vector<unsigned char>rl(lb),ri(pb),rp(pb),gl(lb),gi(pb),gp(pb);
++            std::vector<Job>rg(cap+2),rd(cap+2),gg(cap+2),gd(cap+2);int rn,gn;
++            reset();call(false);ck(cudaStreamSynchronize(st),"reference wait");
++            ck(cudaMemcpy(rl.data(),logits,lb,cudaMemcpyDeviceToHost),"ref logits");ck(cudaMemcpy(ri.data(),indices,pb,cudaMemcpyDeviceToHost),"ref ids");ck(cudaMemcpy(rp.data(),prob,pb,cudaMemcpyDeviceToHost),"ref probs");
++            ck(cudaMemcpy(rg.data(),gu,jb,cudaMemcpyDeviceToHost),"ref jobs");ck(cudaMemcpy(rd.data(),dn,jb,cudaMemcpyDeviceToHost),"ref jobs");ck(cudaMemcpy(&rn,nj,4,cudaMemcpyDeviceToHost),"ref count");
++            cudaGraph_t graph;cudaGraphExec_t ex;ck(cudaStreamBeginCapture(st,cudaStreamCaptureModeRelaxed),"capture");call(true);ck(cudaStreamEndCapture(st,&graph),"capture end");ck(cudaGraphInstantiate(&ex,graph,nullptr,nullptr,0),"instantiate");
++            for(bool replay:{false,true}){
++                reset();if(replay)ck(cudaGraphLaunch(ex,st),"replay");else call(true);ck(cudaStreamSynchronize(st),"wait");
++                ck(cudaMemcpy(gl.data(),logits,lb,cudaMemcpyDeviceToHost),"logits");ck(cudaMemcpy(gi.data(),indices,pb,cudaMemcpyDeviceToHost),"ids");ck(cudaMemcpy(gp.data(),prob,pb,cudaMemcpyDeviceToHost),"probs");
++                ck(cudaMemcpy(gg.data(),gu,jb,cudaMemcpyDeviceToHost),"jobs");ck(cudaMemcpy(gd.data(),dn,jb,cudaMemcpyDeviceToHost),"jobs");ck(cudaMemcpy(&gn,nj,4,cudaMemcpyDeviceToHost),"count");
++                if(rl!=gl||ri!=gi||rp!=gp||rn!=gn)throw std::runtime_error("router logits/prob/ids/count mismatch");
++                for(auto pair:{std::make_pair(&rg,&gg),std::make_pair(&rd,&gd)}){
++                    auto&ref=*pair.first;auto&got=*pair.second;
++                    for(int j=0;j<cap+2;++j){
++                        if(j==0||j>rn){if(std::memcmp(&ref[j],&got[j],sizeof(Job)))throw std::runtime_error("job guard");continue;}
++                        if(ref[j].w!=got[j].w||ref[j].n!=got[j].n)throw std::runtime_error("job header");
++                        std::vector<std::pair<int,int>>r,v;
++                        for(int k=0;k<ref[j].n;++k){r.emplace_back(ref[j].y[k],ref[j].out[k]);v.emplace_back(got[j].y[k],got[j].out[k]);}
++                        std::sort(r.begin(),r.end());std::sort(v.begin(),v.end());if(r!=v)throw std::runtime_error("job routes");
++                        for(int k=ref[j].n;k<MAXT;++k)if(ref[j].y[k]!=got[j].y[k]||ref[j].out[k]!=got[j].out[k])throw std::runtime_error("job tail guard");
++                    }
++                }
++                unsigned count;ck(cudaMemcpy(&count,counter,4,cudaMemcpyDeviceToHost),"counter reset");if(count)throw std::runtime_error("counter not reset");++checks;
++            }
++            cudaGraphExecDestroy(ex);cudaGraphDestroy(graph);
++            for(int probe_rows:{137,513}) {
++                auto probe=[&](bool packed){switch(T){
++#define PROBE(t) case t: if(probe_rows<=160){if(packed)k_gemv_f32<t,4,true><<<probe_rows,128,0,st>>>(wb,x,logits+pad,probe_rows);else k_gemv_f32<t,4><<<probe_rows,128,0,st>>>(wf,x,logits+pad,probe_rows);}else{if(packed)k_gemv_f32<t,1,true><<<(probe_rows+7)/8,256,0,st>>>(wb,x,logits+pad,probe_rows);else k_gemv_f32<t,1><<<(probe_rows+7)/8,256,0,st>>>(wf,x,logits+pad,probe_rows);}break
++                    PROBE(1);PROBE(2);PROBE(3);PROBE(4);PROBE(5);PROBE(6);PROBE(7);PROBE(8);PROBE(9);PROBE(10);PROBE(11);PROBE(12);PROBE(13);PROBE(14);PROBE(15);PROBE(16);
++#undef PROBE
++                }};
++                ck(cudaMemsetAsync(logits,0xa5,lb,st),"probe guard");probe(false);ck(cudaStreamSynchronize(st),"probe ref wait");ck(cudaMemcpy(rl.data(),logits,lb,cudaMemcpyDeviceToHost),"probe ref");
++                ck(cudaStreamBeginCapture(st,cudaStreamCaptureModeRelaxed),"probe capture");probe(true);ck(cudaStreamEndCapture(st,&graph),"probe end");ck(cudaGraphInstantiate(&ex,graph,nullptr,nullptr,0),"probe graph");
++                for(bool replay:{false,true}){
++                    ck(cudaMemsetAsync(logits,0xa5,lb,st),"probe guard");if(replay)ck(cudaGraphLaunch(ex,st),"probe replay");else probe(true);
++                    ck(cudaStreamSynchronize(st),"probe wait");ck(cudaMemcpy(gl.data(),logits,lb,cudaMemcpyDeviceToHost),"probe output");
++                    if(rl!=gl)throw std::runtime_error("probe GEMV or guard mismatch");++checks;
++                }
++                cudaGraphExecDestroy(ex);cudaGraphDestroy(graph);
++            }
++            if(bench&&rep==0&&(T==1||T==3||T==7||T==16))for(bool packed:{false,true,true,false}){
++                ck(cudaStreamBeginCapture(st,cudaStreamCaptureModeRelaxed),"time capture");for(int i=0;i<copies;++i)call(packed);ck(cudaStreamEndCapture(st,&graph),"time end");ck(cudaGraphInstantiate(&ex,graph,nullptr,nullptr,0),"time graph");
++                for(int i=0;i<8;++i)ck(cudaGraphLaunch(ex,st),"warm");ck(cudaEventRecord(a,st),"start");for(int i=0;i<8;++i)ck(cudaGraphLaunch(ex,st),"time launch");ck(cudaEventRecord(b,st),"end");ck(cudaEventSynchronize(b),"time wait");float ms;ck(cudaEventElapsedTime(&ms,a,b),"elapsed");
++                std::cout<<"card "<<dev<<" T "<<T<<" BF16 "<<packed<<" us "<<ms*1000/(8*copies)<<std::endl;cudaGraphExecDestroy(ex);cudaGraphDestroy(graph);
++            }
++        }
++    }
++    cudaEventDestroy(a);cudaEventDestroy(b);cudaStreamDestroy(st);for(void*p:mem)cudaFree(p);return checks;
++}
++}
++int main(int argc,char**argv){try{if(argc>2||(argc==2&&std::string(argv[1])!="--bench"))throw std::runtime_error("usage: split_router_bf16_test [--bench]");const bool bench=argc==2;int n=0;for(int d=0;d<2;++d){fnx::ck(cudaSetDevice(d),"device");n+=fnx::run(d,bench);}std::cout<<"PASS "<<n<<" exact BF16 router/logit/top/job/probe/guard/direct/graph checks\n";}catch(const std::exception&e){std::cerr<<e.what()<<std::endl;return 1;}}

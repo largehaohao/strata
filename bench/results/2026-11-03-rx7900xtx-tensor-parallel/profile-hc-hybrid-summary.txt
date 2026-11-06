@@ -1,0 +1,58 @@
+Diagnostic profile, not an acceptance speed measurement.
+Binary SHA-256: a574442ce1dad5d9081f02154490879ea6bf7a23aff38fb1a9aaaebe0407d7f9
+Trace: /home/john/Strata/build-tensor-parralize-baseline/profile-hybrid/john-MS-7D76/313017_kernel_trace.csv
+SHA-256: 044b429d3a2a7b20366170d32ed310ccf26a0bc4db3ddc2ca321670c88ec5b79
+Collection: 65:4:1; startup self-tests and MTP enabled, same HC/static-cache/release recipe.
+Summed kernel durations include overlap and spin waits; tracing changes host launch overhead.
+
+full collection; 174143 dispatches
+family,calls,total_ms,share_percent
+ring_a2a_push,17421,1447.252,24.339
+q8s,37348,928.723,15.618
+cache_copy,8234,881.640,14.827
+hc,18068,449.209,7.554
+moe_gu_iq,8064,399.356,6.716
+moe_down,8710,260.479,4.381
+att_merge_a2a,2534,250.087,4.206
+attn_part,2534,244.190,4.107
+router_route,8711,240.341,4.042
+moe_mma,188,225.058,3.785
+rocblas,1756,147.777,2.485
+gdn_core,6177,146.850,2.470
+gemv_f32,6177,56.431,0.949
+other,4586,51.261,0.862
+swiglu_stacked,8711,24.854,0.418
+moe_gu,646,22.310,0.375
+q8s_f16,928,21.087,0.355
+moe_h,8710,20.147,0.339
+idx_proj,2058,18.893,0.318
+idx_prep_pool,2534,15.591,0.262
+Agent 1 top families (ms): [('ring_a2a_push', 1078.771), ('q8s', 466.925), ('cache_copy', 439.185), ('hc', 222.224), ('moe_gu_iq', 199.018), ('att_merge_a2a', 180.016), ('moe_down', 129.639), ('attn_part', 121.555)]
+Agent 2 top families (ms): [('q8s', 461.798), ('cache_copy', 442.455), ('ring_a2a_push', 368.48), ('hc', 226.985), ('moe_gu_iq', 200.338), ('moe_down', 130.84), ('attn_part', 122.635), ('router_route', 120.62)]
+prefill MoE dispatches: 188
+
+first two seconds (before next prompt prefill); 91401 dispatches
+family,calls,total_ms,share_percent
+ring_a2a_push,9347,818.025,28.265
+q8s,20236,508.848,17.582
+cache_copy,4368,351.316,12.139
+hc,9744,241.739,8.353
+moe_gu_iq,4278,210.289,7.266
+attn_part,1398,145.981,5.044
+moe_down,4673,141.147,4.877
+att_merge_a2a,1398,138.463,4.784
+router_route,4674,127.133,4.393
+gdn_core,3276,80.282,2.774
+gemv_f32,3276,29.506,1.020
+swiglu_stacked,4674,13.362,0.462
+moe_gu,396,12.817,0.443
+moe_h,4673,11.004,0.380
+idx_proj,1092,10.149,0.351
+idx_prep_pool,1398,8.721,0.301
+attn_prep_append,1398,7.680,0.265
+other,2468,5.968,0.206
+copy_many,46,5.810,0.201
+attn_local,1398,5.320,0.184
+Agent 1 top families (ms): [('ring_a2a_push', 770.527), ('q8s', 257.966), ('cache_copy', 174.249), ('att_merge_a2a', 127.382), ('hc', 119.31), ('moe_gu_iq', 105.137), ('attn_part', 72.37), ('moe_down', 70.286)]
+Agent 2 top families (ms): [('q8s', 250.882), ('cache_copy', 177.066), ('hc', 122.43), ('moe_gu_iq', 105.152), ('attn_part', 73.61), ('moe_down', 70.861), ('router_route', 63.792), ('ring_a2a_push', 47.498)]
+prefill MoE dispatches: 0

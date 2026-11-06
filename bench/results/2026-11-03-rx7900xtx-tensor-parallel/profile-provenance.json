@@ -1,0 +1,17 @@
+{
+  "model": "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S",
+  "base_commit": "ffa80d73133ea5c548aefe57889a16e8085a938f",
+  "calibration": "five separate prompts, 1536 generated tokens each, greedy, engine warmup included",
+  "source_counts_sha256": "2f953cdcf553bf15c707ac001c261b5d0b9b51b45b6841122b4418af8a416fb7",
+  "profile_sha256": "ddea494adbf54a18f0d56c373b1e01e2ae05d40e25129bd07448dfeae4700f54",
+  "transformation": "keep first 24576 uint32 decode counts; zero last 24576 prompt counts",
+  "format": "little-endian uint32[2][48][512]; split format, not native STRP",
+  "target_met": false,
+  "raw_experiment_directory": "/home/john/Strata/build-tensor-parralize-baseline",
+  "limits": [
+    "short prompts; max context 32768",
+    "split changes dense arithmetic to Q8_0/F32 at load",
+    "no quality-equivalence claim",
+    "no 204800-context validation"
+  ]
+}

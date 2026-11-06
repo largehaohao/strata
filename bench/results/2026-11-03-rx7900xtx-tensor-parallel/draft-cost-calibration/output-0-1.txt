@@ -1,0 +1,128 @@
+```rust
+//! A robust CSV parser supporting quoted fields, escaped double quotes,
+//! and embedded newlines.
+//!
+//! # Features
+//! - Streaming API for memory-efficient parsing
+//! - Handles quoted fields with embedded commas, newlines, and escaped quotes
+//! - Configurable delimiters, quote characters, and escape characters
+//! - Comprehensive error types
+//! - Zero-copy where possible
+//!
+//! # Example
+//! ```
+//! use csv_parser::CsvParser;
+//!
+//! let data = r#"name,age,city
+//! "John ""Doe""",30,"New York
+//! City"
+//! Jane,25,Paris"#;
+//!
+//! let mut parser = CsvParser::new();
+//! let mut reader = std::io::Cursor::new(data);
+//! let mut records = Vec::new();
+//!
+//! while let Some(record) = parser.next_record(&mut reader).unwrap() {
+//!     records.push(record);
+//! }
+//!
+//! assert_eq!(records.len(), 3);
+//! assert_eq!(records[0], vec!["name", "age", "city"]);
+//! assert_eq!(records[1], vec!["John \"Doe\"", "30", "New York\nCity"]);
+//! assert_eq!(records[2], vec!["Jane", "25", "Paris"]);
+//! ```
+
+use std::fmt;
+use std::io::{self, Read};
+
+/// Represents the possible errors that can occur during CSV parsing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CsvError {
+    /// An I/O error occurred while reading data.
+    Io(String),
+    /// An unexpected end of input was encountered.
+    UnexpectedEof,
+    /// A quote character was found in an unexpected position.
+    UnexpectedQuote,
+    /// An invalid escape sequence was encountered.
+    InvalidEscape,
+    /// The record has an inconsistent number of fields.
+    InconsistentFieldCount {
+        expected: usize,
+        found: usize,
+        line: usize,
+    },
+    /// A custom error message.
+    Custom(String),
+}
+
+impl fmt::Display for CsvError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CsvError::Io(msg) => write!(f, "I/O error: {}", msg),
+            CsvError::UnexpectedEof => write!(f, "Unexpected end of input"),
+            CsvError::UnexpectedQuote => write!(f, "Unexpected quote character"),
+            CsvError::InvalidEscape => write!(f, "Invalid escape sequence"),
+            CsvError::InconsistentFieldCount {
+                expected,
+                found,
+                line,
+            } => write!(
+                f,
+                "Inconsistent field count: expected {}, found {} at line {}",
+                expected, found, line
+            ),
+            CsvError::Custom(msg) => write!(f, "Custom error: {}", msg),
+        }
+    }
+}
+
+impl std::error::Error for CsvError {}
+
+impl From<io::Error> for CsvError {
+    fn from(err: io::Error) -> Self {
+        CsvError::Io(err.to_string())
+    }
+}
+
+/// Configuration options for the CSV parser.
+#[derive(Debug, Clone)]
+pub struct CsvConfig {
+    /// The field delimiter character (default: ',').
+    pub delimiter: char,
+    /// The quote character (default: '"').
+    pub quote: char,
+    /// The escape character for quotes within quoted fields (default: same as quote).
+    /// If set to None, quotes are escaped by doubling them (standard CSV).
+    pub escape: Option<char>,
+    /// Whether to trim whitespace from unquoted fields.
+    pub trim_whitespace: bool,
+    /// Whether to skip empty lines.
+    pub skip_empty_lines: bool,
+    /// The maximum number of fields allowed per record (0 = unlimited).
+    pub max_fields: usize,
+}
+
+impl Default for CsvConfig {
+    fn default() -> Self {
+        CsvConfig {
+            delimiter: ',',
+            quote: '"',
+            escape: None,
+            trim_whitespace: false,
+            skip_empty_lines: true,
+            max_fields: 0,
+        }
+    }
+}
+
+/// The internal state of the parser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParserState {
+    /// Start of a new field.
+    StartField,
+    /// Inside an unquoted field.
+    UnquotedField,
+    /// Inside a quoted field.
+    QuotedField,
+    /// After a quote character inside a quoted field (

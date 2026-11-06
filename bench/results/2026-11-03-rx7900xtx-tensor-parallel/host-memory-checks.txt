@@ -1,0 +1,1 @@
+MoE staging: two physical GPUs, 1440 direct/graph checks passed

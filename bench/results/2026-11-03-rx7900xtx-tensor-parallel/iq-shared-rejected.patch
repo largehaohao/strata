@@ -1,0 +1,154 @@
+diff --git a/src/split/src/dense.cuh b/src/split/src/dense.cuh
+index fcb79b9e..73b6fc28 100644
+--- a/src/split/src/dense.cuh
++++ b/src/split/src/dense.cuh
+@@ -21,10 +21,10 @@ template <typename F> __device__ __forceinline__ F q8s_pick(int s, F a, F b, F c
+ // SEG: the rows' segments looked up (q8s_gemv_segs); else one matrix, g's first segment, its row pointers made in the
+ // loops as before (held per row in registers they cost the 16-row path ~30-80%)
+ // block bx of the launch (a kernel of its own, or part of a launch shared with other work: k_q8s_ab)
+-template <int T, int Q8S_R, bool SPLIT, bool SEG>
++template <int T, int Q8S_R, bool SPLIT, bool SEG, int THREADS = Q8S_THREADS>
+ __device__ __forceinline__ void q8s_block(const Q8Segs& g, int rows, int cols, const block_q8_1* __restrict__ y,
+                                           const int8_t* __restrict__ tq, const float* __restrict__ td, int bx) {
+-    constexpr int Q8S_ROWS = Q8S_THREADS / 32 * Q8S_R;
++    constexpr int Q8S_ROWS = THREADS / 32 * Q8S_R;
+     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+     const int row0 = bx * Q8S_ROWS + warp * Q8S_R, nb = cols / 32;
+     // each of the warp's rows: its segment's weights at the row's place in it
+@@ -180,7 +180,7 @@ template <int T> __device__ __forceinline__ void shexp_up_block(const ShexpUp& s
+ }
+ // this block's share (q8s blocks bx0, bx0 + nbx, ...) of the down rows, after the swiglu made in shared memory as
+ // k_swiglu_stacked makes its split twin
+-template <int T> __device__ void shexp_down_blocks(const ShexpDown& s, int bx0, int nbx) {
++template <int T, int THREADS = Q8S_THREADS> __device__ void shexp_down_blocks(const ShexpDown& s, int bx0, int nbx) {
+     __shared__ __align__(16) int8_t tq[T * SH_MAXF];
+     __shared__ float td[T * (SH_MAXF / 32)];
+     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nb = s.ffs / 32;
+@@ -193,8 +193,8 @@ template <int T> __device__ void shexp_down_blocks(const ShexpDown& s, int bx0,
+         if (lane == 0) td[t * nb + b] = __half2float(__float2half(d));
+     }
+     __syncthreads();
+-    const int nqb = (s.rows + Q8S_THREADS / 32 - 1) / (Q8S_THREADS / 32);
+-    for (int bx = bx0; bx < nqb; bx += nbx) q8s_block<T, 1, true, false>(s.w, s.rows, s.ffs, nullptr, tq, td, bx);
++    const int nqb = (s.rows + THREADS / 32 - 1) / (THREADS / 32);
++    for (int bx = bx0; bx < nqb; bx += nbx) q8s_block<T, 1, true, false, THREADS>(s.w, s.rows, s.ffs, nullptr, tq, td, bx);
+ }
+ 
+ }  // namespace
+diff --git a/src/split/src/engine.cu b/src/split/src/engine.cu
+index 034d06a8..1674f9de 100644
+--- a/src/split/src/engine.cu
++++ b/src/split/src/engine.cu
+@@ -920,7 +920,15 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
+     hc_read(R, b.bo_a, b.inj_a, L.hc_norm[1], L.hc_down[1], L.hc_up[1], L.hc_inj[1], m_.eps, b.mixed, b.inj_f, b.hcs, b.ring.err, T, b.st, b.xq);
+     // the shared expert (rows P + t of part): its gate|up in the router's launch and its swiglu and down in the routed
+     // gate|up's (Q4_K experts), else on the second stream (a fork and a join cost ~5 us more than the launches' blocks)
+-    const bool sh_in = L.gu_e.type == T_Q4_K && L.sh_gu.s.q && L.sh_down.s.q && ffs % 32 == 0 && ffs <= SH_MAXF;
++    static const bool iq_shared = [] {
++        const auto v = env_int("FNX_IQ_SHARED", 0);
++        if (v != 0 && v != 1) throw std::runtime_error("FNX_IQ_SHARED: expected 0 or 1");
++        if (v && env_int("FNX_IQ_REUSE", 0) != 1) throw std::runtime_error("FNX_IQ_SHARED requires FNX_IQ_REUSE=1");
++        return v == 1;
++    }();
++    const bool iq_type = L.gu_e.type == T_IQ2_S || L.gu_e.type == T_IQ3_XXS || L.gu_e.type == T_IQ3_S;
++    const bool sh_in = (L.gu_e.type == T_Q4_K || (iq_shared && iq_type)) &&
++                      L.sh_gu.s.q && L.sh_down.s.q && ffs % 32 == 0 && ffs <= SH_MAXF;
+     if (!sh_in) {
+         ck(cudaEventRecord(b.fork, b.st), "fork");
+         ck(cudaStreamWaitEvent(b.st2, b.fork, 0), "fork wait");
+diff --git a/src/split/src/kernels.cu b/src/split/src/kernels.cu
+index 8ef4492c..4da6babf 100644
+--- a/src/split/src/kernels.cu
++++ b/src/split/src/kernels.cu
+@@ -2138,13 +2138,22 @@ void moe_gate_up(const DW& A, size_t sa, const Job* jobs, const int* njobs, int
+         moe_mm(false, A, sa, jobs, njobs, njobs_max, xq, gu, st);
+         return;
+     }
+-    if (A.type != T_Q4_K) throw std::runtime_error("moe_gate_up: the shared expert rides only in the Q4_K experts' launch");
++    if (A.type != T_Q4_K && A.type != T_IQ2_S && A.type != T_IQ3_XXS && A.type != T_IQ3_S)
++        throw std::runtime_error("moe_gate_up: shared expert requires Q4_K or IQ2_S/IQ3_XXS/IQ3_S");
+     if (sh_ffs < 32 || sh_ffs > SH_MAXF || sh_ffs % 32) throw std::runtime_error("moe_gate_up: the shared expert's FF slice");
+     ShexpDown sd;
+     for (int k = 0; k < Q8S_SEGS; ++k) sd.w.q[k] = sh_down->q, sd.w.d[k] = sh_down->d, sd.w.out[k] = sh_out, sd.w.end[k] = N, sd.w.stride[k] = N;
+     sd.rows = N, sd.ffs = sh_ffs, sd.gu = sh_gu;
+     const MoeW w{(const char*) A.p, sa, A.row_bytes, A.n_out, A.n_in, A.ep};
+-    gu_q4k_launch(njobs_max / TOPK, w, jobs, njobs, njobs_max, (const block_q8_1*) xq, gu, (cudaStream_t) st, sd);
++    const int T = njobs_max / TOPK;
++    const auto* y = (const block_q8_1*) xq;
++    const auto s = (cudaStream_t) st;
++    switch (A.type) {
++        case T_Q4_K: gu_q4k_launch(T, w, jobs, njobs, njobs_max, y, gu, s, sd); break;
++        case T_IQ2_S: gu_iq_shared<GGML_TYPE_IQ2_S>(T, w, jobs, njobs, njobs_max, y, gu, s, sd); break;
++        case T_IQ3_XXS: gu_iq_shared<GGML_TYPE_IQ3_XXS>(T, w, jobs, njobs, njobs_max, y, gu, s, sd); break;
++        case T_IQ3_S: gu_iq_shared<GGML_TYPE_IQ3_S>(T, w, jobs, njobs, njobs_max, y, gu, s, sd); break;
++    }
+     ck_launch("moe_gate_up (with the shared expert)");
+ }
+ namespace {
+diff --git a/src/split/src/moe.cuh b/src/split/src/moe.cuh
+index 1bf324c9..642b0c78 100644
+--- a/src/split/src/moe.cuh
++++ b/src/split/src/moe.cuh
+@@ -274,6 +274,36 @@ __global__ void __launch_bounds__(MMVQ_THREADS) k_moe_gu(MoeW w, const Job* __re
+ 
+ #include "moe_iq_reuse.cuh"
+ 
++// The shared expert uses extra blocks ahead of IQ jobs, as on the Q4_K path.
++// Its 128-thread blocks use the same per-row sums as dense Q8's 256-thread blocks.
++template <ggml_type TA, int G>
++void gu_iq_shared_launch(int T, const MoeW& w, const Job* jobs, const int* njobs, int njobs_max,
++                         const block_q8_1* y, float* out, cudaStream_t s, const ShexpDown& sd) {
++    const int gx = (w.nrows + MMVQ_THREADS / G - 1) / (MMVQ_THREADS / G);
++    const int blocks = (sd.rows + MMVQ_THREADS / 32 - 1) / (MMVQ_THREADS / 32);
++    const int sd_rows = (blocks + gx - 1) / gx;
++    const dim3 grid(gx, njobs_max + sd_rows);
++#define FNX_IQ_SHARED(t) case t: k_moe_gu_iq<TA, t, G, true><<<grid, MMVQ_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break
++    switch (T) {
++        FNX_IQ_SHARED(1); FNX_IQ_SHARED(2); FNX_IQ_SHARED(3); FNX_IQ_SHARED(4);
++        FNX_IQ_SHARED(5); FNX_IQ_SHARED(6); FNX_IQ_SHARED(7); FNX_IQ_SHARED(8);
++        FNX_IQ_SHARED(9); FNX_IQ_SHARED(10); FNX_IQ_SHARED(11); FNX_IQ_SHARED(12);
++        FNX_IQ_SHARED(13); FNX_IQ_SHARED(14); FNX_IQ_SHARED(15); FNX_IQ_SHARED(16);
++        default: throw std::runtime_error("moe IQ shared expert: T out of range");
++    }
++#undef FNX_IQ_SHARED
++}
++
++template <ggml_type TA>
++void gu_iq_shared(int T, const MoeW& w, const Job* jobs, const int* njobs, int njobs_max,
++                  const block_q8_1* y, float* out, cudaStream_t s, const ShexpDown& sd) {
++    const auto group = env_int("FNX_IQ_GROUP", 32);
++    if (group == 16) gu_iq_shared_launch<TA, 16>(T, w, jobs, njobs, njobs_max, y, out, s, sd);
++    else if (group == 32) gu_iq_shared_launch<TA, 32>(T, w, jobs, njobs, njobs_max, y, out, s, sd);
++    else throw std::runtime_error("FNX_IQ_GROUP: expected 16 or 32");
++}
++
++
+ // down: one block per (job, rows_per_block rows). The block first makes its tokens' h = silu(gate) * up (gu rows
+ // jb.y[j] of [gate (ffs) | up (ffs)]) as q8_1 in shared memory; thread (row, u) then dots its 32-column unit u of the
+ // row with each token's h, and the block sums a row's units into out row jb.out[j]
+diff --git a/src/split/src/moe_iq_reuse.cuh b/src/split/src/moe_iq_reuse.cuh
+index af53e21d..958eb923 100644
+--- a/src/split/src/moe_iq_reuse.cuh
++++ b/src/split/src/moe_iq_reuse.cuh
+@@ -112,11 +112,18 @@ __device__ __forceinline__ float iq_dot32(const IqDot32& w, const block_q8_1& x)
+     return d * sum;
+ }
+ 
+-template <ggml_type TA, int TT, int G = 32>
++template <ggml_type TA, int TT, int G = 32, bool SHARED = false>
+ __global__ void __launch_bounds__(MMVQ_THREADS) k_moe_gu_iq(
+     MoeW w, const Job* __restrict__ jobs, const int* __restrict__ njobs,
+-    const block_q8_1* __restrict__ y, float* __restrict__ out) {
+-    const int ji = blockIdx.y;
++    const block_q8_1* __restrict__ y, float* __restrict__ out,
++    ShexpDown sd = ShexpDown{}, int sd_rows = 0) {
++    if constexpr (SHARED) {
++        if ((int) blockIdx.y < sd_rows) {
++            shexp_down_blocks<TT, MMVQ_THREADS>(sd, blockIdx.y * gridDim.x + blockIdx.x, sd_rows * gridDim.x);
++            return;
++        }
++    }
++    const int ji = blockIdx.y - (SHARED ? sd_rows : 0);
+     if (ji >= *njobs) return;
+     __shared__ Job jb;
+     if (threadIdx.x == 0) jb = jobs[ji];

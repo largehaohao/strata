@@ -1,0 +1,10 @@
+mode 0 bad 11346 first 129 want 0x1.026c3ep-6 got 0x1.026c4p-6 base 0x1.2a2c6ep-6 g 0x1.0d7feep-1 k -0x1.0105fcp-4 delta -0x1.9447ep-4
+mode 1 bad 3852 first 2 want 0x1.106324p-6 got 0x1.106326p-6 base 0x1.932b3ep-6 g 0x1.0d7feep-1 k -0x1.a0b4eep-5 delta -0x1.27bb62p-4
+mode 2 bad 11346 first 129 want 0x1.026c3ep-6 got 0x1.026c4p-6 base 0x1.2a2c6ep-6 g 0x1.0d7feep-1 k -0x1.0105fcp-4 delta -0x1.9447ep-4
+mode 3 bad 11346 first 129 want 0x1.026c3ep-6 got 0x1.026c4p-6 base 0x1.2a2c6ep-6 g 0x1.0d7feep-1 k -0x1.0105fcp-4 delta -0x1.9447ep-4
+card 0 core checks 192 restore cases 1440 mismatches expr/fma_k/fma_g/separate/mixed 840/840/840/840/0
+mode 0 bad 11346 first 129 want 0x1.026c3ep-6 got 0x1.026c4p-6 base 0x1.2a2c6ep-6 g 0x1.0d7feep-1 k -0x1.0105fcp-4 delta -0x1.9447ep-4
+mode 1 bad 3852 first 2 want 0x1.106324p-6 got 0x1.106326p-6 base 0x1.932b3ep-6 g 0x1.0d7feep-1 k -0x1.a0b4eep-5 delta -0x1.27bb62p-4
+mode 2 bad 11346 first 129 want 0x1.026c3ep-6 got 0x1.026c4p-6 base 0x1.2a2c6ep-6 g 0x1.0d7feep-1 k -0x1.0105fcp-4 delta -0x1.9447ep-4
+mode 3 bad 11346 first 129 want 0x1.026c3ep-6 got 0x1.026c4p-6 base 0x1.2a2c6ep-6 g 0x1.0d7feep-1 k -0x1.0105fcp-4 delta -0x1.9447ep-4
+card 1 core checks 384 restore cases 2880 mismatches expr/fma_k/fma_g/separate/mixed 1680/1680/1680/1680/0

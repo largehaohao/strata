@@ -48,22 +48,25 @@ void q8_untwin(const void* q8);
 // out[out_row][r] = W[job.w][r] . y[y_row] for every job in jobs[0..*njobs) (or njobs_host when njobs is null)
 void mmvq(const DW& W, size_t w_stride, const Job* jobs, const int* njobs, int njobs_max, const void* y,
           float* out, int out_stride, void* st);
+// One Q4_0 draft-head activation row. Mode 1 preserves full scores; modes 2/3
+// retain four candidates per 16 rows after a partial dot. Main heads never call it.
+void mtp_head_gemv(const DW& W, const void* y, float* out, int mode, void* st);
 // out[t][r] = W[r] . y[t] for t < T: W in the split Q8_0 layout [rows][cols], y q8_1 rows of cols
 void q8s_gemv(const Q8S& w, int rows, int cols, const void* y, float* out, int out_stride, int T, void* st);
 // y[t][r] = W[r] . x[t] (f32 weights [rows][n], f32 x)
-void gemv_f32(const float* W, const float* x, float* y, int rows, int n, int T, void* st);
+void gemv_f32(const float* W, const float* x, float* y, int rows, int n, int T, void* st, const uint16_t* packed = nullptr);
 
 // the hyper-connection read (build_hc_mix) with the previous half's write folded in when bo_prev is not null:
 // R' = R + bo_prev * 2 sigmoid(inj_prev / HC); R <- R'; mixed = mean_c xn_c * sigmoid(up . silu(down . xn / HC));
 // inject = w_inj . xn (when w_inj); mixed also as q8_1 rows into q8 when not null. scratch: hc_scratch_floats(MAXT)
-// floats, zeroed once (its last float is the read's grid barrier counter). One launch of a block per SM (up to
+// floats, zeroed once (its last two floats hold the wide/compact grid barrier counters). One launch (up to
 // hc_blocks()) that needs every one of them resident: nothing else may run beside it. err: bit 4 set when its barrier
 // timed out.
 size_t hc_scratch_floats(int T);
 int hc_blocks();    // the read's blocks of work; a card with fewer SMs runs them on one block per SM
 // sizes the read's grid to the current card (before its first hc_read or hc_preset_barrier) and zeroes the barrier
 // counter of scratch, the card's one hc scratch (the counter counts in generations of the grid it ran with); returns the
-// grid. cap > 0: at most cap blocks, as a card with that many SMs would run (kbench)
+// largest selected grid. Compact HIP reads use the original layout for T > 12. cap > 0: at most cap blocks, as a card with that many SMs would run (kbench)
 int hc_prepare(float* scratch, int cap = 0);
 int hc1_rows();   // FNX_HC1: windows of up to this many rows take the read's one-barrier form (read once; throws if bad)
 void hc_read(float* R, const float* bo_prev, const float* inj_prev, const float* w_norm, const Q8S& w_down,
@@ -93,9 +96,18 @@ void gdn_out_norm(const float* o, const float* z, const float* w, float* y, int 
 // per-head counters in it are left at zero). For cutting a window back: snap [MAXT - 1][nv][HS][HS] gets the state
 // after each row but the last, hsnap [MAXT][3][ch] the history left by keeping only the first n rows (at n - 1)
 size_t gdn_scratch_floats(int nv);
+// Optional single-lane rollback: first-row state plus decay/key/delta operands
+// for rows 1..MAXT-2. Three padding floats keep each head's record aligned.
+constexpr int GDN_REPLAY_STRIDE = 2 * HS + 4;
+struct GdnReplayJob {
+    float* state;
+    const float* first;
+    const float* updates;
+};
+void gdn_replay(const GdnReplayJob* jobs, int layers, int nv, int keep, void* st);
 void gdn_core(const float* qkvz, const float* ab, float* hist, const float* convw, const float* dt, const float* a,
               const float* nw, float* S, void* yq, const int* ctl, float* scratch, float* snap, float* hsnap, int nk, int nv,
-              const int* vmap, int T, float eps, void* st, float* y32 = nullptr);
+              const int* vmap, int T, float eps, void* st, float* y32 = nullptr, float* replay_log = nullptr);
 // a batched window's T rows, one row each from a lane of its own: device arrays of row r's lane's state, conv history
 // (this layer's) and ctl. With row0: segments of several rows of one lane, indexed by segment, segment s's rows from
 // window row row0[s] (device), its snapshots (snap and hsnap as gdn_core's, this layer's) from that row on
@@ -217,7 +229,7 @@ void qsa_index(const float* y, const float* qn, const float* kn, uint16_t* ring,
                float eps, Rope base, void* st);
 // the scores and the selection of rows whose query is in q
 void qsa_select(const float* q, const uint16_t* pooled, const KvPages& g, float* scores, int* cells, int* n_cells, int max_pools, const int* pos0, int T,
-                int card, void* st);
+                int card, void* st, int selection_stride = 0);
 // the same with the decode path's scores (qsa's), for a batched window's T rows of their own lanes (lr)
 void qsa_select_lanes(const float* q, const uint16_t* pooled, const KvPages& g, float* scores, int* cells, int* n_cells, int max_pools,
                       const LaneRows& lr, int T, int card, void* st);
@@ -241,7 +253,7 @@ int attn_rows();   // the most rows one attn call takes
 // indices (n_cells[t] = -1: every owned position up to the row's). The cards' partials are merged on the ring: out
 // gets this card's NQH / NCARD heads (heads card * NQH / NCARD ..), gated
 void attn(const float* qg, const uint16_t* kc, const uint16_t* vc, const KvPages& g, float* out, const AttRing& ar, const unsigned* tag, int call,
-          const int* pos0, int T, float* scratch, void* st, const int* cells = nullptr, const int* n_cells = nullptr);
+          const int* pos0, int T, float* scratch, void* st, const int* cells = nullptr, const int* n_cells = nullptr, int selection_stride = 0);
 // attn in two parts, for a window of several sequences: attn_part_lanes the partials of its T rows, each at its lane's
 // position on its lane's pages (lr; cells / n_cells and qg indexed by the row), attn_finish the merge across the cards
 void attn_part_lanes(const float* qg, const uint16_t* kc, const uint16_t* vc, const KvPages& g, const LaneRows& lr, int T, float* scratch,
@@ -256,6 +268,8 @@ void qsa_proj(const uint16_t* wq, const uint16_t* wk, const float* x, float* y, 
 size_t attn_prompt_block_floats(int C);   // one block of part (one slot of recv)
 void attn_prompt(const float* qg, const uint16_t* kc, const uint16_t* vc, const KvPages& g, const int* pos0, const int* cells, const int* n_cells,
                  int card, int C, int r0, int T, float* part, void* st);   // rows r0 .. r0 + T - 1 of the C
+void attn_prompt_heads(const float* qg, const uint16_t* kc, const uint16_t* vc, const KvPages& g, const int* pos0,
+                       const int* cells, const int* n_cells, int card, int C, float* part, float* out, void* st);
 void attn_prompt_merge(const float* own, const float* recv, const float* qg, float* out, int C, int card, void* st);
 // the rows of the window's positions this card owns (block j on card j % NCARD) = k/v (both KV heads) rounded to f16, or
 // quantized to int8 (g.q8)
@@ -288,11 +302,33 @@ void ple_post(float* R, const float* key, const float* value, const float* nk, c
 // sh_gu (rows sh_rows < 4096): the shared expert's gate|up over the q8_1 rows sh_y into sh_out, in the same launch
 void router_route(const float* W, const float* x, float* logits, int T, int* topi, float* topw, Job* jobs_gu, Job* jobs_dn,
                   int* njobs, void* st, const ExpertCache* ec = nullptr, int layer = -1, int* list = nullptr, const Q8S* sh_gu = nullptr,
-                  int sh_rows = 0, const void* sh_y = nullptr, float* sh_out = nullptr);
+                  int sh_rows = 0, const void* sh_y = nullptr, float* sh_out = nullptr, const uint16_t* packed = nullptr);
+// Down weights to fill beside IQ gate/up arithmetic. The preceding cache plan
+// must complete first; GU is already resident or filled by CacheGateUpCopy below.
+// The list/slots stay fixed until this launch finishes. Bytes and offsets are
+// 16-byte aligned. Only IQ reuse, group 16.
+struct CacheDownCopy {
+    const char* const* host = nullptr;
+    const int* slots = nullptr;
+    const int* list = nullptr;
+    char* pool = nullptr;
+    size_t slot_bytes = 0, offset = 0, bytes = 0;
+    int slot0 = 0, blocks = 0;
+};
+// Gate/up misses from the same completed cache plan. Each listed expert must
+// have exactly one GU job and a writable A.ep slot. Its complete rows are filled
+// by that job's compute blocks; no other launch may consume them until this one
+// completes. Requires CacheDownCopy and IQ reuse group 16; no MoE staging.
+struct CacheGateUpCopy {
+    const char* const* host = nullptr;
+    const int* list = nullptr;
+    int layer = -1;
+};
 // gu rows of 2*ffs: [gate | up] (A: per-expert stacked rows, stride sa). sh_down (Q4_K experts only): the shared
 // expert's swiglu of sh_gu ([T][2 * sh_ffs]) and down (N rows) into sh_out (row stride N), in the same launch
 void moe_gate_up(const DW& A, size_t sa, const Job* jobs, const int* njobs, int njobs_max, const void* xq, float* gu, void* st,
-                 const Q8S* sh_down = nullptr, int sh_ffs = 0, const float* sh_gu = nullptr, float* sh_out = nullptr);
+                 const Q8S* sh_down = nullptr, int sh_ffs = 0, const float* sh_gu = nullptr, float* sh_out = nullptr,
+                 const CacheDownCopy* copy = nullptr, const CacheGateUpCopy* gu_copy = nullptr);
 // the same for jobs of up to MAXT rows each, njobs_cap of them at most (the prompt path's)
 void moe_gate_up_jobs(const DW& A, size_t sa, const Job* jobs, const int* njobs, int njobs_cap, const void* xq, float* gu, void* st);
 // the same with BigJobs (njobs_cap of them at most)
@@ -305,9 +341,12 @@ void swiglu_h16(const float* gu, int ffs, int P, uint16_t* h16, void* st);
 void moe_down_mma(const DW& A, size_t sa, const BigJob* jobs, const int* njobs, int njobs_cap, const uint16_t* h16, float* part, void* st);
 // a decode window's layer with an ExpertCache (model.hpp): the experts router_route's plan listed copied in from RAM to
 // their new slots by a grid of the SMs (wide 16-byte reads; the MoE kernels' own reads over the link are latency-bound).
-// With jobs, the plan runs here first, a launch of its own (when router_route did not plan)
+// With jobs, the plan runs here first, a launch of its own (when router_route did not plan).
+// gu_only leaves the down copy to moe_gate_up with CacheDownCopy before any down read.
+// defer_gu also leaves GU to CacheGateUpCopy; it requires gu_only. The plan and
+// shape validation still run here, including when the prefetch probe is enabled.
 void moe_cache(int layer, size_t gu_stride, size_t dn_stride, const ExpertCache& ec, int* list, void* st, const Job* jobs = nullptr,
-               const int* njobs = nullptr);
+               const int* njobs = nullptr, bool padded = false, bool gu_only = false, bool defer_gu = false);
 // pool p's listed experts (list: device, its count then the experts' ids, each with its slot in ec.slot_of already) from
 // their host copies into their slots, one kernel: the arena's fill
 void cache_copy(const ExpertCache& ec, int p, const int* list, void* st);
@@ -380,7 +419,7 @@ void l2_prefetch(const void* p, size_t bytes, void* st);
 void q8s_gemv_segs(const Q8S* w, const int* rows, float* const* out, const int* out_stride, int n, int cols, const void* y, int T,
                    void* st);
 // q8s_gemv(w, rows, cols, y, out, rows) and gemv_f32(W, x, yf, rf <= 160, N) in one launch, the same values; rows
-// 4096..8191 only (q8s_gemv_segs: 8192 rows and more in all)
+// 4096..8191 normally; larger Flash-Next matrices require FNX_Q8S_ROW_GROUP=2.
 void q8s_gemv_f32(const Q8S& w, int rows, int cols, const void* y, float* out, const float* W, const float* x, float* yf, int rf, int T,
                   void* st);
 

@@ -17,7 +17,24 @@
 #include <string>
 #include <vector>
 
+#if FNX_HIP
+#undef __vsubss4
+#undef __vsub4
+#undef __vcmpne4
+#undef __shfl_sync
+#undef __shfl_up_sync
+#undef __shfl_xor_sync
+#endif
 #include "common.cuh"
+#if FNX_HIP
+#undef __shfl_sync
+#undef __shfl_up_sync
+#undef __shfl_xor_sync
+#define __shfl_xor_sync(...) (::strata::hip_compat::shfl_xor_sync(__VA_ARGS__))
+#define __shfl_up_sync(...) (::strata::hip_compat::shfl_up_sync(__VA_ARGS__))
+#define __shfl_sync(...) (::strata::hip_compat::shfl_sync(__VA_ARGS__))
+#undef cudaFuncSetAttribute
+#endif
 #include "ggml.h"
 #include "gguf.hpp"
 
@@ -108,9 +125,11 @@ int main(int argc, char** argv) {
                     case T_IQ3_S: run<GGML_TYPE_IQ3_S>(d_we, row_a, nrows, ncols, d_out); break;
                     case T_IQ3_XXS: run<GGML_TYPE_IQ3_XXS>(d_we, row_a, nrows, ncols, d_out); break;
                     case T_IQ2_S: run<GGML_TYPE_IQ2_S>(d_we, row_a, nrows, ncols, d_out); break;
+                    case T_IQ2_XXS: run<GGML_TYPE_IQ2_XXS>(d_we, row_a, nrows, ncols, d_out); break;
                     case T_Q4_K: run<GGML_TYPE_Q4_K>(d_we, row_a, nrows, ncols, d_out); break;
                     case T_Q5_K: run<GGML_TYPE_Q5_K>(d_we, row_a, nrows, ncols, d_out); break;
                     case T_Q5_1: run<GGML_TYPE_Q5_1>(d_we, row_a, nrows, ncols, d_out); break;
+                    case T_Q5_0: run<GGML_TYPE_Q5_0>(d_we, row_a, nrows, ncols, d_out); break;
                     case T_Q8_0: run<GGML_TYPE_Q8_0>(d_we, row_a, nrows, ncols, d_out); break;
                     default: std::printf("skip %s type %u\n", t.name.c_str(), t.type); cudaFree(d_we); cudaFree(d_out); continue;
                 }

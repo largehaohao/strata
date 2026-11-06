@@ -40,6 +40,10 @@ struct CardBuf {
     float *logits, *topw;
     int *topi, *njobs;
     Job *jobs_gu, *jobs_dn, *dense[MAXT + 1];
+    ExpertCache static_cache;         // decode-only tables; prefill keeps the model's immutable placement
+    char* moe_stage = nullptr;
+    const char** moe_stage_ep = nullptr;
+    unsigned char* moe_stage_hot = nullptr;
     float *gu, *part;
     float* sh_gu;                     // the shared expert: [T][gate | up]
     void* sh_hq;                      // its h as q8_1
@@ -67,6 +71,9 @@ struct CardBuf {
     float* ple_hist;
     // what commit() cuts a window back to: the state after each row, each kept count's histories
     std::vector<float*> snap, hsnap;
+    std::vector<float*> gdn_updates;
+    GdnReplayJob* gdn_replay_jobs = nullptr;
+    int gdn_replay_layers = 0;
     // every recurrent layer's snap in one block: between a commit and the next verify nothing reads it, so the prompt
     // path borrows it for scratch
     float* snap_block = nullptr;

@@ -11,9 +11,15 @@
 #include "engine.hpp"
 #include "engine_impl.hpp"
 #include "env.hpp"
+#include "attn_head_split.hpp"
 #include "pf_ring_plan.hpp"
+#include "static_prefill_stage.hpp"
+#include "static_prefill_copy.cuh"
+#include "moe_mma_fused.hpp"
+#include "strata/prefill/hip_batch_copy.hpp"
 #if FNX_HIP
 #include "hip/rccl.h"
+#include "wmma_gemm.h"
 #endif
 
 #include <cublas_v2.h>
@@ -25,6 +31,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <limits>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -59,30 +66,14 @@ struct Arena {
     }
 };
 
-__device__ __forceinline__ float pf_sigm(float x) { return 1.0f / (1.0f + __expf(-x)); }
+#include "hc_prefill.cuh"
+
 __device__ __forceinline__ float pf_silu(float x) { return x / (1.0f + __expf(-x)); }
-__device__ __forceinline__ float pf_wsum(float v) {
-#pragma unroll
-    for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
-    return v;
-}
 __device__ __forceinline__ float pf_wmax(float v) {
 #pragma unroll
     for (int o = 16; o; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
     return v;
 }
-__device__ float pf_block_sum(float v, float* sh) {
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = blockDim.x >> 5;
-    v = pf_wsum(v);
-    __syncthreads();
-    if (lane == 0) sh[warp] = v;
-    __syncthreads();
-    float r = 0.f;
-    for (int w = 0; w < nw; ++w) r += sh[w];
-    __syncthreads();
-    return r;
-}
-
 // ---------------------------------------------------------------- conversions
 __global__ void k_f16_f32(const __half* __restrict__ x, int rows, int cols, float* __restrict__ y, int ldy) {
     for (size_t e = blockIdx.x * (size_t) blockDim.x + threadIdx.x; e < (size_t) rows * cols; e += (size_t) gridDim.x * blockDim.x)
@@ -93,105 +84,10 @@ __global__ void k_bf16_f32(const uint16_t* __restrict__ x, size_t n, float* __re
         y[e] = __uint_as_float((unsigned) x[e] << 16);
 }
 
-// ---------------------------------------------------------------- hyper-connection read, batched
-// row t: R' = R + bo * 2 sigmoid(inj / HC) per stream (written back), rs[t][c] = 1 / sqrt(mean R'^2 + eps), and
-// xn = R' * w_norm * rs as f16 (the down mix's input); with w_inj (bf16 rows of D) also inject_out[t][r] = w_inj[r] . xn
-// from the same f32 xn while it is in registers (k_hcb_mixinj then needs no second pass over R)
-constexpr int HCB_THREADS = 256, HCB_PER = N / HCB_THREADS;
-static_assert(N % HCB_THREADS == 0, "stream elements per thread");
-__global__ void __launch_bounds__(HCB_THREADS) k_hcb_prep(float* __restrict__ R, const float* __restrict__ bo, const float* __restrict__ inj,
-                                                          const float* __restrict__ wn, float* __restrict__ rs, __half* __restrict__ xh,
-                                                          float eps, const uint16_t* __restrict__ w_inj, float* __restrict__ inject_out) {
-    const int t = blockIdx.x, i0 = threadIdx.x;
-    __shared__ float sh[32];
-    __shared__ float shi[HC][HCB_THREADS / 32];
-    float acc[HC] = {};
-    for (int c = 0; c < HC; ++c) {
-        float v[HCB_PER];
-        float ss = 0.f;
-        const float g = bo ? 2.0f * pf_sigm(inj[t * HC + c] / (float) HC) : 0.f;
-#pragma unroll
-        for (int k = 0; k < HCB_PER; ++k) {
-            const int i = i0 + k * HCB_THREADS;
-            float r = R[(size_t) t * D + c * N + i];
-            if (bo) {
-                r = fmaf(bo[(size_t) t * N + i], g, r);
-                R[(size_t) t * D + c * N + i] = r;
-            }
-            v[k] = r;
-            ss += r * r;
-        }
-        const float r_s = rsqrtf(pf_block_sum(ss, sh) / (float) N + eps);
-        if (i0 == 0) rs[t * HC + c] = r_s;
-#pragma unroll
-        for (int k = 0; k < HCB_PER; ++k) {
-            const int i = i0 + k * HCB_THREADS;
-            const float xn = v[k] * wn[c * N + i] * r_s;
-            xh[(size_t) t * D + c * N + i] = __float2half(xn);
-            if (w_inj)
-#pragma unroll
-                for (int r = 0; r < HC; ++r) acc[r] = fmaf(__uint_as_float((unsigned) w_inj[(size_t) r * D + c * N + i] << 16), xn, acc[r]);
-        }
-    }
-    if (!w_inj) return;
-    const int lane = i0 & 31, warp = i0 >> 5;
-#pragma unroll
-    for (int r = 0; r < HC; ++r) {
-        const float s = pf_wsum(acc[r]);
-        if (lane == 0) shi[r][warp] = s;
-    }
-    __syncthreads();
-    if (i0 < HC) {
-        float s = 0.f;
-#pragma unroll
-        for (int w = 0; w < HCB_THREADS / 32; ++w) s += shi[i0][w];
-        inject_out[t * HC + i0] = s;
-    }
-}
 // lo = silu(down / HC) as f16
 __global__ void k_hcb_lo(const float* __restrict__ down, int n, __half* __restrict__ lo) {
     for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < n; e += gridDim.x * blockDim.x) lo[e] = __float2half(pf_silu(down[e] / (float) HC));
 }
-// per row t: mixed[t][i] = mean_c xn_c[i] * sigmoid(up_c[i]), then (with w_inj: bf16 rows of D) inject[t][r] =
-// w_inj[r] . xn[t]: warps 4 r .. 4 r + 3 take a quarter of D each, their sums added in order. xn = R wn rs,
-// recomputed with k_hcb_prep's operations (so its values) rather than kept as a copy
-constexpr int HCM_THREADS = 512, HCM_WPR = HCM_THREADS / 32 / HC;   // warps per inject row
-__global__ void __launch_bounds__(HCM_THREADS) k_hcb_mixinj(const float* __restrict__ R, const float* __restrict__ wn,
-                                                            const float* __restrict__ rs, const float* __restrict__ up,
-                                                            float* __restrict__ mixed, __half* __restrict__ mixh,
-                                                            const uint16_t* __restrict__ w_inj,
-                                                            float* __restrict__ inj) {
-    const int t = blockIdx.x, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    const float* Rt = R + (size_t) t * D;
-    float r_s[HC];
-#pragma unroll
-    for (int c = 0; c < HC; ++c) r_s[c] = rs[t * HC + c];
-    for (int i = tid; i < N; i += HCM_THREADS) {
-        float g[HC];
-#pragma unroll
-        for (int c = 0; c < HC; ++c) g[c] = pf_sigm(up[(size_t) t * D + c * N + i]) * (Rt[c * N + i] * wn[c * N + i] * r_s[c]);
-        const float m = (g[0] + g[1] + g[2] + g[3]) / (float) HC;
-        mixed[(size_t) t * N + i] = m;
-        mixh[(size_t) t * N + i] = __float2half(m);
-    }
-    if (!w_inj) return;
-    __shared__ float part[HC][HCM_WPR];
-    const int r = warp / HCM_WPR, q = warp % HCM_WPR;
-    constexpr int QLEN = D / HCM_WPR;
-    float acc = 0.f;
-    for (int i = q * QLEN + lane; i < (q + 1) * QLEN; i += 32)
-        acc += __uint_as_float((unsigned) w_inj[(size_t) r * D + i] << 16) * (Rt[i] * wn[i] * r_s[i / N]);
-    acc = pf_wsum(acc);
-    if (lane == 0) part[r][q] = acc;
-    __syncthreads();
-    if (tid < HC) {
-        float s = 0.f;
-#pragma unroll
-        for (int k = 0; k < HCM_WPR; ++k) s += part[tid][k];
-        inj[t * HC + tid] = s;
-    }
-}
-
 // ---------------------------------------------------------------- routing
 // row t (a warp): top 10 of the NEXP logits (the lower index on a tie), weights the selected softmax renormalized
 __global__ void k_pf_top10(const float* __restrict__ logits, int C, int* __restrict__ topi, float* __restrict__ topw) {
@@ -229,6 +125,36 @@ __global__ void k_pf_top10(const float* __restrict__ logits, int C, int* __restr
 __global__ void k_pf_count(const int* __restrict__ topi, int P, int* __restrict__ cnt) {
     const int p = blockIdx.x * blockDim.x + threadIdx.x;
     if (p < P) atomicAdd(&cnt[topi[p]], 1);
+}
+// Diagnostic only: validate the exact weight bytes at the new cache-read seam.
+// The immutable model tables remain the reference, including host-resident experts.
+__global__ void k_pf_cache_check(const char* const* src_gu, const char* const* src_dn,
+    const char* const* cached_gu, const char* const* cached_dn, const int* counts,
+    size_t gs, size_t ds, unsigned long long* stats) {
+    const int e=blockIdx.y;
+    if(!counts[e]) return;
+    const bool gu=src_gu[e]!=cached_gu[e], dn=src_dn[e]!=cached_dn[e];
+    if(!gu && !dn) return;
+    if(blockIdx.x==0 && threadIdx.x==0) {
+        atomicAdd(stats+1,1ull);
+        atomicAdd(stats+2,(unsigned long long)((gu?gs:0)+(dn?ds:0)));
+    }
+    const size_t g=gs/sizeof(uint4),d=ds/sizeof(uint4);
+    unsigned long long mismatch=0;
+    for(size_t i=(size_t)blockIdx.x*blockDim.x+threadIdx.x;i<g+d;i+=(size_t)gridDim.x*blockDim.x) {
+        uint4 a,b;
+        if(i<g) {
+            if(!gu) continue;
+            a=reinterpret_cast<const uint4*>(src_gu[e])[i];
+            b=reinterpret_cast<const uint4*>(cached_gu[e])[i];
+        } else {
+            if(!dn) continue;
+            a=reinterpret_cast<const uint4*>(src_dn[e])[i-g];
+            b=reinterpret_cast<const uint4*>(cached_dn[e])[i-g];
+        }
+        mismatch+=(a.x!=b.x || a.y!=b.y || a.z!=b.z || a.w!=b.w);
+    }
+    if(mismatch) atomicAdd(stats,mismatch);
 }
 // one block of NEXP threads: each expert's first job (ceil(count / PF_JOB) jobs each), the job count
 __global__ void k_pf_jobbase(const int* __restrict__ cnt, int* __restrict__ jbase, int* __restrict__ njobs) {
@@ -322,14 +248,23 @@ constexpr int ATT_FLAG_ROWS = NCARD - 1 > 2 ? NCARD - 1 : 2;
 
 struct Engine::Pf {
     cublasHandle_t blas = nullptr;
+    bool native_gemm = false;         // FNX_PF_GEMM=1: native RDNA3 WMMA, FP32 accumulation/output
+    bool q8_gsu3 = false;
+    bool hc_streams = false;          // FNX_PF_HC_STREAMS=1: reduce all HC stream norms together
+    bool hc_up_fused = false;         // FNX_PF_HC_UP_FUSED=1: large HC up products mix before the VRAM store
+    bool compact_heads = false;       // native WMMA keeps its reduction order when missing heads are omitted
     __half* wh;                       // a dense matrix as f16
     float* widx;                      // the indexer projections as f32 [640][N]
     __half* xh;                       // f16 activations, up to a chunk's rows of D
     float *R, *xf, *rs, *lo32, *up32, *mixed, *bo_a, *bo_f, *inj_a, *inj_f;
+    float* head_gather = nullptr;     // small padded head projections must not gather over the phase arena
     __half* lo16;
     void* xq;                         // mixed as q8_1 (with a twin), for the experts through the decode kernels
     uint16_t* h16;                    // the experts' swiglu rows as f16, for the tensor-core down product
     bool moe_q8 = false;              // FNX_PF_MOE_Q8=1: the experts through the decode kernels' q8_1 arithmetic
+    bool moe_fused = false;           // optional exact gate/up + SwiGLU, avoiding the FP32 intermediate
+    bool decode_cache = false;        // optional read-only decode cache sources, direct or through routed static stages
+    unsigned long long* cache_check = nullptr; // diagnostic: mismatched vectors, cached experts, cached bytes
     float *logits, *topw, *gu, *part, *shg;
     __half* shh;
     int *topi, *cnt, *jbase, *njobs;
@@ -392,6 +327,9 @@ struct Engine::Pf {
     // a pass's chunks: what a chunk carries from one layer, or one half, to the next (R, ctl, bo_f, inj_f, bo_a, inj_a
     // above point at the chunk's while it runs; [0] are those)
     int pass = 1;                     // chunks per pass: FNX_PF_PASS (default 2; 4 with an ExpertCache)
+    int borrow_pass = 1;              // optional larger pass backed temporarily by unused KV/cache pages
+    int cache_r_chunks = 0, residual_pool = -1;
+    bool cache_last_addend = false;
     float *Rk[Engine::PF_PASS], *bofk[Engine::PF_PASS], *injfk[Engine::PF_PASS], *boak[Engine::PF_PASS],
         *injak[Engine::PF_PASS];
     int* ctlk[Engine::PF_PASS];
@@ -445,13 +383,27 @@ struct Engine::Pf {
     size_t stage_bytes = 0;
     size_t alloc_bytes = 0;           // what the prompt path holds on this card (palloc's tally; the stages added later)
     int stage_rows = 0;               // FNX_PF_STAGE_ROWS (default 2048): shorter reads take the experts in place
+    bool static_stage = false;        // FNX_PF_STATIC_STAGE: immutable experts, independent of decode's cache
+    bool selective_stage = false;     // 2/3/4: fill only routed cold experts, once per layer/pass
+    bool routed_dma = false;          // 3: strata's actual-route DMA, overlapped with the shared expert
+    bool routed_overlap = false;      // 4: GPU route checks on the copy stream, without host readback
+    int copy_blocks = 8;
+    bool compact_phase = false, cache_phase = false, cache_carry = false;
+    int phase_pool = -1;
+    char* phase_base = nullptr;
+    size_t phase_bytes = 0;
+    size_t phase_loan_bytes = 0;       // active view before any borrowed residuals
+    std::function<size_t(int, char*, size_t)> bind_phase;
+    unsigned char* stage_ready = nullptr;
+    unsigned long long* stage_moved = nullptr;
+    int* route_host = nullptr;        // pinned actual counts, read back before the shared expert runs
+    cudaEvent_t route_done = nullptr;
+    std::vector<unsigned char> dma_ready;
+    std::vector<const char*> dma_gu, dma_dn;
+    unsigned long long dma_moved = 0, dma_batches = 0, dma_fallbacks = 0;
     const char **ep_gu = nullptr, **ep_dn = nullptr, **ep_hgu = nullptr, **ep_hdn = nullptr;
     int* slot_h = nullptr;            // pinned: the ExpertCache's slot_of at the pass's start
-    struct Copy {
-        const char* src;
-        char* dst;
-        size_t n;
-    };
+    using Copy = PrefillStageCopy;
     std::vector<Copy> copies[NL];
     size_t staged = 0, in_place = 0;  // the pass's expert bytes copied in, and left in RAM
     cudaStream_t cs = nullptr;
@@ -465,6 +417,20 @@ void pf_gemm(Engine::Pf& p, const __half* W, int rows, int cols, const __half* X
         static std::set<std::tuple<int, int, int, int>> seen;
         if (seen.insert({rows, cols, C, ldo}).second) std::fprintf(stderr, "pf_gemm: rows %d cols %d C %d ldo %d\n", rows, cols, C, ldo);
     }
+#if FNX_HIP
+    static const bool hc_gsu3 = env_flag("FNX_PF_HC_DOWN_GSU3");
+    static const bool wide_gsu3 = env_flag("FNX_PF_WIDE_GSU3");
+    if (p.native_gemm && !p.f16acc && C < 64) {
+        const auto* x16 = reinterpret_cast<const uint16_t*>(X);
+        const auto* w16 = reinterpret_cast<const uint16_t*>(W);
+        if (hc_gsu3 && strata_pf_hcdown_gsu3_f16(x16, w16, out, C, rows, cols, ldo, s)) return;
+        if (wide_gsu3 && strata_pf_wide_gsu3_f16(x16, w16, out, C, rows, cols, ldo, s)) return;
+    }
+    if (p.native_gemm && strata_pf_gemm_f16(reinterpret_cast<const uint16_t*>(X), reinterpret_cast<const uint16_t*>(W),
+                                           out, C, rows, cols, ldo, 0.0f, s)) return;
+    if (p.native_gemm && strata_pf_gemm_narrow_f16(reinterpret_cast<const uint16_t*>(X), reinterpret_cast<const uint16_t*>(W),
+                                                  out, C, rows, cols, ldo, s)) return;
+#endif
     if (p.f16acc) {
         // f16 accumulation and output (llama.cpp's COMPUTE_16F on a V100), then to f32
         const __half one = __float2half(1.0f), zero = __float2half(0.0f);
@@ -486,10 +452,45 @@ void pf_dense_xh(Engine::Pf& p, const Q8S& w, int rows, int cols, int C, float* 
     const int slice = (int) std::min<size_t>(rows, PF_WH / cols / 128 * 128);   // whole 128-row tiles
     for (int r0 = 0; r0 < rows; r0 += slice) {
         const int nr = std::min(slice, rows - r0);
+#if FNX_HIP
+        if (p.q8_gsu3 && strata_pf_q8_gsu3_f16(reinterpret_cast<const uint16_t*>(p.xh),
+                w.q + (size_t)r0*cols, w.d + (size_t)r0*cols/32, out + r0, C, nr, cols, ldo, nr, 0, s)) continue;
+#endif
         k_q8s_f16<<<grid_for((size_t) nr * cols), 256, 0, s>>>(w.q + (size_t) r0 * cols, w.d + (size_t) r0 * cols / 32, (size_t) nr * cols, p.wh);
         pf_gemm(p, p.wh, nr, cols, p.xh, C, out + r0, ldo, s);
     }
 }
+// A head shard keeps the original prompt GEMM's row slices, output stride and
+// row offsets. Changing those shapes can select a different BLAS reduction and
+// perturb greedy decoding. Missing heads are zero-filled in the existing staging
+// buffer; after each original-shape product, only the owned rows are retained.
+void pf_dense_head_xh(Engine::Pf& p, const Q8S& w, int rows, int full_rows, int first, int cols,
+                      int C, float* out, cudaStream_t s) {
+    if (p.compact_heads && C >= 64) {
+        pf_dense_xh(p, w, rows, cols, C, out, rows, s);
+        return;
+    }
+    const int slice = (int) std::min<size_t>(full_rows, PF_WH / cols / 128 * 128);
+    for (int r0 = 0; r0 < full_rows; r0 += slice) {
+        const int nr = std::min(slice, full_rows - r0);
+        const int lo = std::max(first, r0), hi = std::min(first + rows, r0 + nr);
+        if (hi <= lo) continue;
+#if FNX_HIP
+        if (p.q8_gsu3 && strata_pf_q8_gsu3_f16(reinterpret_cast<const uint16_t*>(p.xh),
+                w.q + (size_t)(lo-first)*cols, w.d + (size_t)(lo-first)*cols/32,
+                out + lo, C, hi-lo, cols, full_rows, nr, lo-r0, s)) continue;
+#endif
+        ckc(cudaMemsetAsync(p.wh, 0, (size_t) nr * cols * sizeof(__half), s), "head weight padding");
+        k_q8s_f16<<<grid_for((size_t) (hi - lo) * cols), 256, 0, s>>>(w.q + (size_t) (lo - first) * cols,
+            w.d + (size_t) (lo - first) * cols / 32, (size_t) (hi - lo) * cols, p.wh + (size_t) (lo - r0) * cols);
+        pf_gemm(p, p.wh, nr, cols, p.xh, C, out + r0, full_rows, s);
+    }
+    float* gather = p.head_gather ? p.head_gather : p.xf;
+    ckc(cudaMemcpy2DAsync(gather, (size_t) rows * sizeof(float), out + first, (size_t) full_rows * sizeof(float),
+        (size_t) rows * sizeof(float), C, cudaMemcpyDeviceToDevice, s), "head projection gather");
+    ckc(cudaMemcpyAsync(out, gather, (size_t) C * rows * sizeof(float), cudaMemcpyDeviceToDevice, s), "head projection compact");
+}
+
 // the same from x (f32, C rows of cols), converted into p.xh first
 void pf_dense(Engine::Pf& p, const Q8S& w, int rows, int cols, const float* x, int C, float* out, int ldo, cudaStream_t s) {
     k_f32_f16<<<grid_for((size_t) C * cols), 256, 0, s>>>(x, (size_t) C * cols, p.xh);
@@ -623,26 +624,46 @@ void pf_lt_calibrate(Engine::Pf& p, cudaStream_t s) {
 // the hyper-connection read for C rows (see hc.cuh for what it computes)
 void pf_hc_read(Engine::Pf& p, float* R, const float* bo, const float* inj_prev, const float* w_norm, const Q8S& w_down, const Q8S& w_up,
                 const uint16_t* w_inj, float eps, float* mixed, float* inject, int C, cudaStream_t s, __half* mixh = nullptr) {
-    k_hcb_prep<<<C, HCB_THREADS, 0, s>>>(R, bo, inj_prev, w_norm, p.rs, p.xh, eps, w_inj, inject);   // the inject rows here
-    k_q8s_f16<<<grid_for((size_t) LR * D), 256, 0, s>>>(w_down.q, w_down.d, (size_t) LR * D, p.wh);
-#if !FNX_HIP
-    if (!(p.down_lt && !p.f16acc && pf_down_lt(p, p.wh, p.xh, C, p.lo32, s)))
+    if (p.hc_streams)
+        k_hcb_prep_streams<<<C, HCB_THREADS, 0, s>>>(R, bo, inj_prev, w_norm, p.rs, p.xh, eps, w_inj, inject);
+    else
+        k_hcb_prep<<<C, HCB_THREADS, 0, s>>>(R, bo, inj_prev, w_norm, p.rs, p.xh, eps, w_inj, inject);
+    bool fused_down = false;
+#if FNX_HIP
+    if (p.q8_gsu3) fused_down = strata_pf_q8_gsu3_f16(reinterpret_cast<const uint16_t*>(p.xh),
+        w_down.q, w_down.d, p.lo32, C, LR, D, LR, LR, 0, s);
 #endif
-        pf_gemm(p, p.wh, LR, D, p.xh, C, p.lo32, LR, s);
+    if (!fused_down) {
+        k_q8s_f16<<<grid_for((size_t) LR * D), 256, 0, s>>>(w_down.q, w_down.d, (size_t) LR * D, p.wh);
+#if !FNX_HIP
+        if (!(p.down_lt && !p.f16acc && pf_down_lt(p, p.wh, p.xh, C, p.lo32, s)))
+#endif
+            pf_gemm(p, p.wh, LR, D, p.xh, C, p.lo32, LR, s);
+    }
     k_hcb_lo<<<grid_for((size_t) C * LR), 256, 0, s>>>(p.lo32, C * LR, p.lo16);
     k_q8s_f16<<<grid_for((size_t) D * LR), 256, 0, s>>>(w_up.q, w_up.d, (size_t) D * LR, p.wh);
-    if (p.f16acc) {
-        // pf_gemm's f16 path stages through up32: here up32 is the result, so stage through xh (free once lo is made)
-        const __half one = __float2half(1.0f), zero = __float2half(0.0f);
-        ckb(cublasGemmEx(p.blas, CUBLAS_OP_T, CUBLAS_OP_N, D, C, LR, &one, p.wh, CUDA_R_16F, LR, p.lo16, CUDA_R_16F, LR, &zero, p.xh,
-                         CUDA_R_16F, D, CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP), "gemm f16 (hc up)");
-        k_f16_f32<<<grid_for((size_t) D * C), 256, 0, s>>>(p.xh, C, D, p.up32, D);
-    } else {
-        const float one = 1.0f, zero = 0.0f;
-        ckb(cublasGemmEx(p.blas, CUBLAS_OP_T, CUBLAS_OP_N, D, C, LR, &one, p.wh, CUDA_R_16F, LR, p.lo16, CUDA_R_16F, LR, &zero, p.up32,
-                         CUDA_R_32F, D, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP), "gemm (hc up)");
+    bool mixed_up = false;
+#if FNX_HIP
+    // Smaller chunks measured faster with the separate product and mixer.
+    if (p.hc_up_fused && !mixh && C >= 3072) {
+        mixed_up = strata_pf_hcup_mix_f16(reinterpret_cast<const uint16_t*>(p.lo16),
+            reinterpret_cast<const uint16_t*>(p.wh), R, w_norm, p.rs, mixed,
+            reinterpret_cast<uint16_t*>(p.xh), C, D, LR, s);
+        if (!mixed_up) throw std::runtime_error("prefill: fused HC up dispatch failed");
     }
-    k_hcb_mixinj<<<C, HCM_THREADS, 0, s>>>(R, w_norm, p.rs, p.up32, mixed, mixh ? mixh : p.xh, nullptr, nullptr);   // prep made the inject rows
+#endif
+    if (!mixed_up) {
+        if (p.f16acc) {
+            // pf_gemm's f16 path stages through up32: here up32 is the result, so stage through xh (free once lo is made)
+            const __half one = __float2half(1.0f), zero = __float2half(0.0f);
+            ckb(cublasGemmEx(p.blas, CUBLAS_OP_T, CUBLAS_OP_N, D, C, LR, &one, p.wh, CUDA_R_16F, LR, p.lo16, CUDA_R_16F, LR, &zero, p.xh,
+                             CUDA_R_16F, D, CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP), "gemm f16 (hc up)");
+            k_f16_f32<<<grid_for((size_t) D * C), 256, 0, s>>>(p.xh, C, D, p.up32, D);
+        } else {
+            pf_gemm(p, p.wh, D, LR, p.lo16, C, p.up32, D, s);
+        }
+        k_hcb_mixinj<<<C, HCM_THREADS, 0, s>>>(R, w_norm, p.rs, p.up32, mixed, mixh ? mixh : p.xh, nullptr, nullptr);   // prep made the inject rows
+    }
     // FNX_PF_HC_CHECK=1 (debugging): the inject rows the way k_hcb_mixinj made them, against prep's
     static const bool check = std::getenv("FNX_PF_HC_CHECK") != nullptr;
     if (check && w_inj) {
@@ -853,6 +874,23 @@ void Engine::pf_seq_reset(unsigned start) {
 
 void Engine::prefill_alloc() {
     if (!pf_.empty()) throw std::runtime_error("prefill_alloc: the prompt path's buffers exist already");
+    const bool slim_transport = env_flag("FNX_PF_SLIM_BUFFERS");
+    const bool alias_residual = env_flag("FNX_PF_RESIDUAL_ALIAS");
+    const bool phase_scratch = env_flag("FNX_PF_PHASE_SCRATCH");
+    const bool tight_activations = env_flag("FNX_PF_TIGHT_ACTIVATIONS");
+    if (tight_activations && (!phase_scratch || !attn_head_split() || !env_flag("FNX_PF_COMPACT_HEADS") || D < 3 * N))
+        throw std::runtime_error("FNX_PF_TIGHT_ACTIVATIONS requires compact head-split phase scratch");
+#if FNX_HIP
+    if ((slim_transport || alias_residual || phase_scratch) && (!attn_head_split() || !rccl_on_ || env_int("FNX_PF_RING_SM", 0)))
+        throw std::runtime_error("slim prefill buffers and residual aliasing require head-split attention and RCCL prompt sums");
+#else
+    if (slim_transport || alias_residual || phase_scratch) throw std::runtime_error("slim prefill buffers and residual aliasing require HIP");
+#endif
+    const long long static_stage = env_int("FNX_PF_STATIC_STAGE", 0);
+    if (static_stage < 0 || static_stage > 4)
+        throw std::runtime_error("FNX_PF_STATIC_STAGE: expected 0, 1 (DMA), 2 (routed copies), 3 (routed DMA) or 4 (overlapped routed copies)");
+    if (static_stage && (env_int("FNX_STATIC_EXPERTS", 0) != 1 || m_.resident.size() != NL))
+        throw std::runtime_error("FNX_PF_STATIC_STAGE requires immutable static experts");
     pf_.resize(NCARD);
     for (int c = 0; c < NCARD; ++c) {
         CardBuf& b = *cb_[c];
@@ -862,6 +900,14 @@ void Engine::prefill_alloc() {
         ckc(cudaMemGetInfo(&free0, &tot0), "mem info");
         pf_card_bytes = 0;
         Pf* p = new Pf;
+        p->static_stage = static_stage != 0;
+        p->selective_stage = static_stage >= 2;
+        p->routed_dma = static_stage == 3;
+        p->routed_overlap = static_stage == 4;
+        const long long copy_blocks = env_int("FNX_PF_COPY_BLOCKS", p->routed_overlap ? 1 : 8);
+        if (copy_blocks < 1 || copy_blocks > 32)
+            throw std::runtime_error("FNX_PF_COPY_BLOCKS: expected 1..32");
+        p->copy_blocks = (int) copy_blocks;
         ckb(cublasCreate(&p->blas), "create");
         {
             const int d = current_card();
@@ -871,80 +917,183 @@ void Engine::prefill_alloc() {
         }
         ckb(cublasSetStream(p->blas, b.st), "stream");
         ckb(cublasSetMathMode(p->blas, CUBLAS_TENSOR_OP_MATH), "math mode");
+        p->decode_cache = env_flag("FNX_PF_DECODE_CACHE");
+        p->compact_phase = env_flag("FNX_PF_COMPACT_PHASE");
+        p->cache_phase = env_flag("FNX_PF_CACHE_PHASE");
+        p->cache_carry = env_flag("FNX_PF_CACHE_CARRY");
+        if (p->cache_carry && (!p->cache_phase || !alias_residual))
+            throw std::runtime_error("FNX_PF_CACHE_CARRY requires phase cache and aliased addends");
+        if (p->cache_phase && (!p->compact_phase || !static_arena_ || static_stage != 2 || !p->decode_cache))
+            throw std::runtime_error("FNX_PF_CACHE_PHASE requires compact phase views, a static cache arena, stage 2 and cache reads");
+        if (p->compact_phase && (!phase_scratch || !tight_activations))
+            throw std::runtime_error("FNX_PF_COMPACT_PHASE requires tight phase scratch");
+        if (p->decode_cache && !b.static_cache.n_slots)
+            throw std::runtime_error("FNX_PF_DECODE_CACHE requires a static decode cache");
+        if (env_flag("FNX_PF_DECODE_CACHE_CHECK")) {
+            if (!p->decode_cache) throw std::runtime_error("FNX_PF_DECODE_CACHE_CHECK requires FNX_PF_DECODE_CACHE");
+            for (const auto& layer : w.L)
+                if (layer.gu_e_stride % sizeof(uint4) || layer.down_e_stride % sizeof(uint4))
+                    throw std::runtime_error("prefill cache byte check requires aligned expert strides");
+            p->cache_check = palloc<unsigned long long>(3);
+        }
         p->f16acc = env_flag("FNX_PF_F16ACC");
+        p->native_gemm = env_int("FNX_PF_GEMM", 0) != 0;
+        p->q8_gsu3 = env_flag("FNX_PF_Q8_GSU3") && p->native_gemm && !p->f16acc;
+        p->hc_streams = env_flag("FNX_PF_HC_STREAMS");
+        p->hc_up_fused = env_flag("FNX_PF_HC_UP_FUSED");
+        p->compact_heads = env_flag("FNX_PF_COMPACT_HEADS");
+        p->moe_fused = env_flag("FNX_PF_MOE_FUSED");
+        if (p->moe_fused) {
+#if FNX_HIP
+            if (env_flag("FNX_PF_MOE_Q8"))
+                throw std::runtime_error("FNX_PF_MOE_FUSED requires FP16 expert activations");
+            for (size_t layer=0;layer<w.L.size();++layer) {
+                const DW& gu=w.L[layer].gu_e;
+                if (!moe_gate_up_swiglu_supported(gu))
+                    throw std::runtime_error("FNX_PF_MOE_FUSED: unsupported gate/up at layer "+std::to_string(layer)+
+                        " (type "+std::to_string(gu.type)+", "+std::to_string(gu.n_out)+"x"+std::to_string(gu.n_in)+
+                        ", row bytes "+std::to_string(gu.row_bytes)+")");
+            }
+#else
+            throw std::runtime_error("FNX_PF_MOE_FUSED requires HIP");
+#endif
+        }
+        if (phase_scratch && (!p->compact_heads || p->f16acc || !env_flag("FNX_PF_SCRATCH_ALIAS")))
+            throw std::runtime_error("FNX_PF_PHASE_SCRATCH requires compact heads, FP32 accumulation and FNX_PF_SCRATCH_ALIAS");
+        if (p->compact_heads && (!p->native_gemm || !attn_head_split()))
+            throw std::runtime_error("FNX_PF_COMPACT_HEADS requires native GEMM and head-split attention");
+        if (p->hc_up_fused && (!p->native_gemm || p->f16acc || std::getenv("FNX_PF_HC_CHECK")))
+            throw std::runtime_error("FNX_PF_HC_UP_FUSED requires native FP32 GEMM and FNX_PF_HC_CHECK unset");
+        if (p->native_gemm && p->f16acc)
+            throw std::runtime_error("FNX_PF_GEMM preserves FP32 accumulation; unset FNX_PF_F16ACC");
+#if FNX_HIP
+        if ((p->hc_up_fused || p->compact_heads) && !strata_pf_padded_gemm_available())
+            throw std::runtime_error("fused HC up and compact head projections require gfx11 WMMA");
+        if (p->native_gemm)
+            std::fprintf(stderr, "fnx: card %d: native FP32 prompt GEMM %s (unsupported shapes use BLAS)\n", c,
+                         strata_pf_padded_gemm_available() ? "enabled" : "unavailable");
+#else
+        if (p->native_gemm) throw std::runtime_error("FNX_PF_GEMM requires a HIP build");
+#endif
         const int ffs = w.ff1 - w.ff0, rs_qkvz = w.conv_ch() + w.nv() * HS;
+        const size_t up_floats = std::max<size_t>((size_t) pf_c_ * D, (size_t) pf_c_ * NQH * 2 * HD / 2 + 16);
         // the borrowed block (the recurrent snapshots): the phase region, then whole-chunk scratch; the rest on its own
         Arena big{(char*) b.snap_block, b.snap_block_bytes};
         // one region for the buffers of each phase of a layer: they never live at once (the FFN half's are read last
         // by the chunk sum's addend, on the stream before the next half starts)
-        auto ffn_set = [&](Arena& a) {
-            p->gu = a.take<float>((size_t) pf_c_ * TOPK * 2 * ffs);
-            p->part = a.take<float>((size_t) (pf_c_ * TOPK + pf_c_) * N);
-            p->shg = a.take<float>((size_t) pf_c_ * 2 * ffs);
-            p->shh = a.take<__half>((size_t) pf_c_ * ffs);
-            p->h16 = a.take<uint16_t>((size_t) pf_c_ * TOPK * ffs);
+        if (const char* qr = std::getenv("FNX_PF_QSA_ROWS")) {
+            char* end = nullptr;
+            const long v = std::strtol(qr, &end, 10);
+            if (end == qr || *end || v < MAXT || v > std::numeric_limits<int>::max() || v % MAXT)
+                throw std::runtime_error("FNX_PF_QSA_ROWS: a positive multiple of " + std::to_string(MAXT) + ", not '" + qr + "'");
+            p->qsa_pf_rows = (int) v;
+        }
+        // Bind the same phase layout to the rows used by this pass. The
+        // capacity is the actual loan before its residuals and addends.
+        p->bind_phase = [this, p, &w, ffs, rs_qkvz, tight_activations, phase_scratch]
+                        (int cap, char* region, size_t capacity) {
+            Arena ffn{region, capacity};
+            p->gu = p->moe_fused ? nullptr : ffn.take<float>((size_t) cap * TOPK * 2 * ffs);
+            p->part = ffn.take<float>((size_t) (cap * TOPK + cap) * N);
+            p->shg = ffn.take<float>((size_t) cap * 2 * ffs);
+            p->shh = ffn.take<__half>((size_t) cap * ffs);
+            p->h16 = ffn.take<uint16_t>((size_t) cap * TOPK * ffs);
+
+            Arena attn{region, capacity};
+            // Short BLAS chunks still need the padded output before gathering.
+            const size_t short_rows = std::min(cap, 63);
+            const size_t q_rows = tight_activations ? std::max((size_t) cap * attn_projected_q_heads(), short_rows * NQH)
+                                                   : (size_t) cap * NQH;
+            const size_t kv_rows = tight_activations ? std::max((size_t) cap * attn_projected_kv_heads(), short_rows * NKVH)
+                                                    : (size_t) cap * NKVH;
+            p->qg = attn.take<float>(q_rows * 2 * HD);
+            p->k = attn.take<float>(kv_rows * HD);
+            p->v = attn.take<float>(kv_rows * HD);
+            p->att = attn.take<float>((size_t) cap * w.nq * HD);
+            p->yidx = attn.take<float>((size_t) cap * qsa_rows());
+            p->qidx = attn.take<float>((size_t) cap * 512);
+            p->cells = attn.take<int>((size_t) attn_position_partitions() * cap * qsa_maxsel());
+            p->ncells = attn.take<int>(attn_position_partitions() * cap);
+            const int score_rows = p->compact_phase ? std::min(cap, p->qsa_pf_rows) : p->qsa_pf_rows;
+            p->scores = attn.take<float>((size_t) std::max(attn_rows(), score_rows) * (max_ctx_ / 4));
+            p->apart[0] = attn.take<float>(NCARD * attn_prompt_block_floats(cap));
+
+            Arena rec{region, capacity};
+            p->qkvz = rec.take<float>((size_t) cap * rs_qkvz);
+            p->ab = rec.take<float>((size_t) cap * 2 * w.nv());
+            p->y32 = rec.take<float>((size_t) cap * w.nv() * HS);
+            p->gdn_xc = rec.take<float>((size_t) cap * w.conv_ch());
+            p->gdn_sq = rec.take<float>((size_t) cap * w.nv() * 4);
+            p->gdn_ch = rec.take<float>(gdn_prompt_work_floats(cap, w.nv()));
+
+            Arena ple{region, capacity};
+            p->ple_key = ple.take<float>((size_t) cap * D);
+            p->ple_val = ple.take<float>((size_t) cap * N);
+            p->ple_tmp = ple.take<float>((size_t) 2 * MAXT * D);
+
+            const size_t up_bytes = phase_scratch ?
+                std::max<size_t>((size_t) cap * D, (size_t) cap * NQH * 2 * HD / 2 + 16) * sizeof(float) : 0;
+            const size_t bytes = std::max({ffn.off, attn.off, rec.off, ple.off, up_bytes});
+            if (bytes > capacity) throw std::runtime_error("prefill phase view exceeds its allocation");
+            return bytes;
         };
-        auto attn_set = [&](Arena& a) {
-            p->qg = a.take<float>((size_t) pf_c_ * NQH * 2 * HD);
-            p->k = a.take<float>((size_t) pf_c_ * NKVH * HD);
-            p->v = a.take<float>((size_t) pf_c_ * NKVH * HD);
-            p->att = a.take<float>((size_t) pf_c_ * w.nq * HD);
-            p->yidx = a.take<float>((size_t) pf_c_ * qsa_rows());
-            p->qidx = a.take<float>((size_t) pf_c_ * 512);
-            p->cells = a.take<int>((size_t) pf_c_ * qsa_maxsel());
-            p->ncells = a.take<int>(pf_c_);
-            if (const char* qr = std::getenv("FNX_PF_QSA_ROWS")) {
-                char* end = nullptr;
-                const long v = std::strtol(qr, &end, 10);
-                if (end == qr || *end || v < MAXT || v % MAXT)
-                    throw std::runtime_error("FNX_PF_QSA_ROWS: a positive multiple of " + std::to_string(MAXT) + ", not '" + qr + "'");
-                p->qsa_pf_rows = (int) v;
+        const size_t phase = p->bind_phase(pf_c_, nullptr, SIZE_MAX);
+        char* region = nullptr;
+        if (p->cache_phase) {
+            const auto& cache = b.static_cache;
+            for (int pool = 0; pool < cache.n_pools; ++pool) {
+                if (pool == cache.arena_pool || !cache.pool[pool] || cache.n[pool] <= 1 ||
+                    phase > (size_t) (cache.n[pool] - 1) * cache.slot_bytes[pool]) continue;
+                p->phase_pool = pool;
+                region = cache.pool[pool];
+                break;
             }
-            p->scores = a.take<float>((size_t) std::max(attn_rows(), p->qsa_pf_rows) * (max_ctx_ / 4));
-            p->apart[0] = a.take<float>(NCARD * attn_prompt_block_floats(pf_c_));
-        };
-        auto rec_set = [&](Arena& a) {
-            p->qkvz = a.take<float>((size_t) pf_c_ * rs_qkvz);
-            p->ab = a.take<float>((size_t) pf_c_ * 2 * w.nv());
-            p->y32 = a.take<float>((size_t) pf_c_ * w.nv() * HS);
-            p->gdn_xc = a.take<float>((size_t) pf_c_ * w.conv_ch());
-            p->gdn_sq = a.take<float>((size_t) pf_c_ * w.nv() * 4);
-            p->gdn_ch = a.take<float>(gdn_prompt_work_floats(pf_c_, w.nv()));
-        };
-        auto ple_set = [&](Arena& a) {
-            p->ple_key = a.take<float>((size_t) pf_c_ * D);
-            p->ple_val = a.take<float>((size_t) pf_c_ * N);
-            p->ple_tmp = a.take<float>((size_t) 2 * MAXT * D);
-        };
-        size_t phase = 0;
-        {
-            Arena dry{nullptr, SIZE_MAX};
-            ffn_set(dry), phase = std::max(phase, dry.off), dry.off = 0;
-            attn_set(dry), phase = std::max(phase, dry.off), dry.off = 0;
-            rec_set(dry), phase = std::max(phase, dry.off), dry.off = 0;
-            ple_set(dry), phase = std::max(phase, dry.off);
+            if (!region) throw std::runtime_error("prefill phase does not fit an independent cache pool");
+        } else {
+            region = big.fits(phase) ? big.take<char>(phase) : palloc<char>(phase);
         }
-        char* region = big.fits(phase) ? big.take<char>(phase) : palloc<char>(phase);
-        for (auto set : {0, 1, 2, 3}) {
-            Arena a{region, phase};
-            if (set == 0) ffn_set(a);
-            else if (set == 1) attn_set(a);
-            else if (set == 2) rec_set(a);
-            else ple_set(a);
-        }
+        p->phase_base = region;
+        p->phase_bytes = phase;
+        p->bind_phase(pf_c_, region, phase);
         auto from_big = [&](size_t floats) { return big.fits(floats * sizeof(float)) ? big.take<float>(floats) : palloc<float>(floats); };
-        p->up32 = from_big(std::max<size_t>((size_t) pf_c_ * D, (size_t) pf_c_ * NQH * 2 * HD / 2 + 16));
-        p->xf = from_big((size_t) pf_c_ * D);
+        // HC reads precede every phase's projection, after the preceding
+        // phase's addend has been consumed on b.st. The embedding expansion
+        // and draft fc_hidden also finish before that region is reused.
+        // Head-split attention has no deferred merge keeping phase data live.
+        p->up32 = phase_scratch ? reinterpret_cast<float*>(region) : from_big(up_floats);
+        if (phase_scratch) {
+            // C>=64 takes compact GEMM directly. Smaller C retains the old
+            // padded BLAS shapes, with a disjoint gather to avoid overlapping
+            // cudaMemcpy2D when qg/k/v occupy the same phase arena as up32.
+            const size_t small_c = std::min(pf_c_, 63);
+            p->head_gather = palloc<float>(std::max<size_t>(small_c * D, small_c * NQH * 2 * HD / 2 + 16));
+        }
+        const bool alias_scratch = env_flag("FNX_PF_SCRATCH_ALIAS");
+        if (alias_scratch && p->f16acc)
+            throw std::runtime_error("FNX_PF_SCRATCH_ALIAS requires FP32 GEMM output");
+        // xf is consumed by the embedding expansion, head gather, or the draft's
+        // f32-to-f16 conversion before up32 is written on this same stream.
+        // The draft projection reads xh after that conversion, never xf again.
+        p->xf = alias_scratch ? p->up32 : from_big((size_t) pf_c_ * D);
         p->bo_a = from_big((size_t) pf_c_ * N);
-        p->widx = from_big((size_t) qsa_rows() * N);
+        p->widx = from_big((size_t) std::max(qsa_rows(), NEXP + 1) * N);
         p->wh = palloc<__half>(PF_WH);
         p->xh = palloc<__half>((size_t) pf_c_ * D);
-        p->R = palloc<float>((size_t) pf_c_ * D);
+        p->R = p->cache_carry ? nullptr : palloc<float>((size_t) pf_c_ * D);
         p->rs = palloc<float>((size_t) pf_c_ * HC);
         p->lo32 = palloc<float>((size_t) pf_c_ * LR);
         p->lo16 = palloc<__half>((size_t) pf_c_ * LR);
-        p->mixed = palloc<float>((size_t) pf_c_ * N);
-        p->bo_f = palloc<float>((size_t) pf_c_ * N);
+        // HC down consumes the D-wide half input before the N-wide mixed
+        // output exists. The final half input and float mixed rows occupy
+        // disjoint pieces of that same buffer. Wider later dense inputs
+        // overwrite mixed only after its last projection has consumed it.
+        p->mixed = tight_activations ? reinterpret_cast<float*>(p->xh + (size_t)pf_c_ * N)
+                                    : palloc<float>((size_t) pf_c_ * N);
+        // ev_rf orders the attention HC read after the preceding FFN sum;
+        // ev_ra orders the FFN HC read after the attention sum. Each read
+        // consumes the old addend before this same stream writes the next one.
+        // The draft's fc_emb uses bo_f only after the last main HC read.
+        p->bo_f = alias_residual ? p->bo_a : palloc<float>((size_t) pf_c_ * N);
         p->inj_a = palloc<float>((size_t) pf_c_ * HC);
         p->inj_f = palloc<float>((size_t) pf_c_ * HC);
         p->moe_q8 = env_flag("FNX_PF_MOE_Q8");
@@ -976,8 +1125,9 @@ void Engine::prefill_alloc() {
         {
             PfRing& r = p->ring_ce;
             const size_t share = (size_t) (pf_c_ + NCARD - 1) / NCARD * N;   // a card's share of the rows
-            r.send = palloc<__half>(share);
+            if (!slim_transport) r.send = palloc<__half>(share);
             for (int k = 0; k < 2; ++k) {
+                if (!slim_transport) {
 #if FNX_HIP
                 if (pf_peer_) {   // device memory on this card: the previous card's kernels store into it
                     for (int h = 0; h < NCARD - 1; ++h) r.in[h][k] = ppalloc<__half>(share);
@@ -989,6 +1139,8 @@ void Engine::prefill_alloc() {
                     r.ag[k] = hpalloc<__half>((size_t) pf_c_ * N);
                 }
                 for (int h = 0; h < NCARD - 1; ++h) r.din[h][k] = palloc<__half>(share);
+                }
+                // RCCL uses these two buffers directly; the host ring above is idle.
                 r.dag[k] = palloc<__half>((size_t) pf_c_ * N);
             }
 #if FNX_HIP
@@ -1020,9 +1172,9 @@ void Engine::prefill_alloc() {
         }
 #endif
         p->attn_dec = env_flag("FNX_PF_ATTN_DEC");
-        p->apart[1] = palloc<float>(NCARD * attn_prompt_block_floats(pf_c_));   // set 0 is in the attention phase's region
+        if (!slim_transport) p->apart[1] = palloc<float>(NCARD * attn_prompt_block_floats(pf_c_));   // set 0 is in the attention phase's region
         for (int s = 0; s < 2; ++s) {
-            p->arecv[s] = hpalloc<float>((NCARD - 1) * attn_prompt_block_floats(pf_c_));
+            if (!slim_transport) p->arecv[s] = hpalloc<float>((NCARD - 1) * attn_prompt_block_floats(pf_c_));
             p->aflags[s] = hpalloc<unsigned>(ATT_FLAG_ROWS * ATT_PIECES_MAX);   // [slot][piece]
         }
         if (const char* ap = std::getenv("FNX_PF_ATT_PIECES")) {
@@ -1047,6 +1199,7 @@ void Engine::prefill_alloc() {
 #else
         p->attn_dma = env_int("FNX_PFX_ATTN_DMA", 1) != 0;   // on by default (3.3-5.6% on 32K and 62.9K IQ3_S prompts, bit-identical logits); FNX_PFX_ATTN_DMA=0 turns it off
 #endif
+        if (slim_transport) p->attn_dma = false;   // a head shard never exchanges attention partials
         if (p->attn_dma) {
             for (int s2 = 0; s2 < 2; ++s2) {
                 p->arecv_dev[s2] = palloc<float>((NCARD - 1) * attn_prompt_block_floats(pf_c_));
@@ -1069,12 +1222,44 @@ void Engine::prefill_alloc() {
             const long long pass = env_int("FNX_PF_PASS", pf_pass_pick_ > 0 ? pf_pass_pick_ : (w.ec.n_slots || hcs_wanted ? 4 : 2));   // with an ExpertCache, staging amortizes over more
             if (pass < 1 || pass > PF_PASS) throw std::runtime_error("FNX_PF_PASS: 1 to " + std::to_string(PF_PASS) + ", got " + std::to_string(pass));
             p->pass = (int) pass;
-            for (int k = 1; k < p->pass; ++k) {
-                p->Rk[k] = palloc<float>((size_t) pf_c_ * D);
-                p->bofk[k] = palloc<float>((size_t) pf_c_ * N);
+            const long long borrowed = env_int("FNX_PF_BORROW_PASS",0);
+            if (borrowed < 0 || borrowed > PF_PASS || (borrowed && borrowed < pass))
+                throw std::runtime_error("FNX_PF_BORROW_PASS: 0 or FNX_PF_PASS through " + std::to_string(PF_PASS));
+            p->borrow_pass = borrowed ? (int)borrowed : p->pass;
+            if (p->borrow_pass > p->pass && (!static_arena_ || !alias_residual || static_stage != 2))
+                throw std::runtime_error("FNX_PF_BORROW_PASS requires static cache arena, residual aliasing and routed static stages (mode 2)");
+            const long long chunks = env_int("FNX_PF_CACHE_R_CHUNKS", 0);
+            if (chunks < 0 || chunks >= pass || (chunks && (!static_arena_ || !alias_residual || static_stage != 2 || !p->decode_cache)))
+                throw std::runtime_error("FNX_PF_CACHE_R_CHUNKS requires routed static stages and fewer chunks than the base pass");
+            p->cache_r_chunks = p->cache_carry ? p->pass : (int)chunks;
+            if (p->cache_r_chunks) {
+                // The KV-backed pool owns a separate watermark. Borrow a
+                // prefix of a different, contiguous pool and leave a slot for its hand.
+                const size_t addend_bytes = (size_t) pf_c_ * N * sizeof(float);
+                const size_t bytes = (size_t) p->cache_r_chunks * pf_c_ * D * sizeof(float) +
+                                     (p->cache_carry ? (p->pass - 1) * addend_bytes : 0);
+                const auto& cache = b.static_cache;
+                for (int pool = 0; pool < cache.n_pools; ++pool) {
+                    if (pool == cache.arena_pool || !cache.pool[pool] || cache.n[pool] <= 1 ||
+                        (p->cache_phase && pool != p->phase_pool)) continue;
+                    const size_t slot_bytes = cache.slot_bytes[pool];
+                    const size_t reserved = p->cache_phase ?
+                        (p->phase_bytes / slot_bytes + (p->phase_bytes % slot_bytes != 0)) * slot_bytes : 0;
+                    const size_t total = (size_t) (cache.n[pool] - 1) * slot_bytes;
+                    if (reserved <= total && bytes <= total - reserved) {
+                        p->residual_pool = pool;
+                        p->cache_last_addend = p->cache_carry || addend_bytes <= total - reserved - bytes;
+                        break;
+                    }
+                }
+                if (p->residual_pool < 0) throw std::runtime_error("prefill: no independent cache pool fits the residual chunks");
+            }
+            for (int k = 1; k < p->borrow_pass; ++k) {
+                p->Rk[k] = k < p->pass - p->cache_r_chunks ? palloc<float>((size_t) pf_c_ * D) : nullptr;
+                p->bofk[k] = !p->cache_carry && k < p->pass - (int)p->cache_last_addend ? palloc<float>((size_t) pf_c_ * N) : nullptr;
                 p->injfk[k] = palloc<float>((size_t) pf_c_ * HC);
                 p->ctlk[k] = palloc<int>((size_t) (1 + (pf_c_ / MAXT)) * 2);
-                p->boak[k] = palloc<float>((size_t) pf_c_ * N);
+                p->boak[k] = k >= p->pass ? nullptr : alias_residual ? p->bofk[k] : palloc<float>((size_t) pf_c_ * N);
                 p->injak[k] = palloc<float>((size_t) pf_c_ * HC);
             }
             p->overlap = !p->ring_sm && env_int("FNX_PF_OVERLAP", 1) != 0;
@@ -1120,7 +1305,22 @@ void Engine::prefill_alloc() {
                     }
             }
         }
-        if (w.ec.n_slots) {   // the stages themselves: prefill_stages, once the experts' places are final
+        if (w.ec.n_slots || p->static_stage) {   // the stages themselves: prefill_stages, once the experts' places are final
+            if (p->selective_stage) {
+                p->stage_ready = palloc<unsigned char>(NEXP);
+                p->stage_moved = palloc<unsigned long long>(1);
+            }
+            if (p->routed_dma || p->routed_overlap) {
+                ckc(cudaEventCreateWithFlags(&p->route_done, cudaEventDisableTiming), "route event");
+                own_event(p->route_done);
+            }
+            if (p->routed_dma) {
+                ckc(cudaMallocHost(&p->route_host, NEXP * sizeof(int)), "pinned route counts");
+                own_pinned(p->route_host);
+                p->dma_ready.resize(NEXP);
+                p->dma_gu.resize((size_t) NL * NEXP);
+                p->dma_dn.resize((size_t) NL * NEXP);
+            }
             const long long stage_rows = env_int("FNX_PF_STAGE_ROWS", 2048);
             if (stage_rows < 0 || stage_rows > INT32_MAX)
                 throw std::runtime_error("FNX_PF_STAGE_ROWS: want tokens >= 0, got " + std::to_string(stage_rows));
@@ -1231,10 +1431,13 @@ void Engine::prefill_alloc() {
 
 size_t Engine::pf_stage_bytes(int c) const {
     const CardW& w = m_.cards[c];
-    if (!w.ec.n_slots) return 0;
+    const bool fixed = pf_[c]->static_stage;
+    if (!w.ec.n_slots && !fixed) return 0;
     // a stage holds the largest layer's experts not in a slot at the start, FNX_PF_STAGE_MIB at most
     size_t most = 0;
-    for (int l = 0; l < NL; ++l) {
+    for (int l = 0; l < NL - (fixed ? 1 : 0); ++l) {
+        if (m_.resident[(size_t) l].size() != NEXP)
+            throw std::runtime_error("prefill staging: invalid residency shape");
         size_t n = 0;
         for (int e = 0; e < NEXP; ++e) n += m_.resident[(size_t) l][(size_t) e] ? 0 : 1;
         most = std::max(most, n * (w.L[(size_t) l].gu_e_stride + w.L[(size_t) l].down_e_stride));
@@ -1252,7 +1455,42 @@ void Engine::prefill_stages() {
         if (!p.stage_bytes) continue;
         ckc(cudaSetDevice(p.dev), "set");
         pf_card_bytes = p.alloc_bytes;   // palloc's out-of-memory message says what this card's prompt path holds
-        for (char*& st : p.stage) st = palloc<char>(p.stage_bytes);
+        p.stage[0] = palloc<char>(p.stage_bytes);
+        // Routed copies wait for this layer's router, hence for the preceding
+        // layer's consumers. They reuse one stage even when issued on cs.
+        // Unconditional lookahead DMA needs two stages.
+        p.stage[1] = p.selective_stage ? p.stage[0] : palloc<char>(p.stage_bytes);
+        if (p.static_stage) {
+            const CardW& w = m_.cards[c];
+            p.staged = p.in_place = 0;
+            for (int l = 0; l < NL - 1; ++l) {
+                const LayerW& layer = w.L[l];
+                if (!layer.gu_e.ep || !layer.down_e.ep)
+                    throw std::runtime_error("static prefill staging: missing immutable pointer tables");
+                std::vector<const char*> gu(NEXP), dn(NEXP);
+                ckc(cudaMemcpy(gu.data(), layer.gu_e.ep, NEXP * sizeof(char*), cudaMemcpyDeviceToHost), "static GU sources");
+                ckc(cudaMemcpy(dn.data(), layer.down_e.ep, NEXP * sizeof(char*), cudaMemcpyDeviceToHost), "static down sources");
+                if (p.routed_dma) {
+                    std::copy(gu.begin(), gu.end(), p.dma_gu.begin() + (size_t) l * NEXP);
+                    std::copy(dn.begin(), dn.end(), p.dma_dn.begin() + (size_t) l * NEXP);
+                }
+                auto plan = static_prefill_stage(m_.resident[l], gu, dn, layer.gu_e_stride, layer.down_e_stride,
+                                                p.stage[l & 1], p.stage_bytes);
+                std::copy(plan.gu.begin(), plan.gu.end(), p.ep_hgu + (size_t) l * NEXP);
+                std::copy(plan.down.begin(), plan.down.end(), p.ep_hdn + (size_t) l * NEXP);
+                p.copies[l] = std::move(plan.copies);
+                p.staged += plan.staged;
+                p.in_place += plan.in_place;
+            }
+            // The last layer's FFN is not evaluated during prefill.
+            std::fill(p.ep_hgu + (size_t) (NL - 1) * NEXP, p.ep_hgu + (size_t) NL * NEXP, nullptr);
+            std::fill(p.ep_hdn + (size_t) (NL - 1) * NEXP, p.ep_hdn + (size_t) NL * NEXP, nullptr);
+            ckc(cudaMemcpy(p.ep_gu, p.ep_hgu, (size_t) NL * NEXP * sizeof(char*), cudaMemcpyHostToDevice), "static GU tables");
+            ckc(cudaMemcpy(p.ep_dn, p.ep_hdn, (size_t) NL * NEXP * sizeof(char*), cudaMemcpyHostToDevice), "static down tables");
+            std::fprintf(stderr, "fnx: card %d: static prefill stages %zu MiB x %d, %zu MiB %s per pass, %zu MiB read in place\n",
+                         c, p.stage_bytes >> 20, p.selective_stage ? 1 : 2, p.staged >> 20, p.selective_stage ? "eligible for routed copies" : "copied",
+                         p.in_place >> 20);
+        }
         p.alloc_bytes = pf_card_bytes;
         if (env_flag("FNX_PF_TIMING"))
             std::fprintf(stderr, "prefill on card %d: passes of %d chunks, stages of %zu MiB\n", c, p.pass, p.stage_bytes >> 20);
@@ -1289,9 +1527,15 @@ void Engine::prefill_draft(int C, int set) {
             pf_dense(p, L.idx_qk.s, qsa_rows(), N, p.mixed, C, p.yidx, qsa_rows(), s);
         }
         qsa_index(p.yidx, L.idx_qn, L.idx_kn, b.mtp_qsa_ring, b.mtp_qsa_pooled, b.pg, p.qidx, p.ctl, C, eps, rope_of(b.mrope), s);
-        pf_dense(p, L.wk.s, NKVH * HD, N, p.mixed, C, p.k, NKVH * HD, s);
-        pf_dense(p, L.wv.s, NKVH * HD, N, p.mixed, C, p.v, NKVH * HD, s);
-        attn_prep(nullptr, p.k, L.q_norm, L.k_norm, 0, NKVH, p.ctl, C, eps, rope_of(b.mrope), s);
+        if (attn_head_split()) {
+            k_f32_f16<<<grid_for((size_t) C * N), 256, 0, s>>>(p.mixed, (size_t) C * N, p.xh);
+            pf_dense_head_xh(p, L.wk.s, L.wk.n_out, NKVH * HD, c * HD, N, C, p.k, s);
+            pf_dense_head_xh(p, L.wv.s, L.wv.n_out, NKVH * HD, c * HD, N, C, p.v, s);
+        } else {
+            pf_dense(p, L.wk.s, L.wk.n_out, N, p.mixed, C, p.k, L.wk.n_out, s);
+            pf_dense(p, L.wv.s, L.wv.n_out, N, p.mixed, C, p.v, L.wv.n_out, s);
+        }
+        attn_prep(nullptr, p.k, L.q_norm, L.k_norm, 0, attn_projected_kv_heads(), p.ctl, C, eps, rope_of(b.mrope), s);
         kv_append(p.k, p.v, b.mtp_kc, b.mtp_vc, b.pg, b.att_ring.card, C, p.ctl, s);
         ckc(cudaGetLastError(), "draft layer (prompt)");
     }
@@ -1300,6 +1544,8 @@ void Engine::prefill_draft(int C, int set) {
 void Engine::prefill(const std::vector<int>& tokens, int after) {
     if (!pending_.empty() || !rows_pending_.lanes.empty()) throw std::runtime_error("prefill: a window is not committed");
     if (mtp_ && after < 0) throw std::runtime_error("prefill: the draft layer needs the token after the last row");
+    if (pf_[0]->decode_cache && lanes_.size() != 1)
+        throw std::runtime_error("FNX_PF_DECODE_CACHE requires one lane");
     if (pf_[0]->seq >= PF_SEQ_RESET) {
         std::fprintf(stderr, "fnx: prompt ring sequence numbers at %u: flags zeroed, numbers from 0 again\n", pf_[0]->seq);
         pf_seq_reset(0);
@@ -1309,67 +1555,223 @@ void Engine::prefill(const std::vector<int>& tokens, int after) {
     int K = PF_PASS;
     for (const Pf* p : pf_) K = std::min(K, p->pass);
     if (pass_rows_ > 0) K = std::max(1, std::min(K, pass_rows_ / pf_c_));
-    for (int k = 0; k < 2 * K; ++k)
-        if (!pf_emb_[k]) {
-            ckc(cudaMallocHost(&pf_emb_[k], (size_t) pf_c_ * N * sizeof(float)), "pinned emb");
-            own_pinned(pf_emb_[k]);
-            ckc(cudaMallocHost(&pf_ple_[k], (size_t) pf_c_ * N * sizeof(float)), "pinned ple");
-            own_pinned(pf_ple_[k]);
-            ckc(cudaMallocHost(&pf_ctl_[k], (size_t) (1 + (pf_c_ / MAXT)) * 2 * sizeof(int)), "pinned ctl");
-            own_pinned(pf_ctl_[k]);
-            ckc(cudaMallocHost(&pf_after_[k], (size_t) N * sizeof(float)), "pinned after");
-            own_pinned(pf_after_[k]);
+    const int base_K = K;
+    int borrow_K = PF_PASS;
+    bool same_base = true;
+    for (const Pf* p : pf_) {
+        borrow_K = std::min(borrow_K,p->borrow_pass);
+        same_base = same_base && p->pass == base_K;
+    }
+    bool borrowed = false;
+    std::array<int, NCARD> residual_slots{};
+    auto release = [&] {
+        for (int c = 0; c < NCARD; ++c) {
+            if (!residual_slots[c]) continue;
+            auto& p = *pf_[c];
+            auto& b = *cb_[c];
+            ckc(cudaSetDevice(b.dev), "residual cache device");
+            // The caller can cancel between passes. Wait for both streams
+            // before making any of their scratch addresses admissible again.
+            ckc(cudaDeviceSynchronize(), "residual cache users finished");
+            ExpertCache pool = b.static_cache;
+            pool.arena_pool = p.cache_phase ? p.phase_pool : p.residual_pool;
+            arena_slots(pool, residual_slots[c], 0, b.st);
+            ckc(cudaStreamSynchronize(b.st), "residual cache returned");
+            for (int k = p.pass - p.cache_r_chunks; k < p.pass; ++k) p.Rk[k] = nullptr;
+            p.R = p.Rk[0];
+            p.phase_loan_bytes = 0;
+            if (p.cache_carry) {
+                p.bo_a = p.boak[0];
+                p.bo_f = p.bofk[0];
+                for (int k = 1; k < p.pass; ++k) p.boak[k] = p.bofk[k] = nullptr;
+            } else if (p.cache_last_addend) {
+                p.bo_a = p.boak[0]; p.bo_f = p.bofk[0];
+                p.boak[p.pass - 1] = p.bofk[p.pass - 1] = nullptr;
+            }
+            residual_slots[c] = 0;
         }
-    // every pass's rows embedded on the host while the cards run the pass before; passes alternate between the two
-    // halves of the sets
-    const int h0 = (int) history_.size();
-    const auto tok_at = [&](int q) -> int { return q < h0 ? history_[q] : tokens[q - h0]; };
-    const size_t nt = tokens.size();
+        if (!borrowed) return;
+        release_prefill_arena();
+        for (Pf* p : pf_) {
+            p->R=p->Rk[0];p->bo_a=p->boak[0];p->bo_f=p->bofk[0];
+            p->inj_a=p->injak[0];p->inj_f=p->injfk[0];p->ctl=p->ctlk[0];
+            for (int k=base_K;k<borrow_K;++k) p->Rk[k]=p->boak[k]=p->bofk[k]=nullptr;
+        }
+        borrowed=false;
+    };
+    try {
+        for (int c = 0; c < NCARD; ++c) {
+            auto& p = *pf_[c];
+            if (!p.cache_r_chunks && !p.cache_phase) continue;
+            const int permanent = p.pass - p.cache_r_chunks;
+            const int needed = (int) std::min<size_t>(p.pass, (tokens.size() + pf_c_ - 1) / pf_c_);
+            if (needed <= permanent && !p.cache_phase) continue;
+            auto& b = *cb_[c];
+            ExpertCache pool = b.static_cache;
+            const int index = p.cache_phase ? p.phase_pool : p.residual_pool;
+            pool.arena_pool = index;
+            const int r_chunks = std::max(0, needed - permanent);
+            const bool addend = p.cache_last_addend && needed == p.pass;
+            size_t active_phase = 0;
+            int cap = pf_c_;
+            if (p.cache_phase) {
+                cap = std::min(pf_c_, std::max(MAXT, (int) ((tokens.size() + MAXT - 1) / MAXT * MAXT)));
+                active_phase = p.bind_phase(cap, nullptr, p.phase_bytes);
+            }
+            const size_t stride = (size_t) (p.cache_carry ? cap : pf_c_) * D * sizeof(float);
+            const size_t bo_stride = (size_t) (p.cache_carry ? cap : pf_c_) * N * sizeof(float);
+            const int addends = p.cache_carry ? std::max(0, needed - 1) : (int) addend;
+            const auto plan = prefill_cache_borrow(active_phase, r_chunks, stride, addends * bo_stride,
+                                                  pool.slot_bytes[index], pool.n[index]);
+            const int slots = plan.slots;
+            ckc(cudaSetDevice(b.dev), "residual cache device");
+            ckc(cudaDeviceSynchronize(), "residual cache readers finished");
+            int previous = 0;
+            ckc(cudaMemcpy(&previous, pool.lent + index, sizeof(previous), cudaMemcpyDeviceToHost), "residual cache ownership");
+            if (previous) throw std::runtime_error("prefill residual cache pool already lent");
+            arena_slots(pool, 0, slots, b.st);
+            residual_slots[c] = slots;
+            ckc(cudaStreamSynchronize(b.st), "residual cache invalidated");
+            p.phase_loan_bytes = active_phase;
+            char* const scratch = pool.pool[index];
+            for (int k = permanent; k < needed; ++k)
+                p.Rk[k] = reinterpret_cast<float*>(scratch + plan.phase_bytes + (k - permanent) * stride);
+            if (p.cache_carry) {
+                for (int k = 1; k < needed; ++k)
+                    p.bofk[k] = p.boak[k] = reinterpret_cast<float*>(scratch + plan.addend_offset + (k - 1) * bo_stride);
+            } else if (addend) {
+                p.bofk[p.pass - 1] = p.boak[p.pass - 1] = reinterpret_cast<float*>(scratch + plan.addend_offset);
+            }
+            if (c == 0 && env_flag("FNX_PF_TIMING")) {
+                std::fprintf(stderr, "prefill: %d residual chunks in %d slots of independent cache pool %d\n", r_chunks, slots, index);
+                if (p.cache_phase)
+                    std::fprintf(stderr, "prefill: active phase %zu KiB borrowed, %d of %d independent slots unavailable\n",
+                                 active_phase >> 10, slots, pool.n[index]);
+            }
+        }
+        if (staging && same_base && borrow_K>base_K && tokens.size()>(size_t)base_K*pf_c_ &&
+            pos_<=max_ctx_ && tokens.size()<=(size_t)(max_ctx_-pos_)) {
+            const size_t bytes=(size_t)(borrow_K-base_K)*pf_c_*(D+N)*sizeof(float);
+            if (borrow_prefill_arena(bytes,pos_+(int)tokens.size())) {
+                borrowed=true;
+                for (int c=0;c<NCARD;++c) {
+                    Pf& p=*pf_[(size_t)c];
+                    Arena arena{(char*)prefill_arena_data(c),bytes};
+                    for (int k=base_K;k<borrow_K;++k) {
+                        p.Rk[k]=arena.take<float>((size_t)pf_c_*D);
+                        p.bofk[k]=p.boak[k]=arena.take<float>((size_t)pf_c_*N);
+                    }
+                }
+                K=borrow_K;
+                std::fprintf(stderr,"prefill: borrowed %zu MiB per card for %d chunks (base %d); full context remains %d\n",
+                    bytes>>20,K,base_K,max_ctx_);
+            } else if (env_flag("FNX_PF_TIMING")) {
+                std::fprintf(stderr,"prefill: keeping %d chunks; KV ownership leaves no room for borrowed buffers\n",base_K);
+            }
+        }
+        // The internal warm read also prepares a later borrowed pass. This
+        // keeps its extra pinned allocations out of the first long request.
+        const int host_K = same_base ? std::max(K,borrow_K) : K;
+        for (int k = 0; k < 2 * host_K; ++k)
+            if (!pf_emb_[k]) {
+                ckc(cudaMallocHost(&pf_emb_[k], (size_t) pf_c_ * N * sizeof(float)), "pinned emb");
+                own_pinned(pf_emb_[k]);
+                ckc(cudaMallocHost(&pf_ple_[k], (size_t) pf_c_ * N * sizeof(float)), "pinned ple");
+                own_pinned(pf_ple_[k]);
+                ckc(cudaMallocHost(&pf_ctl_[k], (size_t) (1 + (pf_c_ / MAXT)) * 2 * sizeof(int)), "pinned ctl");
+                own_pinned(pf_ctl_[k]);
+                ckc(cudaMallocHost(&pf_after_[k], (size_t) N * sizeof(float)), "pinned after");
+                own_pinned(pf_after_[k]);
+            }
+        // every pass's rows embedded on the host while the cards run the pass before; passes alternate between the two
+        // halves of the sets
+        const int h0 = (int) history_.size();
+        const auto tok_at = [&](int q) -> int { return q < h0 ? history_[q] : tokens[q - h0]; };
+        const size_t nt = tokens.size();
 #if FNX_DF2
-    if (df2_) {   // DFlash2: this read's last kRing positions are tapped into the lane's host ring (the drafter takes them at its first round)
-        Df2Lane& L = df2_lane_[(size_t) cur_];
-        if (!L.ring) {
-            ckc(cudaHostAlloc((void**) &L.ring, (size_t) df2::kRing * df2::kTaps * df2::kNEmbd * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "df2 tap ring");
-            own_pinned(L.ring);
+        if (df2_) {
+            Df2Lane& L = df2_lane_[(size_t) cur_];
+            if (!L.ring) {
+                ckc(cudaHostAlloc((void**) &L.ring, (size_t) df2::kRing * df2::kTaps * df2::kNEmbd * sizeof(float), cudaHostAllocPortable | cudaHostAllocMapped), "df2 tap ring");
+                own_pinned(L.ring);
+            }
+            df2_seg_end_ = h0 + (int) nt;
         }
-        df2_seg_end_ = h0 + (int) nt;
-    }
 #endif
-    // a pass takes K chunks; with the hyper-connection split a short last chunk (not a whole pf_c_ rows) is a pass of its own, so it does not keep the whole chunks
-    // before it from being split
-    const bool lone_tail = pf_[0]->hcs;
-    const int lone_min = (int) env_int("FNX_PF_HCSPLIT_MIN", 3);   // fewer whole chunks than this: the tail stays with them (one pass, the chunks hide each other's sums)
-    auto chunks_of = [&](size_t i0, int half) {
-        std::vector<PfChunk> ch;
-        for (size_t i = i0; i < nt && (int) ch.size() < K; i += pf_c_) {
-            const size_t e = std::min(nt, i + pf_c_);
-            if (lone_tail && (int) ch.size() >= lone_min && e - i != (size_t) pf_c_) break;
-            ch.push_back({std::vector<int>(tokens.begin() + i, tokens.begin() + e), e < nt ? tokens[e] : after, half * K + (int) ch.size()});
+        const bool lone_tail = pf_[0]->hcs;
+        const int lone_min = (int) env_int("FNX_PF_HCSPLIT_MIN", 3);
+        auto chunks_of = [&](size_t i0, int half) {
+            std::vector<PfChunk> ch;
+            for (size_t i = i0; i < nt && (int) ch.size() < K; i += pf_c_) {
+                const size_t e = std::min(nt, i + pf_c_);
+                if (lone_tail && (int) ch.size() >= lone_min && e - i != (size_t) pf_c_) break;
+                ch.push_back({std::vector<int>(tokens.begin() + i, tokens.begin() + e), e < nt ? tokens[e] : after, half * K + (int) ch.size()});
+            }
+            return ch;
+        };
+        auto embed = [&](size_t i0, const std::vector<PfChunk>& ch) {
+            if (ch.empty()) return;
+            static const bool parallel = env_flag("FNX_PF_EMBED_PARALLEL");
+            static const bool check = env_flag("FNX_PF_EMBED_CHECK");
+            const bool use_workers = parallel && lanes_.size()==1 && ch.size()>1;
+            const auto begin = std::chrono::steady_clock::now();
+            size_t starts[PF_PASS], end=i0;
+            for (size_t j=0;j<ch.size();++j) { starts[j]=end;end+=ch[j].tokens.size(); }
+            if (use_workers) {
+                // The existing card workers are idle during host embedding.
+                // They only read stable lane/model/token data here. Each chunk
+                // owns disjoint output buffers; on_cards joins and propagates
+                // worker exceptions before history or lane state can change.
+                on_cards([&](int c) {
+                    for (size_t j=(size_t)c;j<ch.size();j+=NCARD) {
+                        const PfChunk& part=ch[j];
+                        embed_rows(h0+(int)starts[j],(int)part.tokens.size(),tok_at,pf_emb_[part.set],pf_ple_[part.set]);
+                    }
+                });
+            } else {
+                size_t i=i0;
+                for (const PfChunk& c:ch) {
+                    embed_rows(h0+(int)i,(int)c.tokens.size(),tok_at,pf_emb_[c.set],pf_ple_[c.set]);
+                    i+=c.tokens.size();
+                }
+            }
+            const auto done=std::chrono::steady_clock::now();
+            if (check) {
+                std::vector<float> ref_emb((size_t)pf_c_*N),ref_ple(ref_emb.size());
+                size_t i=i0;
+                for (const PfChunk& c:ch) {
+                    embed_rows(h0+(int)i,(int)c.tokens.size(),tok_at,ref_emb.data(),ref_ple.data());
+                    const size_t bytes=c.tokens.size()*N*sizeof(float);
+                    if (std::memcmp(ref_emb.data(),pf_emb_[c.set],bytes) || std::memcmp(ref_ple.data(),pf_ple_[c.set],bytes))
+                        throw std::runtime_error("prefill: parallel embedding differs from serial embedding");
+                    i+=c.tokens.size();
+                }
+                std::fprintf(stderr,"prefill: %zu embedding rows match serial bytes\n",end-i0);
+            }
+            if (env_flag("FNX_PF_TIMING"))
+                std::fprintf(stderr,"prefill host embeddings: %zu rows, %d workers, %.1f ms\n",end-i0,
+                    use_workers?(int)std::min<size_t>(NCARD,ch.size()):1,std::chrono::duration<double,std::milli>(done-begin).count());
+        };
+        std::vector<PfChunk> ch = chunks_of(0, 0);
+        embed(0, ch);
+        for (size_t i = 0, k = 0; i < nt; ++k) {
+            size_t cov = 0;
+            for (const PfChunk& c : ch) cov += c.tokens.size();
+            std::vector<PfChunk> next = chunks_of(i + cov, (int) ((k + 1) & 1));
+            prefill_pass(ch, staging, [&] { embed(i + cov, next); });
+            size_t e = i;
+            for (const PfChunk& c : ch) {
+                e += c.tokens.size();
+                if (on_prefill_chunk) on_prefill_chunk((int) e);
+            }
+            i += cov;
+            ch = std::move(next);
         }
-        return ch;
-    };
-    auto embed = [&](size_t i0, const std::vector<PfChunk>& ch) {
-        size_t i = i0;
-        for (const PfChunk& c : ch) {
-            embed_rows(h0 + (int) i, (int) c.tokens.size(), tok_at, pf_emb_[c.set], pf_ple_[c.set]);
-            i += c.tokens.size();
-        }
-    };
-    std::vector<PfChunk> ch = chunks_of(0, 0);
-    embed(0, ch);
-    for (size_t i = 0, k = 0; i < nt; ++k) {
-        size_t cov = 0;
-        for (const PfChunk& c : ch) cov += c.tokens.size();
-        std::vector<PfChunk> next = chunks_of(i + cov, (int) ((k + 1) & 1));
-        prefill_pass(ch, staging, [&] { embed(i + cov, next); });
-        size_t e = i;
-        for (const PfChunk& c : ch) {
-            e += c.tokens.size();
-            if (on_prefill_chunk) on_prefill_chunk((int) e);
-        }
-        i += cov;
-        ch = std::move(next);
+    } catch (...) {
+        release();
+        throw;
     }
+    release();
 }
 
 #if FNX_DF2
@@ -1396,6 +1798,16 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
     for (int j = 0; j < nk; ++j) pos0[(size_t) j] = pos_ + rows, rows += (int) chunks[(size_t) j].tokens.size();
     if (pos_ + rows > max_ctx_) throw Refused("prefill: context full");
     ensure_pages(pos_ + rows);
+    if (pf_[0]->compact_phase) {
+        int active_capacity = MAXT;
+        for (const auto& chunk : chunks)
+            active_capacity = std::max(active_capacity, ((int) chunk.tokens.size() + MAXT - 1) / MAXT * MAXT);
+        for (int c = 0; c < NCARD; ++c) {
+            Pf& p = *pf_[c];
+            ckc(cudaSetDevice(cb_[c]->dev), "phase view device");
+            p.bind_phase(active_capacity, p.phase_base, p.cache_phase ? p.phase_loan_bytes : p.phase_bytes);
+        }
+    }
     const float eps = m_.eps;
     // each chunk's (position, tag) and each group's: a tag per group, so the recurrent history's parity steps per group
     for (int j = 0; j < nk; ++j) {
@@ -1449,9 +1861,12 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
             if (p->hcs) p->mixed = p->mixedk[hs ? j : 0];
         }
     };
+    each([&](int, CardBuf& b, const CardW&, Pf& p) {
+        if (p.cache_check) ckc(cudaMemsetAsync(p.cache_check,0,3*sizeof(unsigned long long),b.st),"cache check reset");
+    });
     // with an ExpertCache: the pass's expert tables, each layer's experts not in a slot at stage[l & 1] (as many as
     // fit, in expert order; the rest in place), the others in their slots
-    if (staging)
+    if (staging && !pf_[0]->static_stage)
         each([&](int, CardBuf& b, const CardW& w, Pf& p) {
             const ExpertCache& ec = w.ec;
             ckc(cudaMemcpyAsync(p.slot_h, ec.slot_of, (size_t) NL * NEXP * sizeof(int), cudaMemcpyDeviceToHost, b.st), "slots");
@@ -1510,7 +1925,12 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
             k_pf_streams<<<grid_for((size_t) C * D), 256, 0, b.st>>>(p.xf, p.R, C);
         });
     }
-    if (staging) stage_in(0);
+    if (staging && !pf_[0]->selective_stage) stage_in(0);
+    if (staging && pf_[0]->selective_stage)
+        each([&](int, CardBuf& b, const CardW&, Pf& p) {
+            if (p.routed_dma) p.dma_moved = p.dma_batches = p.dma_fallbacks = 0;
+            else ckc(cudaMemsetAsync(p.stage_moved, 0, sizeof(*p.stage_moved), b.st), "stage counter");
+        });
     const auto t_up = std::chrono::steady_clock::now();
     // FNX_PF_OVERLAP: a half's sum goes round the ring on ring_st once its output is ready (and the routed experts' addend,
     // made here: the next chunk's experts reuse their buffers), while the pass's next chunk computes; `done` marks it
@@ -1591,8 +2011,37 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
             ckc(cudaMemcpyAsync(p.xh, p.mixhk[j], (size_t) C * N * sizeof(__half), cudaMemcpyDeviceToDevice, b.st), "mixh");
         } else k_f32_f16<<<grid_for((size_t) C * N), 256, 0, b.st>>>(p.mixed, (size_t) C * N, p.xh);
     };
+    auto shared_expert = [&](CardBuf& b, const CardW& w, Pf& p, int l) {
+        const LayerW& L = w.L[l];
+        const int ffs = w.ff1 - w.ff0, P = C * TOPK;
+        cudaStream_t s = b.st;
+        pf_dense_xh(p, L.sh_gu.s, 2 * ffs, N, C, p.shg, 2 * ffs, s);
+        k_pf_swiglu<<<grid_for((size_t) C * ffs), 256, 0, s>>>(p.shg, ffs, C, p.shh);
+        k_q8s_f16<<<grid_for((size_t) N * ffs), 256, 0, s>>>(L.sh_down.s.q, L.sh_down.s.d, (size_t) N * ffs, p.wh);
+        pf_gemm(p, p.wh, N, ffs, p.shh, C, p.part + (size_t) P * N, N, s);
+    };
+    auto routed_experts = [&](CardBuf& b, const CardW& w, Pf& p, int l, const DW& gu, const DW& down) {
+        const LayerW& L = w.L[l];
+        if (p.moe_q8) {
+            moe_gate_up_big(gu, L.gu_e_stride, p.jobs_gu, p.njobs, pf_jobs_, p.xq, p.gu, b.st);
+            moe_down_big(down, L.down_e_stride, p.jobs_dn, p.njobs, pf_jobs_, p.gu, p.part, b.st);
+        } else {
+#if FNX_HIP
+            if (p.moe_fused) {
+                if (!moe_gate_up_swiglu_mma(gu, L.gu_e_stride, p.jobs_gu, p.njobs, pf_jobs_,
+                                           reinterpret_cast<const uint16_t*>(p.xh), p.h16, b.st))
+                    throw std::runtime_error("prefill: fused gate/up geometry changed after allocation");
+            } else
+#endif
+            {
+            moe_gate_up_mma(gu, L.gu_e_stride, p.jobs_gu, p.njobs, pf_jobs_, reinterpret_cast<const uint16_t*>(p.xh), p.gu, b.st);
+            swiglu_h16(p.gu, w.ff1 - w.ff0, C * TOPK, p.h16, b.st);
+            }
+            moe_down_mma(down, L.down_e_stride, p.jobs_dn, p.njobs, pf_jobs_, p.h16, p.part, b.st);
+        }
+    };
     for (int l = 0; l < NL; ++l) {
-        if (staging && l + 1 < NL - 1) stage_in(l + 1);   // the last layer runs no experts
+        if (staging && !pf_[0]->selective_stage && l + 1 < NL - 1) stage_in(l + 1);   // the last layer runs no experts
 #if FNX_DF2
         // DFlash2: layer l - 1's completed output (its FFN half's sum folded into R as the next read would) is the tap of the rows of the last kRing positions of
         // this read. Before this layer's reads fold the sum into R; in the split read (HCSPLIT) a card holds the sums of its own rows only and taps those
@@ -1658,10 +2107,17 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
                 } else {
                     finish_att(c, b, w, p, l);   // the previous chunk's, before qg is this chunk's
                     // mixed to f16 again (finish_att's wo used xh), then k and v from that
-                    pf_dense(p, L.wq.s, NQH * 2 * HD, N, p.mixed, C, p.qg, NQH * 2 * HD, s);
-                    pf_dense_xh(p, L.wk.s, NKVH * HD, N, C, p.k, NKVH * HD, s);
-                    pf_dense_xh(p, L.wv.s, NKVH * HD, N, C, p.v, NKVH * HD, s);
-                    attn_prep(p.qg, p.k, L.q_norm, L.k_norm, NQH, NKVH, p.ctl, C, eps, rope_of(b.mrope), s);
+                    if (attn_head_split()) {
+                        k_f32_f16<<<grid_for((size_t) C * N), 256, 0, s>>>(p.mixed, (size_t) C * N, p.xh);
+                        pf_dense_head_xh(p, L.wq.s, L.wq.n_out, NQH * 2 * HD, w.q0 * 2 * HD, N, C, p.qg, s);
+                        pf_dense_head_xh(p, L.wk.s, L.wk.n_out, NKVH * HD, w.kv0 * HD, N, C, p.k, s);
+                        pf_dense_head_xh(p, L.wv.s, L.wv.n_out, NKVH * HD, w.kv0 * HD, N, C, p.v, s);
+                    } else {
+                        pf_dense(p, L.wq.s, L.wq.n_out, N, p.mixed, C, p.qg, L.wq.n_out, s);
+                        pf_dense_xh(p, L.wk.s, L.wk.n_out, N, C, p.k, L.wk.n_out, s);
+                        pf_dense_xh(p, L.wv.s, L.wv.n_out, N, C, p.v, L.wv.n_out, s);
+                    }
+                    attn_prep(p.qg, p.k, L.q_norm, L.k_norm, attn_projected_q_heads(), attn_projected_kv_heads(), p.ctl, C, eps, rope_of(b.mrope), s);
                     kv_append(p.k, p.v, b.kc[l], b.vc[l], b.pg, b.att_ring.card, C, p.ctl, s);
                     // the indexer: bf16 projections as f32 (llama.cpp's choice past 8 rows on a V100)
                     k_bf16_f32<<<grid_for((size_t) 512 * N), 256, 0, s>>>(L.idx_wq, (size_t) 512 * N, p.widx);
@@ -1675,17 +2131,21 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
                         const int r0 = g * AR, Tg = std::min(AR, C - r0);
                         const int* gctl = p.ctl + 2 + 2 * (r0 / MAXT);
                         qsa_select(p.qidx + (size_t) r0 * 512, b.qsa_pooled[l], b.pg, p.scores, p.cells + (size_t) r0 * qsa_maxsel(),
-                                   p.ncells + r0, max_ctx_ / 4, gctl, Tg, b.att_ring.card, s);
+                                   p.ncells + r0, max_ctx_ / 4, gctl, Tg, b.att_ring.card, s, C);
                         if (!p.attn_dec) continue;
-                        attn(p.qg + (size_t) r0 * NQH * 2 * HD, b.kc[l], b.vc[l], b.pg, p.att + (size_t) r0 * w.nq * HD, b.att_ring,
+                        attn(p.qg + (size_t) r0 * attn_projected_q_heads() * 2 * HD, b.kc[l], b.vc[l], b.pg, p.att + (size_t) r0 * w.nq * HD, b.att_ring,
                              (const unsigned*) (gctl + 1), 128 + l, gctl, Tg, b.att_part, s, p.cells + (size_t) r0 * qsa_maxsel(),
-                             p.ncells + r0);
+                             p.ncells + r0, C);
                     }
-                    if (!p.attn_dec && p.overlap) {
+                    if (!p.attn_dec && p.overlap && !attn_head_split()) {
                         pf_attn_start(p, b, b.kc[l], b.vc[l], c, C, j & 1, s);   // merged by finish_att
                         p.att_pend = j, p.att_pend_rows = C;
                     } else {
-                        if (!p.attn_dec) pf_attention(p, b, b.kc[l], b.vc[l], c, C, s);
+                        if (!p.attn_dec) {
+                            if (attn_head_split()) attn_prompt_heads(p.qg, b.kc[l], b.vc[l], b.pg, p.ctl, p.cells, p.ncells,
+                                c, C, p.apart[0], p.att, s);
+                            else pf_attention(p, b, b.kc[l], b.vc[l], c, C, s);
+                        }
                         pf_dense(p, L.wo.s, N, w.nq * HD, p.att, C, p.bo_a, N, s);
                     }
                 }
@@ -1694,7 +2154,7 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
             each([&](int c, CardBuf& b, const CardW&, Pf& p) {
                 if (p.ring_sm) ring_sum(p.ring, p.bo_a, C, (const unsigned*) (p.ctl + 1), 2 * l, b.st);
                 else if (p.overlap) {
-                    if (!is_attn(l) || p.attn_dec) ring_async(c, b, p, p.bo_a, nullptr, j, p.ev_ra[j], C, hs && l >= PLE_LAYER);   // else finish_att's
+                    if (!is_attn(l) || p.attn_dec || attn_head_split()) ring_async(c, b, p, p.bo_a, nullptr, j, p.ev_ra[j], C, hs && l >= PLE_LAYER);   // else finish_att's
                 } else pf_ring(p, c, p.bo_a, C, nullptr, b.ring.err, b.st);
             });
         }
@@ -1731,34 +2191,116 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
                 DW gu_e = L.gu_e, down_e = L.down_e;
                 if (staging) {
                     gu_e.ep = p.ep_gu + (size_t) l * NEXP, down_e.ep = p.ep_dn + (size_t) l * NEXP;
-                    if (j == 0) ckc(cudaStreamWaitEvent(s, p.ev_ready[l & 1], 0), "stage in");
+                    if (j == 0 && !p.selective_stage) ckc(cudaStreamWaitEvent(s, p.ev_ready[l & 1], 0), "stage in");
+                } else if (p.decode_cache) {
+                    // ensure_pages ran before this pass. Any slots lent to K/V
+                    // already point back to host weights in these current tables.
+                    // The one-lane prompt owns the engine until its streams finish;
+                    // no decoder can replace a slot while these kernels read it.
+                    // Keep the tables live: retaining individual slot pointers
+                    // between passes would become stale after cache replacement.
+                    gu_e.ep = b.static_cache.ep_gu + (size_t)l*NEXP;
+                    down_e.ep = b.static_cache.ep_dn + (size_t)l*NEXP;
                 }
                 if (sf) swap_join(b, p, j);
                 else pf_hc_read(p, p.R, p.bo_a, p.inj_a, L.hc_norm[1], L.hc_down[1], L.hc_up[1], L.hc_inj[1], eps, p.mixed, p.inj_f, C, s);
                 if (p.moe_q8) quantize_q8_1(p.mixed, p.xq, N, C, s);   // else xh holds the hc read's f16 of mixed
-                pf_sgemm(p, L.router, NEXP + 1, N, p.mixed, C, p.logits, NEXP + 1);
+                // Reuse the indexer conversion buffer (640 rows), now idle on this
+                // same stream. SGEMM receives exactly the original FP32 router bits.
+                const float* router = L.router;
+                if (L.router_bf16) {
+                    k_bf16_f32<<<grid_for((size_t) (NEXP + 1) * N), 256, 0, s>>>(L.router_bf16, (size_t) (NEXP + 1) * N, p.widx);
+                    router = p.widx;
+                }
+                pf_sgemm(p, router, NEXP + 1, N, p.mixed, C, p.logits, NEXP + 1);
                 k_pf_top10<<<(C + 7) / 8, 256, 0, s>>>(p.logits, C, p.topi, p.topw);
                 ckc(cudaMemsetAsync(p.cnt, 0, NEXP * 4, s), "cnt");
                 k_pf_count<<<(P + 255) / 256, 256, 0, s>>>(p.topi, P, p.cnt);
                 if (b.route_cnt) route_count(p.topi, P, b.route_cnt + (size_t) (NL + l) * NEXP, s);
                 k_pf_jobbase<<<1, NEXP, 0, s>>>(p.cnt, p.jbase, p.njobs);
                 k_pf_fill<<<NEXP, PF_FILL_THREADS, 0, s>>>(p.topi, P, p.cnt, p.jbase, p.jobs_gu, p.jobs_dn);
-                if (p.moe_q8) {
-                    moe_gate_up_big(gu_e, L.gu_e_stride, p.jobs_gu, p.njobs, pf_jobs_, p.xq, p.gu, s);
-                    moe_down_big(down_e, L.down_e_stride, p.jobs_dn, p.njobs, pf_jobs_, p.gu, p.part, s);
-                } else {
-                    moe_gate_up_mma(gu_e, L.gu_e_stride, p.jobs_gu, p.njobs, pf_jobs_, reinterpret_cast<const uint16_t*>(p.xh), p.gu, s);
-                    swiglu_h16(p.gu, ffs, P, p.h16, s);
-                    moe_down_mma(down_e, L.down_e_stride, p.jobs_dn, p.njobs, pf_jobs_, p.h16, p.part, s);
+                if (p.cache_check && (!staging || (p.selective_stage && !p.routed_dma && !p.routed_overlap)))
+                    k_pf_cache_check<<<dim3(2,NEXP),256,0,s>>>(L.gu_e.ep,L.down_e.ep,
+                        b.static_cache.ep_gu+(size_t)l*NEXP,b.static_cache.ep_dn+(size_t)l*NEXP,
+                        p.cnt,L.gu_e_stride,L.down_e_stride,p.cache_check);
+                if (staging && p.routed_dma) {
+                    // Issue both cards' routers before waiting for either. The
+                    // small readback completes ahead of independent shared work.
+                    ckc(cudaMemcpyAsync(p.route_host, p.cnt, NEXP * sizeof(int), cudaMemcpyDeviceToHost, s), "route readback");
+                    ckc(cudaEventRecord(p.route_done, s), "route ready");
+                    shared_expert(b, w, p, l);
+                    return;
                 }
-                if (staging && j == nk - 1) ckc(cudaEventRecord(p.ev_done[l & 1], s), "stage done");
+                if (staging && p.routed_overlap) {
+                    // The strata branch overlaps uploads with independent
+                    // shared work. Keep TP's routing on the GPU, and use fewer
+                    // copy blocks so that work can occupy the remaining CUs.
+                    ckc(cudaEventRecord(p.route_done, s), "routed copy producer");
+                    ckc(cudaStreamWaitEvent(p.cs, p.route_done, 0), "routed copy stage reuse");
+                    if (j == 0) ckc(cudaMemsetAsync(p.stage_ready, 0, NEXP, p.cs), "stage readiness");
+                    static_prefill_copy(L.gu_e.ep, L.down_e.ep, gu_e.ep, down_e.ep, p.cnt, p.stage_ready,
+                        L.gu_e_stride, L.down_e_stride, NEXP, p.stage_moved, p.cs, p.copy_blocks);
+                    ckc(cudaEventRecord(p.ev_ready[0], p.cs), "routed copy ready");
+                    shared_expert(b, w, p, l);
+                    ckc(cudaStreamWaitEvent(s, p.ev_ready[0], 0), "routed copy consume");
+                    routed_experts(b, w, p, l, gu_e, down_e);
+                    ckc(cudaGetLastError(), "overlapped routed ffn");
+                    return;
+                }
+                if (staging && p.selective_stage) {
+                    if (j == 0) ckc(cudaMemsetAsync(p.stage_ready, 0, NEXP, s), "stage readiness");
+                    // Mode 2 may use the same current decode-cache sources as a
+                    // direct small read. Cache misses still point at immutable
+                    // host weights. Copying both kinds into our separate stage
+                    // preserves its existing lifetime/ready protocol and avoids
+                    // retaining individual cache-slot addresses between passes.
+                    const char* const* src_gu = p.decode_cache ? b.static_cache.ep_gu+(size_t)l*NEXP : L.gu_e.ep;
+                    const char* const* src_dn = p.decode_cache ? b.static_cache.ep_dn+(size_t)l*NEXP : L.down_e.ep;
+                    static_prefill_copy(src_gu, src_dn, gu_e.ep, down_e.ep, p.cnt, p.stage_ready,
+                                        L.gu_e_stride, L.down_e_stride, NEXP, p.stage_moved, s, p.copy_blocks);
+                }
+                routed_experts(b, w, p, l, gu_e, down_e);
+                if (staging && !p.selective_stage && j == nk - 1) ckc(cudaEventRecord(p.ev_done[l & 1], s), "stage done");
                 // the shared expert: rows P + t of part
-                pf_dense_xh(p, L.sh_gu.s, 2 * ffs, N, C, p.shg, 2 * ffs, s);   // xh: still the f16 of mixed
-                k_pf_swiglu<<<grid_for((size_t) C * ffs), 256, 0, s>>>(p.shg, ffs, C, p.shh);
-                k_q8s_f16<<<grid_for((size_t) N * ffs), 256, 0, s>>>(L.sh_down.s.q, L.sh_down.s.d, (size_t) N * ffs, p.wh);
-                pf_gemm(p, p.wh, N, ffs, p.shh, C, p.part + (size_t) P * N, N, s);
+                shared_expert(b, w, p, l);
                 ckc(cudaGetLastError(), "ffn");
             });
+            if (staging && pf_[0]->routed_dma)
+                each([&](int, CardBuf& b, const CardW& w, Pf& p) {
+                    const LayerW& L = w.L[l];
+                    ckc(cudaEventSynchronize(p.route_done), "route readback done");
+                    if (j == 0) std::fill(p.dma_ready.begin(), p.dma_ready.end(), 0);
+                    const size_t off = (size_t) l * NEXP;
+                    auto plan = routed_prefill_transfers(p.dma_gu.data() + off, p.dma_dn.data() + off,
+                        p.ep_hgu + off, p.ep_hdn + off, p.route_host, p.dma_ready, L.gu_e_stride, L.down_e_stride);
+                    if (!plan.copies.empty()) {
+                        // This also protects the one stage from the preceding
+                        // layer's last reader, without reserving a second stage.
+                        ckc(cudaStreamWaitEvent(p.cs, p.route_done, 0), "routed DMA stage reuse");
+                        std::vector<void*> dsts, srcs;
+                        std::vector<size_t> sizes;
+                        for (const auto& cp : plan.copies) {
+                            dsts.push_back(cp.dst); srcs.push_back(const_cast<char*>(cp.src)); sizes.push_back(cp.n);
+                        }
+                        bool used_batch = false;
+                        const cudaError_t copied = strata::prefill::hip_batch_copy::enqueue(
+                            dsts.data(), srcs.data(), sizes.data(), sizes.size(), p.cs, nullptr, &used_batch);
+                        if (copied != cudaSuccess) {
+                            (void) cudaStreamSynchronize(p.cs);
+                            ckc(copied, "routed DMA enqueue");
+                        }
+                        ckc(cudaEventRecord(p.ev_ready[0], p.cs), "routed DMA ready");
+                        ckc(cudaStreamWaitEvent(b.st, p.ev_ready[0], 0), "routed DMA consume");
+                        for (int e : plan.experts) p.dma_ready[e] = 1;
+                        p.dma_moved += plan.bytes;
+                        ++p.dma_batches;
+                        if (!used_batch) ++p.dma_fallbacks;
+                    }
+                    DW gu = L.gu_e, down = L.down_e;
+                    gu.ep = p.ep_gu + off; down.ep = p.ep_dn + off;
+                    routed_experts(b, w, p, l, gu, down);
+                    ckc(cudaGetLastError(), "routed DMA ffn");
+                });
             each([&](int c, CardBuf& b, const CardW&, Pf& p) {
                 RingMoe m;
                 m.part = p.part;
@@ -1787,7 +2329,7 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
     unsigned err = 0;
     // bounded: a copy-engine ring step waits on its flag without a timeout of its own
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
-    each([&](int, CardBuf& b, const CardW&, Pf&) {
+    each([&](int c, CardBuf& b, const CardW&, Pf& p) {
         for (;;) {
             const cudaError_t q = cudaStreamQuery(b.st);
             if (q == cudaSuccess) break;
@@ -1799,6 +2341,12 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
         unsigned e = 0;
         ckc(cudaMemcpy(&e, b.ring.err, 4, cudaMemcpyDeviceToHost), "err");
         err |= e;
+        if (p.cache_check) {
+            unsigned long long stats[3]={};
+            ckc(cudaMemcpy(stats,p.cache_check,sizeof(stats),cudaMemcpyDeviceToHost),"cache byte check");
+            if (stats[0]) throw std::runtime_error("prefill: decode cache weight bytes differ from immutable model weights");
+            std::fprintf(stderr,"prefill cache check: card %d, %llu routed cached experts, %llu bytes exact\n",c,stats[1],stats[2]);
+        }
     });
     if (err) throw std::runtime_error("prefill: ring error " + std::to_string(err));
     const auto t_main = std::chrono::steady_clock::now();
@@ -1836,8 +2384,18 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
                      std::chrono::duration<double, std::milli>(t_enq - t_pass).count(),
                      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_main).count());
         if (staging)
-            for (int c = 0; c < NCARD; ++c)
+            for (int c = 0; c < NCARD; ++c) {
+                if (pf_[c]->selective_stage) {
+                    ckc(cudaSetDevice(cb_[c]->dev), "stage counter device");
+                    unsigned long long moved = 0;
+                    if (pf_[c]->routed_dma) moved = pf_[c]->dma_moved;
+                    else ckc(cudaMemcpy(&moved, pf_[c]->stage_moved, sizeof(moved), cudaMemcpyDeviceToHost), "stage counter read");
+                    pf_[c]->staged = (size_t) moved;
+                }
                 std::fprintf(stderr, "; card %d experts %zu MiB copied in, %zu MiB read in place", c, pf_[c]->staged >> 20, pf_[c]->in_place >> 20);
+                if (pf_[c]->routed_dma)
+                    std::fprintf(stderr, " (%llu DMA batches, %llu individual fallbacks)", pf_[c]->dma_batches, pf_[c]->dma_fallbacks);
+            }
         std::fprintf(stderr, "\n");
     }
 }

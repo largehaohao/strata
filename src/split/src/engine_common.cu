@@ -672,7 +672,7 @@ void Engine::commit(int n) {
             int k = 0;
             for (int l = 0; l < NL; ++l) {
                 if (is_attn(l)) continue;
-                jobs[k++] = {b.S[l], b.snap[l] + (size_t) (n - 1) * w.nv() * HS * HS, sbytes};
+                if (!gdn_replay_) jobs[k++] = {b.S[l], b.snap[l] + (size_t) (n - 1) * w.nv() * HS * HS, sbytes};
                 jobs[k++] = {b.chist[l] + wrote * hfloats, b.hsnap[l] + (size_t) (n - 1) * hfloats, hfloats * 4};
             }
             k += hist_jobs(jobs + k, b, nullptr, (size_t) (n - 1));
@@ -681,6 +681,7 @@ void Engine::commit(int n) {
                     throw std::runtime_error("commit: a copy not 16-byte aligned");
             ck(cudaMemcpyAsync(b.commit_jobs, jobs, (size_t) k * sizeof(CopyJob), cudaMemcpyHostToDevice, b.st), "commit jobs");
             ck(cudaEventRecord(b.commit_ev, b.st), "commit event");
+            if (gdn_replay_) gdn_replay(b.gdn_replay_jobs, b.gdn_replay_layers, w.nv(), n, b.st);
             copy_many(b.commit_jobs, k, b.st);
         });
     }
@@ -1057,6 +1058,7 @@ std::vector<int> Engine::verify_rows(const std::vector<int>& lanes, const std::v
         T += k;
     }
     if (T > MAXT || (int) tokens.size() != T) throw std::runtime_error("verify_rows: at most MAXT rows in all, a token each");
+    if (gdn_replay_ && T > 1) throw std::runtime_error("FNX_GDN_REPLAY uses single-lane verify(), not batched draft windows");
     if (!pending_.empty() || !rows_pending_.lanes.empty()) throw std::runtime_error("verify_rows: the last window is not committed");
     for (int i = 0; i < nl; ++i) {
         if (lanes[i] < 0 || lanes[i] >= (int) lanes_.size()) throw std::runtime_error("verify_rows: no lane " + std::to_string(lanes[i]));
@@ -1380,6 +1382,15 @@ int Engine::draft(int T, bool from_main, int src_row, const std::vector<int>& to
     return draft_rows(src, T, tokens, pos0, pen, cands);
 }
 
+int mtp_head_mode() {
+    static const long long mode = env_int("FNX_MTP_HEAD_MODE", 0);
+    if (mode < 0 || mode > 3) throw std::runtime_error("FNX_MTP_HEAD_MODE: expected 0..3");
+#if !FNX_HIP || FNX_NCARD != 2 || FNX_27B
+    if (mode) throw std::runtime_error("FNX_MTP_HEAD_MODE requires two-card HIP Flash-Next");
+#endif
+    return (int) mode;
+}
+
 int Engine::draft_rows(const std::vector<const float*>& src, int T, const std::vector<int>& tokens, int pos0,
                        const Penalties::Row* pen, bool cands) {
     if (!mtp_) throw std::runtime_error("draft: no draft layer attached");
@@ -1411,7 +1422,9 @@ int Engine::draft_rows(const std::vector<const float*>& src, int T, const std::v
     } else {
         for (int c = 0; c < NCARD; ++c) h_.mtp_pen[(size_t) c * (1 + 2 * PEN_CAP)] = 0;
     }
-    const std::vector<int> key = graph_key({cur_});
+    mtp_head_mode_ = !pen && !cands ? mtp_head_mode() : 0;
+    auto key = graph_key({cur_});
+    key.push_back(mtp_head_mode_);  // changing to sampled/penalized drafts recaptures full scores
     if (cb_[0]->mtp_graphs[T].key != key || !cb_[0]->mtp_graphs[T].exec) {   // capturing queues no work
         const auto tc = std::chrono::steady_clock::now();
         for (CardBuf* b : cb_) {

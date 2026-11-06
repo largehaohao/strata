@@ -21,6 +21,25 @@ bool strata_wmma_gemm_f16(const uint16_t* X, const uint16_t* W, float* Y,
 /// T >= 64, N >= 512; the 128 x 256 / 128 x 128 grouped-order WMMA kernel. False (nothing launched) otherwise / off gfx11.
 bool strata_pf_gemm_f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                         float beta, void* stream = nullptr);
+/// Opt-in narrow projection using the same FP32 kernel: 1 <= N < 512, T >= 64,
+/// K a positive multiple of 32. The existing wide GEMM dispatch is unchanged.
+bool strata_pf_gemm_narrow_f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K,
+                               int64_t ldy, void* stream = nullptr);
+bool strata_pf_gemm_narrow_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t* W, int64_t ldw, float* Y,
+                                  int64_t T, int64_t N, int64_t K, int64_t ldy, void* stream = nullptr);
+// Contiguous FP16 inputs, FP32 output. Uses the verified gfx1100 GSU3 order
+// for HC down at 16..63 prompt rows; returns false for unsupported shapes.
+bool strata_pf_hcdown_gsu3_f16(const uint16_t* x, const uint16_t* w, float* y, int rows, int n, int k, int ldy,
+                              void* stream = nullptr);
+// Small-row GDN, attention and shared-expert projections using the same
+// three-part FP32 order. Other matrix shapes fall back to the caller.
+bool strata_pf_wide_gsu3_f16(const uint16_t* x, const uint16_t* w, float* y, int rows, int n, int k, int ldy,
+                            void* stream = nullptr);
+// Split Q8 input weights. Dequantization rounds every weight to FP16 before
+// the same ordered FP32 product. A head shard keeps its original matrix shape
+// and column offset for the reference kernel's stagger along K.
+bool strata_pf_q8_gsu3_f16(const uint16_t* x, const int8_t* q, const uint16_t* d, float* y,
+                           int rows, int n, int k, int ldy, int reference_n, int first_column, void* stream = nullptr);
 /// The same with row strides ldx >= K and ldw >= K (multiples of 8): a 4 KB-multiple row stride (K 2048 / 4096 /
 /// 6144) camps on the memory channels, K + 64 does not (S23 gemm_probe7/8: K 6144 19 -> 35 TFLOPS).
 /// S23 (STRATA_PF_HCDOWN=1): lo[t, n] = sum_k X[t, k] Wd[n, k] (n < nd) and inj[t, n] = sum_k X[t, k] Wi[n, k]
@@ -41,6 +60,11 @@ bool strata_pf_hcdown_exact_bf16(const uint16_t* X, int64_t ldx, const uint16_t*
                                  int64_t K, void* stream = nullptr);
 bool strata_pf_gemm_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t* W, int64_t ldw, float* Y, int64_t T,
                            int64_t N, int64_t K, int64_t ldy, float beta, void* stream = nullptr);
+/// HC up projection followed by the ordered mean of four gated residual
+/// streams. X is T x K, W is N x K (FP16); R/norm/rms are FP32. Y/Yh are
+/// T x (N/4), FP32/FP16. N=10240, K=320, T>=64 on gfx11 only.
+bool strata_pf_hcup_mix_f16(const uint16_t* X, const uint16_t* W, const float* R, const float* norm, const float* rms,
+                            float* Y, uint16_t* Yh, int64_t T, int64_t N, int64_t K, void* stream = nullptr);
 /// True when the products above can run on the current device (the gfx11 matrix cores).  Host code that pads an
 /// activation's row stride for them (STRATA_PF_PAD, prefill.cpp) must ask this first: on another card no kernel takes
 /// a padded X, and Gemm::native would have to copy the rows unpadded.

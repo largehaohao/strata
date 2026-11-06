@@ -24,6 +24,75 @@ __device__ __forceinline__ void mq_zero32(__half* dst) {
     mq_put32(dst, z);
 }
 
+// Unsloth Dynamic v3.1 keeps IQ2_XXS gate/up experts and a Q5_0 down layer.
+// Read their original blocks; the prompt operands are ggml's dequantized values
+// rounded once to FP16, as for the other expert formats below.
+template <> struct MmTile<GGML_TYPE_IQ2_XXS> {
+    uint32_t codes, aux;
+    uint16_t dh;
+    bool live, item;
+    __device__ __forceinline__ void fetch(const char* we, size_t row_a, int nrows, int row0, int k0, int kc) {
+        const int r = threadIdx.x / MM_TPR, u = threadIdx.x % MM_TPR;
+        item = u * 32 < kc;
+        live = item && row0 + r < nrows;
+        if (live) {
+            const uint8_t* b = (const uint8_t*) we + (size_t) (row0 + r) * row_a + (size_t) (k0 / 256) * 66;
+            const int ib = (k0 % 256) / 32 + u;
+            dh = (uint16_t) mq_ld16(b);
+            codes = mq_ld32(b + 2 + ib * 8);
+            aux = mq_ld32(b + 6 + ib * 8);
+        }
+    }
+    __device__ __forceinline__ void put(int, int, __half* sw) const {
+        if (!item) return;
+        __half* dst = sw + threadIdx.x / MM_TPR * MM_LD + threadIdx.x % MM_TPR * 32;
+        if (!live) { mq_zero32(dst); return; }
+        const float d = mq_half(dh) * (0.5f + (aux >> 28)) * 0.25f;
+        float f[32];
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const uint8_t* grid = (const uint8_t*) (iq2xxs_grid + ((codes >> (8 * l)) & 255));
+            const uint8_t signs = ksigns_iq2xs[(aux >> (7 * l)) & 127];
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                f[8 * l + j] = d * grid[j] * ((signs & kmask_iq2xs[j]) ? -1.f : 1.f);
+        }
+        mq_put32(dst, f);
+    }
+};
+
+template <> struct MmTile<GGML_TYPE_Q5_0> {
+    uint16_t dh;
+    uint32_t high, q[4];
+    bool live, item;
+    __device__ __forceinline__ void fetch(const char* we, size_t row_a, int nrows, int row0, int k0, int kc) {
+        const int r = threadIdx.x / MM_TPR, u = threadIdx.x % MM_TPR;
+        item = u * 32 < kc;
+        live = item && row0 + r < nrows;
+        if (live) {
+            const uint8_t* b = (const uint8_t*) we + (size_t) (row0 + r) * row_a + (size_t) (k0 / 32 + u) * 22;
+            dh = (uint16_t) mq_ld16(b);
+            high = mq_ld32(b + 2);
+#pragma unroll
+            for (int l = 0; l < 4; ++l) q[l] = mq_ld32(b + 6 + 4 * l);
+        }
+    }
+    __device__ __forceinline__ void put(int, int, __half* sw) const {
+        if (!item) return;
+        __half* dst = sw + threadIdx.x / MM_TPR * MM_LD + threadIdx.x % MM_TPR * 32;
+        if (!live) { mq_zero32(dst); return; }
+        float f[32];
+        const float d = mq_half(dh);
+#pragma unroll
+        for (int l = 0; l < 16; ++l) {
+            const unsigned byte = (q[l / 4] >> (8 * (l % 4))) & 255;
+            f[l] = d * ((int) ((byte & 15) | (((high >> l) & 1) << 4)) - 16);
+            f[l + 16] = d * ((int) ((byte >> 4) | (((high >> (l + 16)) & 1) << 4)) - 16);
+        }
+        mq_put32(dst, f);
+    }
+};
+
 // Q4_0 (value (nibble - 8) * d) and IQ4_NL (kvalues_iq4nl[nibble] * d): 18 bytes, low nibbles are values 0..15, high 16..31
 template <bool NL>
 struct MmTile4 {
@@ -46,6 +115,30 @@ struct MmTile4 {
             mq_zero32(sw + r * MM_LD + u * 32);
             return;
         }
+#if defined(FNX_MOE_MMA_WIDE) && FNX_HIP
+        if constexpr (!NL) {
+            // Every (nibble - 8) is exact in half. A single half FMA rounds
+            // the exact d*q product once, with the reference's canonical +0.
+            const __half2 d = __half2half2(__ushort_as_half(v[0]));
+            const __half2 bias = __half2half2(__ushort_as_half(0x6408));
+            const __half2 zero = __float2half2_rn(0.f);
+            __half2 lo[8], hi[8];
+#pragma unroll
+            for (int w = 0; w < 4; ++w) {
+                const uint32_t q = (uint32_t)v[1 + 2 * w] | ((uint32_t)v[2 + 2 * w] << 16);
+                __half2 a, b;
+                mm_bytes_h2(q & 0x0f0f0f0fu, bias, a, b);
+                lo[2 * w] = __hfma2(a, d, zero);
+                lo[2 * w + 1] = __hfma2(b, d, zero);
+                mm_bytes_h2((q >> 4) & 0x0f0f0f0fu, bias, a, b);
+                hi[2 * w] = __hfma2(a, d, zero);
+                hi[2 * w + 1] = __hfma2(b, d, zero);
+            }
+            mm_store8(sw + r * MM_LD + u * 32, lo);
+            mm_store8(sw + r * MM_LD + u * 32 + 16, hi);
+            return;
+        }
+#endif
         const float d = mq_half(v[0]);
         float f[32];
 #pragma unroll
@@ -63,6 +156,30 @@ struct MmTile4 {
 };
 template <> struct MmTile<GGML_TYPE_Q4_0> : MmTile4<false> {};
 template <> struct MmTile<GGML_TYPE_IQ4_NL> : MmTile4<true> {};
+
+// Expand only the fetched 32-value half of a packed Q2_0 block into the
+// original Q4_0 tile registers. Inherited put() and WMMA arithmetic are unchanged.
+template <> struct MmTile<GGML_TYPE_Q2_0> : MmTile4<false> {
+    __device__ __forceinline__ void fetch(const char* we, size_t row_a, int nrows, int row0, int k0, int kc) {
+        const int r = threadIdx.x / MM_TPR, u = threadIdx.x % MM_TPR, row = row0 + r;
+        item = u * 32 < kc;
+        live = item && row < nrows;
+        if (live) {
+            const int half = k0 / 32 + u;
+            const auto* b = reinterpret_cast<const uint8_t*>(we) + (size_t) row * row_a + (size_t) (half / 2) * 18;
+            const auto* q = b + 2 + (half % 2) * 8;
+            v[0] = (uint16_t) mq_ld16(b);
+#pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                const int shift = 4 * (w % 2);
+                const unsigned lo = (q[w / 2] >> shift) & 15u;
+                const unsigned hi = (q[4 + w / 2] >> shift) & 15u;
+                v[1 + w] = (uint16_t) (((lo & 3u) + 7u) | (((hi & 3u) + 7u) << 4) |
+                    (((lo >> 2) + 7u) << 8) | (((hi >> 2) + 7u) << 12));
+            }
+        }
+    }
+};
 
 // IQ4_XS: 136 bytes = d (f16), scales_h (u16), scales_l[4], qs[128]; sub-block ib has 16 qs bytes at 8 + 16 ib and a 6-bit scale
 template <> struct MmTile<GGML_TYPE_IQ4_XS> {
@@ -110,6 +227,25 @@ __device__ __forceinline__ void mq_signed4(float* y, uint32_t grid, float d, uin
     for (int j = 0; j < 4; ++j) y[j] = d * (float) ((grid >> (8 * j)) & 0xFF) * ((signs & kmask_iq2xs[s0 + j]) ? -1.f : 1.f);
 }
 
+#if defined(FNX_MOE_MMA_WIDE) && FNX_HIP
+// Apply the strata branch's direct-sign idea to TP's original weight values.
+// Grid * odd scale is <=465 (IQ3_S), <=1922 (IQ3_XXS), or <=1333 (IQ2_S).
+// These integers, including XXS's /4 and IQ2's /8, are exact in FP16.
+// Multiply this factor by the original half d only once: the same rounding
+// as the old exact FP32 product followed by conversion. Do not round d*scale.
+__device__ __forceinline__ void mq_iq_packed4(__half2* out, uint32_t grid, __half2 scale, __half2 d,
+                                               uint32_t signs, int s0) {
+    __half2 a, b;
+    mm_bytes_h2(grid, mm_k1024(), a, b);
+    a = __hmul2(__hmul2(a, scale), d);
+    b = __hmul2(__hmul2(b, scale), d);
+    const uint32_t sa = ((signs >> s0) & 1u) << 15 | ((signs >> (s0 + 1)) & 1u) << 31;
+    const uint32_t sb = ((signs >> (s0 + 2)) & 1u) << 15 | ((signs >> (s0 + 3)) & 1u) << 31;
+    out[0] = __builtin_bit_cast(__half2, __builtin_bit_cast(uint32_t, a) ^ sa);
+    out[1] = __builtin_bit_cast(__half2, __builtin_bit_cast(uint32_t, b) ^ sb);
+}
+#endif
+
 // IQ3_S: 110 bytes = d, qs[64], qh[8], signs[32], scales[4]; sub-block ib: qs[8 ib..], qh[ib], signs[4 ib..], a 4-bit scale (1 + 2 s) d
 template <> struct MmTile<GGML_TYPE_IQ3_S> {
     uint32_t dq, qs[2], sg, qh, sc;   // d (low 16 bits of dq), 8 qs bytes, 4 sign bytes, qh byte, scales byte
@@ -137,17 +273,34 @@ template <> struct MmTile<GGML_TYPE_IQ3_S> {
             mq_zero32(sw + r * MM_LD + u * 32);
             return;
         }
-        const float d = mq_half(dq) * (float) (1 + 2 * ((sc >> (4 * (ib % 2))) & 0xF));
+        const int scale = 1 + 2 * ((sc >> (4 * (ib % 2))) & 0xF);
+#if defined(FNX_MOE_MMA_WIDE) && FNX_HIP
+        const __half2 dh = __half2half2(__ushort_as_half((uint16_t) dq));
+        const __half2 sh = __float2half2_rn((float) scale);
+        __half2 h[16];
+#else
+        const float d = mq_half(dq) * (float) scale;
         float f[32];
+#endif
 #pragma unroll
         for (int il = 0; il < 4; ++il) {
             const uint32_t q0 = (qs[(2 * il) / 4] >> (8 * ((2 * il) % 4))) & 0xFF, q1 = (qs[(2 * il + 1) / 4] >> (8 * ((2 * il + 1) % 4))) & 0xFF;
             const uint32_t g1 = iq3s_grid[q0 | ((qh << (8 - 2 * il)) & 256)], g2 = iq3s_grid[q1 | ((qh << (7 - 2 * il)) & 256)];
             const uint32_t sb = (sg >> (8 * il)) & 0xFF;
+#if defined(FNX_MOE_MMA_WIDE) && FNX_HIP
+            mq_iq_packed4(h + 4 * il, g1, sh, dh, sb, 0);
+            mq_iq_packed4(h + 4 * il + 2, g2, sh, dh, sb, 4);
+#else
             mq_signed4(f + 8 * il, g1, d, sb, 0);
             mq_signed4(f + 8 * il + 4, g2, d, sb, 4);
+#endif
         }
+#if defined(FNX_MOE_MMA_WIDE) && FNX_HIP
+        mm_store8(sw + r * MM_LD + u * 32, h);
+        mm_store8(sw + r * MM_LD + u * 32 + 16, h + 8);
+#else
         mq_put32(sw + r * MM_LD + u * 32, f);
+#endif
     }
 };
 
@@ -176,16 +329,32 @@ template <> struct MmTile<GGML_TYPE_IQ3_XXS> {
             mq_zero32(sw + r * MM_LD + u * 32);
             return;
         }
+#if defined(FNX_MOE_MMA_WIDE) && FNX_HIP
+        const __half2 dh = __half2half2(__ushort_as_half((uint16_t) dq));
+        const __half2 sh = __float2half2_rn((float) (1 + 2 * (aux >> 28)) * 0.25f);
+        __half2 h[16];
+#else
         const float d = mq_half(dq) * (0.5f + (float) (aux >> 28)) * 0.5f;
         float f[32];
+#endif
 #pragma unroll
         for (int il = 0; il < 4; ++il) {
             const uint32_t q0 = (qs[(2 * il) / 4] >> (8 * ((2 * il) % 4))) & 0xFF, q1 = (qs[(2 * il + 1) / 4] >> (8 * ((2 * il + 1) % 4))) & 0xFF;
             const uint32_t sb = ksigns_iq2xs[(aux >> (7 * il)) & 127];
+#if defined(FNX_MOE_MMA_WIDE) && FNX_HIP
+            mq_iq_packed4(h + 4 * il, iq3xxs_grid[q0], sh, dh, sb, 0);
+            mq_iq_packed4(h + 4 * il + 2, iq3xxs_grid[q1], sh, dh, sb, 4);
+#else
             mq_signed4(f + 8 * il, iq3xxs_grid[q0], d, sb, 0);
             mq_signed4(f + 8 * il + 4, iq3xxs_grid[q1], d, sb, 4);
+#endif
         }
+#if defined(FNX_MOE_MMA_WIDE) && FNX_HIP
+        mm_store8(sw + r * MM_LD + u * 32, h);
+        mm_store8(sw + r * MM_LD + u * 32 + 16, h + 8);
+#else
         mq_put32(sw + r * MM_LD + u * 32, f);
+#endif
     }
 };
 
@@ -215,15 +384,31 @@ template <> struct MmTile<GGML_TYPE_IQ2_S> {
             mq_zero32(sw + r * MM_LD + u * 32);
             return;
         }
+#if defined(FNX_MOE_MMA_WIDE) && FNX_HIP
+        const __half2 dh = __half2half2(__ushort_as_half((uint16_t) dq));
+        __half2 h[16];
+#else
         float f[32];
+#endif
 #pragma unroll
         for (int il = 0; il < 4; ++il) {
             const uint64_t grid = iq2s_grid[((qs >> (8 * il)) & 0xFF) | ((qh << (8 - 2 * il)) & 0x300)];
-            const float d = mq_half(dq) * (0.5f + (float) ((sc >> (4 * (il / 2))) & 0xF)) * 0.25f;
             const uint32_t sb = (sg >> (8 * il)) & 0xFF;
+#if defined(FNX_MOE_MMA_WIDE) && FNX_HIP
+            const __half2 sh = __float2half2_rn((float) (1 + 2 * ((sc >> (4 * (il / 2))) & 0xF)) * 0.125f);
+            mq_iq_packed4(h + 4 * il, (uint32_t) grid, sh, dh, sb, 0);
+            mq_iq_packed4(h + 4 * il + 2, (uint32_t) (grid >> 32), sh, dh, sb, 4);
+#else
+            const float d = mq_half(dq) * (0.5f + (float) ((sc >> (4 * (il / 2))) & 0xF)) * 0.25f;
             mq_signed4(f + 8 * il, (uint32_t) grid, d, sb, 0);
             mq_signed4(f + 8 * il + 4, (uint32_t) (grid >> 32), d, sb, 4);
+#endif
         }
+#if defined(FNX_MOE_MMA_WIDE) && FNX_HIP
+        mm_store8(sw + r * MM_LD + u * 32, h);
+        mm_store8(sw + r * MM_LD + u * 32 + 16, h + 8);
+#else
         mq_put32(sw + r * MM_LD + u * 32, f);
+#endif
     }
 };

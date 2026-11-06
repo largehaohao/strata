@@ -67,6 +67,9 @@ set(_sp_engine
     ${_sp}/src/engine_common.cu ${_sp}/src/prefill.cu ${_sp}/src/session.cpp ${_sp}/src/batch.cpp ${_sp}/tools/sfnx.cpp)
 if(_fnx_hip)
   list(APPEND _sp_engine ${_sp}/src/selftest.cu)   # the kernel self-test of a card Strata has not run the split on (hip/selftest_policy.hpp)
+  list(APPEND _sp_engine ${_sp}/src/moe_mma_wide.cu)
+  set_source_files_properties(${_sp}/src/moe_mma_wide.cu PROPERTIES LANGUAGE HIP)
+  set_property(SOURCE ${_sp}/src/moe_mma.cu APPEND PROPERTY COMPILE_DEFINITIONS FNX_MOE_MMA_DISPATCH_WIDE=1)
 endif()
 if(_fnx_hip)
   set(_fnx_lang HIP)
@@ -101,20 +104,54 @@ if(TARGET strata_kernels AND TARGET strata_core)
   set(_sp_df2 ON)
 endif()
 
+if(_fnx_hip)
+  # Reuse the native engine's FP16-input / FP32-accumulating prompt GEMM.
+  # Separate compilation avoids the split engine's CUDA compatibility macros.
+  add_library(strata_split_prefill_gemm OBJECT EXCLUDE_FROM_ALL ${PROJECT_SOURCE_DIR}/src/prefill/wmma_gemm.cu)
+  set_source_files_properties(${PROJECT_SOURCE_DIR}/src/prefill/wmma_gemm.cu PROPERTIES LANGUAGE HIP)
+  target_include_directories(strata_split_prefill_gemm PRIVATE ${PROJECT_SOURCE_DIR}/include)
+  target_link_libraries(strata_split_prefill_gemm PRIVATE strata_hip_runtime)
+  target_compile_definitions(strata_split_prefill_gemm PRIVATE STRATA_USE_HIP=1)
+  option(STRATA_SPLIT_PF_CU_MODE "Compile split prompt GEMM in CU mode (FP32 accumulation unchanged)" OFF)
+  if(STRATA_SPLIT_PF_CU_MODE)
+    target_compile_options(strata_split_prefill_gemm PRIVATE -mcumode)
+  endif()
+  # The native kernel has concrete gfx11 code objects; gfx11-generic needs the
+  # ordinary BLAS fallback until that kernel explicitly supports generic ISA.
+  if(NOT "gfx11-generic" IN_LIST _fnx_hip_archs AND "${_fnx_hip_archs}" MATCHES "gfx110[0-3]")
+    target_compile_definitions(strata_split_prefill_gemm PRIVATE STRATA_WMMA_GFX11=1)
+  endif()
+  set_target_properties(strata_split_prefill_gemm PROPERTIES HIP_STANDARD 17 HIP_STANDARD_REQUIRED ON
+                        HIP_ARCHITECTURES "${_fnx_hip_archs}")
+  # This test includes both native GEMM implementations directly. Keep it free
+  # of the split engine's forced CUDA compatibility headers, like the object above.
+  add_executable(split_prefill_schedule_test EXCLUDE_FROM_ALL tools/prefill_schedule_test.cu)
+  set_source_files_properties(tools/prefill_schedule_test.cu PROPERTIES LANGUAGE HIP)
+  target_include_directories(split_prefill_schedule_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+  target_link_libraries(split_prefill_schedule_test PRIVATE strata_hip_runtime)
+  target_compile_definitions(split_prefill_schedule_test PRIVATE STRATA_USE_HIP=1 STRATA_WMMA_GFX11=1)
+  set_target_properties(split_prefill_schedule_test PROPERTIES HIP_STANDARD 17 HIP_STANDARD_REQUIRED ON
+                        HIP_ARCHITECTURES "${_fnx_hip_archs}")
+  add_executable(split_prefill_scratch_plan_test EXCLUDE_FROM_ALL tools/prefill_scratch_plan_test.cpp)
+  set_target_properties(split_prefill_scratch_plan_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+endif()
+
 foreach(_n ${STRATA_SPLIT_CARDS})
   if(NOT _n MATCHES "^[234]$")
     message(FATAL_ERROR "STRATA_SPLIT_CARDS: 2, 3 or 4, not ${_n}")
   endif()
   set(_t strata-split-${_n})
   add_executable(${_t} ${_sp_engine} ${_sp_kparts})
+  target_include_directories(${_t} PRIVATE ${PROJECT_SOURCE_DIR}/include)
   if(_fnx_hip)
     # HIP: src/hip first (cuda.h, mma.h stand-ins), the force-included fnx_hip.h after the tree's cuda_runtime.h shim
     target_include_directories(${_t} PRIVATE ${_sp}/src/hip ${_sp}/src ${_sp}/tools ${STRATA_GGML_DIR}/ggml/src/ggml-cuda
                                ${STRATA_GGML_DIR}/ggml/src ${STRATA_GGML_DIR}/ggml/include)
-    target_compile_definitions(${_t} PRIVATE FNX_NCARD=${_n} FNX_ARCH=${STRATA_SPLIT_ARCH} FNX_27B=0 FNX_HOSTRING=1 FNX_HIP=1 GGML_USE_HIP=1
+    target_compile_definitions(${_t} PRIVATE FNX_NCARD=${_n} FNX_ARCH=${STRATA_SPLIT_ARCH} FNX_27B=0 FNX_HOSTRING=1 FNX_HIP=1 GGML_USE_HIP=1 FNX_PF_JOB=${STRATA_SPLIT_PF_JOB}
                                FNX_DIR="${_sp}")
     target_compile_options(${_t} PRIVATE "$<$<COMPILE_LANGUAGE:HIP>:SHELL:-include ${_sp}/src/hip/fnx_hip.h>")
-    target_link_libraries(${_t} PRIVATE strata_hip_runtime ${STRATA_HIP_BLAS_TARGETS})
+    target_link_libraries(${_t} PRIVATE strata_hip_runtime ${STRATA_HIP_BLAS_TARGETS} strata_split_prefill_gemm)
+    target_include_directories(${_t} PRIVATE ${PROJECT_SOURCE_DIR}/src/prefill)
     set_target_properties(${_t} PROPERTIES CXX_STANDARD 17 HIP_STANDARD 17 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${_fnx_hip_archs}")
     find_package(Threads REQUIRED)
     target_link_libraries(${_t} PRIVATE Threads::Threads)
@@ -142,10 +179,89 @@ foreach(_n ${STRATA_SPLIT_CARDS})
   set_target_properties(${_t} PROPERTIES CUDA_RUNTIME_LIBRARY Shared)
 endforeach()
 
-# the CPU unit tests sFNX ships (split rule, ring plan, card checks, batch plan, rope, input parser): plain C++, no GPU
+# Standalone byte/graph check, built explicitly; it does not load model weights.
+add_executable(split_moe_stage_test EXCLUDE_FROM_ALL ${_sp}/tools/moe_stage_test.cu)
+target_include_directories(split_moe_stage_test PRIVATE ${_sp}/src)
+target_compile_definitions(split_moe_stage_test PRIVATE FNX_NCARD=2 FNX_ARCH=${STRATA_SPLIT_ARCH} FNX_27B=0)
+if(_fnx_hip)
+  set_source_files_properties(${_sp}/tools/moe_stage_test.cu PROPERTIES LANGUAGE HIP)
+  target_compile_options(split_moe_stage_test PRIVATE "SHELL:-include ${_sp}/src/hip/fnx_hip.h")
+  target_link_libraries(split_moe_stage_test PRIVATE strata_hip_runtime)
+  set_target_properties(split_moe_stage_test PROPERTIES HIP_STANDARD 17 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${_fnx_hip_archs}")
+else()
+  set_target_properties(split_moe_stage_test PROPERTIES CUDA_STANDARD 17 CUDA_ARCHITECTURES "${STRATA_SPLIT_ARCH}-real")
+endif()
+
+# Explicit kernel comparisons, with the engine's headers and arithmetic flags.
+list(GET STRATA_SPLIT_CARDS 0 _moe_cards)
+set(_fnx_kernel_checks moe_iq moe_down moe_cache dense_q8 mtp_head_gpu)
+if(_fnx_hip AND _moe_cards EQUAL 2)
+  list(APPEND _fnx_kernel_checks attn_heads qsa_pair moe_cache_gu moe_q2_down moe_q2_mma moe_mma_wide moe_mma_fused mtp_head_gemv router_bf16 q8s_ab static_prefill_copy prefill_gemm gdn_prefill hc_prefill hcup_mix)
+endif()
+foreach(_kind ${_fnx_kernel_checks})
+  set(_target split_${_kind}_test)
+  set(_source ${_sp}/tools/${_kind}_test.cu)
+  add_executable(${_target} EXCLUDE_FROM_ALL ${_source})
+  if(_kind STREQUAL "moe_mma_wide" OR _kind STREQUAL "moe_mma_fused")
+    target_sources(${_target} PRIVATE ${_sp}/src/moe_mma_wide.cu)
+  endif()
+  foreach(_prop INCLUDE_DIRECTORIES COMPILE_DEFINITIONS COMPILE_OPTIONS LINK_LIBRARIES)
+    get_target_property(_value strata-split-${_moe_cards} ${_prop})
+    if(_value)
+      set_property(TARGET ${_target} PROPERTY ${_prop} "${_value}")
+    endif()
+  endforeach()
+  if(_fnx_hip)
+    set_source_files_properties(${_source} PROPERTIES LANGUAGE HIP)
+    set_target_properties(${_target} PROPERTIES HIP_STANDARD 17 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${_fnx_hip_archs}")
+  else()
+    set_target_properties(${_target} PROPERTIES CUDA_STANDARD 17 CUDA_ARCHITECTURES "${STRATA_SPLIT_ARCH}-real")
+  endif()
+endforeach()
+
+# Real GGUF expert tiles checked against gguf-py, also available in HIP builds.
+if(_fnx_hip)
+  add_executable(split_moe_tile_native_test EXCLUDE_FROM_ALL ${_sp}/tools/moe_tile_test.cu ${_sp}/src/gguf.cpp)
+  foreach(_prop INCLUDE_DIRECTORIES COMPILE_DEFINITIONS COMPILE_OPTIONS LINK_LIBRARIES)
+    get_target_property(_value strata-split-${_moe_cards} ${_prop})
+    if(_value)
+      set_property(TARGET split_moe_tile_native_test PROPERTY ${_prop} "${_value}")
+    endif()
+  endforeach()
+  set_source_files_properties(${_sp}/tools/moe_tile_test.cu PROPERTIES LANGUAGE HIP)
+  set_target_properties(split_moe_tile_native_test PROPERTIES HIP_STANDARD 17 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${_fnx_hip_archs}")
+endif()
+
+# Compact HC is currently restricted to gfx1100; its regression needs HIP residency APIs.
+if(_fnx_hip)
+  add_executable(split_hc_compact_test EXCLUDE_FROM_ALL ${_sp}/tools/hc_compact_test.cu)
+  foreach(_prop INCLUDE_DIRECTORIES COMPILE_DEFINITIONS COMPILE_OPTIONS LINK_LIBRARIES)
+    get_target_property(_value strata-split-${_moe_cards} ${_prop})
+    if(_value)
+      set_property(TARGET split_hc_compact_test PROPERTY ${_prop} "${_value}")
+    endif()
+  endforeach()
+  set_source_files_properties(${_sp}/tools/hc_compact_test.cu PROPERTIES LANGUAGE HIP)
+  set_target_properties(split_hc_compact_test PROPERTIES HIP_STANDARD 17 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${_fnx_hip_archs}")
+endif()
+
+# Exact logged GDN rollback is currently restricted to the Flash-Next gfx1100 path.
+if(_fnx_hip)
+  add_executable(split_gdn_replay_test EXCLUDE_FROM_ALL ${_sp}/tools/gdn_replay_test.cu)
+  foreach(_prop INCLUDE_DIRECTORIES COMPILE_DEFINITIONS COMPILE_OPTIONS LINK_LIBRARIES)
+    get_target_property(_value strata-split-${_moe_cards} ${_prop})
+    if(_value)
+      set_property(TARGET split_gdn_replay_test PROPERTY ${_prop} "${_value}")
+    endif()
+  endforeach()
+  set_source_files_properties(${_sp}/tools/gdn_replay_test.cu PROPERTIES LANGUAGE HIP)
+  set_target_properties(split_gdn_replay_test PROPERTIES HIP_STANDARD 17 HIP_STANDARD_REQUIRED ON HIP_ARCHITECTURES "${_fnx_hip_archs}")
+endif()
+
+# CPU unit tests: split rule, ring plan, card checks, batch plan, rope and input parser.
 if(STRATA_BUILD_TESTS)
   list(GET STRATA_SPLIT_CARDS 0 _n0)
-  foreach(_tt batch_plan_test pf_ring_plan_test card_check_test rope_test sfnx_input_test peer_policy_test rccl_policy_test selftest_policy_test)
+  foreach(_tt batch_plan_test pf_ring_plan_test card_check_test rope_test sfnx_input_test peer_policy_test rccl_policy_test selftest_policy_test static_experts_test mtp_head_test static_prefill_stage_test)
     add_executable(split_${_tt} ${_sp}/tools/${_tt}.cpp)
     target_include_directories(split_${_tt} PRIVATE ${_sp}/src ${_sp}/tools)
     target_compile_definitions(split_${_tt} PRIVATE FNX_NCARD=${_n0} FNX_27B=0)
@@ -193,3 +309,31 @@ if(STRATA_BUILD_TESTS)
   target_link_libraries(split_fnx_run PRIVATE CUDA::cublas CUDA::cublasLt CUDA::cuda_driver Threads::Threads)
   set_target_properties(split_fnx_run PROPERTIES CUDA_RUNTIME_LIBRARY Shared)
 endif()
+
+# Host-only conversion-buffer lifetime test, independent of model/GPU allocations.
+find_package(Threads REQUIRED)
+add_executable(split_gguf_release_test EXCLUDE_FROM_ALL ${_sp}/tools/gguf_release_test.cpp)
+target_compile_definitions(split_gguf_release_test PRIVATE FNX_27B=0)
+target_link_libraries(split_gguf_release_test PRIVATE Threads::Threads)
+set_target_properties(split_gguf_release_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+
+# Host-only sizing checks for optional grouped static-cache slots.
+add_executable(split_static_cache_layout_test EXCLUDE_FROM_ALL ${_sp}/tools/static_cache_layout_test.cpp)
+target_include_directories(split_static_cache_layout_test PRIVATE ${_sp}/src)
+set_target_properties(split_static_cache_layout_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+
+# Host-only validation for the opt-in attention geometry and environment parsing.
+add_executable(split_attn_head_config_test EXCLUDE_FROM_ALL ${_sp}/tools/attn_head_config_test.cpp)
+target_include_directories(split_attn_head_config_test PRIVATE ${_sp}/src)
+target_compile_definitions(split_attn_head_config_test PRIVATE FNX_NCARD=${_moe_cards} FNX_27B=0 FNX_HIP=$<BOOL:${_fnx_hip}>)
+set_target_properties(split_attn_head_config_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+
+# Verify shared-region sizing before allocating or lending any GPU slots.
+add_executable(split_static_kv_cache_test EXCLUDE_FROM_ALL ${_sp}/tools/static_kv_cache_test.cpp)
+target_include_directories(split_static_kv_cache_test PRIVATE ${_sp}/src)
+set_target_properties(split_static_kv_cache_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+
+# Exact router storage conversion, including rejection instead of rounding.
+add_executable(split_lossless_bf16_test EXCLUDE_FROM_ALL ${_sp}/tools/lossless_bf16_test.cpp)
+target_include_directories(split_lossless_bf16_test PRIVATE ${_sp}/src)
+set_target_properties(split_lossless_bf16_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)

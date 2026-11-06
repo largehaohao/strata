@@ -22,7 +22,7 @@ namespace fnx {
 
 enum GgmlType : uint32_t {
     T_F32 = 0, T_F16 = 1, T_Q4_0 = 2, T_Q4_1 = 3, T_Q5_0 = 6, T_Q5_1 = 7, T_Q8_0 = 8, T_Q8_1 = 9, T_Q2_K = 10,
-    T_Q3_K = 11, T_Q4_K = 12, T_Q5_K = 13, T_Q6_K = 14, T_Q8_K = 15, T_IQ3_XXS = 18, T_IQ4_NL = 20, T_IQ3_S = 21, T_IQ2_S = 22,
+    T_Q3_K = 11, T_Q4_K = 12, T_Q5_K = 13, T_Q6_K = 14, T_Q8_K = 15, T_IQ2_XXS = 16, T_IQ3_XXS = 18, T_IQ4_NL = 20, T_IQ3_S = 21, T_IQ2_S = 22,
     T_IQ4_XS = 23, T_BF16 = 30, T_Q2_0 = 42,   // 42: Strata's 64-value 2-bit blocks (not in llama.cpp)
 };
 
@@ -37,7 +37,7 @@ struct Tensor {
     uint32_t type = 0;
     int64_t ne[4] = {1, 1, 1, 1};
     int n_dims = 0;
-    const uint8_t* data = nullptr;   // in the mapping
+    const uint8_t* data = nullptr;   // mapping or owned conversion; null after explicit release
     size_t nbytes = 0;
     int shard = -1;                  // the file it is in (-1: not from a GGUF file) and where in it
     uint64_t offset = 0;
@@ -47,7 +47,9 @@ struct Tensor {
 
 class Gguf {
 public:
-    explicit Gguf(const std::string& first_shard);   // finds the other "-0000N-of-0000M" shards beside it
+    // Finds sibling shards. The optional packed down format preserves the
+    // file's Q2_0 bytes; other readers retain the original Q4_0 repacking.
+    explicit Gguf(const std::string& first_shard, bool packed_q2_down = false);
     ~Gguf();
     const Tensor& t(const std::string& name) const;          // throws when missing
     const Tensor* find(const std::string& name) const;
@@ -71,6 +73,10 @@ public:
     const std::string& shard_path(int s) const { return maps_[(size_t) s].path; }
     size_t shard_size(int s) const { return maps_[(size_t) s].size; }
     const uint8_t* shard_base(int s) const { return (const uint8_t*) maps_[(size_t) s].base; }
+    // After consumers finish copying weights, discard owned conversion buffers
+    // except the named CPU tensors. Released tensors keep metadata but data is
+    // null; staging them again requires reloading the GGUF. Mappings are kept.
+    size_t release_owned_except(const std::set<std::string>& keep);
 
 private:
     struct Map { void* base = nullptr; size_t size = 0; int fd = -1; std::string path; };
@@ -88,7 +94,7 @@ private:
     int converted_ = 0;
     bool iq_experts_ = false;
     void load_shard(const std::string& path, bool meta);
-    void convert_small_tensors();
+    void convert_small_tensors(bool packed_q2_down);
 };
 
 // Reads groups of tensors (a layer's, say) into host buffers ahead of the threads that slice them, in the order they

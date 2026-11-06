@@ -1,0 +1,240 @@
+compare card 0 type 20 T 1 jobs 10 differences 0 rel_l2 0
+card 0 type 20 T 1 jobs 10 pre 0 us 13.8502
+card 0 type 20 T 1 jobs 10 pre 1 us 12.8362
+card 0 type 20 T 1 jobs 10 pre 1 us 13.537
+card 0 type 20 T 1 jobs 10 pre 0 us 12.8778
+compare card 0 type 20 T 3 jobs 10 differences 0 rel_l2 0
+card 0 type 20 T 3 jobs 10 pre 0 us 22.8332
+card 0 type 20 T 3 jobs 10 pre 1 us 18.6131
+card 0 type 20 T 3 jobs 10 pre 1 us 18.1603
+card 0 type 20 T 3 jobs 10 pre 0 us 23.0352
+compare card 0 type 20 T 3 jobs 24 differences 0 rel_l2 0
+card 0 type 20 T 3 jobs 24 pre 0 us 27.8473
+card 0 type 20 T 3 jobs 24 pre 1 us 21.2852
+card 0 type 20 T 3 jobs 24 pre 1 us 21.6756
+card 0 type 20 T 3 jobs 24 pre 0 us 28.2157
+compare card 0 type 20 T 6 jobs 10 differences 0 rel_l2 0
+card 0 type 20 T 6 jobs 10 pre 0 us 38.6235
+card 0 type 20 T 6 jobs 10 pre 1 us 23.986
+card 0 type 20 T 6 jobs 10 pre 1 us 24.0964
+card 0 type 20 T 6 jobs 10 pre 0 us 38.3243
+compare card 0 type 20 T 6 jobs 24 differences 0 rel_l2 0
+card 0 type 20 T 6 jobs 24 pre 0 us 41.0011
+card 0 type 20 T 6 jobs 24 pre 1 us 27.0465
+card 0 type 20 T 6 jobs 24 pre 1 us 26.8977
+card 0 type 20 T 6 jobs 24 pre 0 us 41.5927
+compare card 0 type 20 T 6 jobs 48 differences 0 rel_l2 0
+card 0 type 20 T 6 jobs 48 pre 0 us 50.0965
+card 0 type 20 T 6 jobs 48 pre 1 us 32.681
+card 0 type 20 T 6 jobs 48 pre 1 us 33.1282
+card 0 type 20 T 6 jobs 48 pre 0 us 53.3517
+compare card 0 type 20 T 8 jobs 10 differences 0 rel_l2 0
+card 0 type 20 T 8 jobs 10 pre 0 us 46.816
+card 0 type 20 T 8 jobs 10 pre 1 us 26.8753
+card 0 type 20 T 8 jobs 10 pre 1 us 26.4309
+card 0 type 20 T 8 jobs 10 pre 0 us 46.4104
+compare card 0 type 20 T 8 jobs 24 differences 0 rel_l2 0
+card 0 type 20 T 8 jobs 24 pre 0 us 49.4417
+card 0 type 20 T 8 jobs 24 pre 1 us 29.0789
+card 0 type 20 T 8 jobs 24 pre 1 us 29.6052
+card 0 type 20 T 8 jobs 24 pre 0 us 49.6686
+compare card 0 type 20 T 8 jobs 48 differences 0 rel_l2 0
+card 0 type 20 T 8 jobs 48 pre 0 us 54.838
+card 0 type 20 T 8 jobs 48 pre 1 us 35.961
+card 0 type 20 T 8 jobs 48 pre 1 us 35.6922
+card 0 type 20 T 8 jobs 48 pre 0 us 52.7097
+compare card 0 type 20 T 16 jobs 10 differences 0 rel_l2 0
+card 0 type 20 T 16 jobs 10 pre 0 us 93.1436
+card 0 type 20 T 16 jobs 10 pre 1 us 43.6748
+card 0 type 20 T 16 jobs 10 pre 1 us 44.0664
+card 0 type 20 T 16 jobs 10 pre 0 us 91.5472
+compare card 0 type 20 T 16 jobs 24 differences 0 rel_l2 0
+card 0 type 20 T 16 jobs 24 pre 0 us 95.0025
+card 0 type 20 T 16 jobs 24 pre 1 us 46.5372
+card 0 type 20 T 16 jobs 24 pre 1 us 46.7424
+card 0 type 20 T 16 jobs 24 pre 0 us 96.8713
+compare card 0 type 20 T 16 jobs 48 differences 0 rel_l2 0
+card 0 type 20 T 16 jobs 48 pre 0 us 106.295
+card 0 type 20 T 16 jobs 48 pre 1 us 56.593
+card 0 type 20 T 16 jobs 48 pre 1 us 58.5106
+card 0 type 20 T 16 jobs 48 pre 0 us 108.651
+compare card 0 type 2 T 1 jobs 10 differences 0 rel_l2 0
+card 0 type 2 T 1 jobs 10 pre 0 us 21.694
+card 0 type 2 T 1 jobs 10 pre 1 us 16.3427
+card 0 type 2 T 1 jobs 10 pre 1 us 14.2622
+card 0 type 2 T 1 jobs 10 pre 0 us 12.2338
+compare card 0 type 2 T 3 jobs 10 differences 0 rel_l2 0
+card 0 type 2 T 3 jobs 10 pre 0 us 18.7915
+card 0 type 2 T 3 jobs 10 pre 1 us 16.2111
+card 0 type 2 T 3 jobs 10 pre 1 us 15.6731
+card 0 type 2 T 3 jobs 10 pre 0 us 20.2472
+compare card 0 type 2 T 3 jobs 24 differences 0 rel_l2 0
+card 0 type 2 T 3 jobs 24 pre 0 us 25.1584
+card 0 type 2 T 3 jobs 24 pre 1 us 19.9636
+card 0 type 2 T 3 jobs 24 pre 1 us 19.2011
+card 0 type 2 T 3 jobs 24 pre 0 us 25.9381
+compare card 0 type 2 T 6 jobs 10 differences 0 rel_l2 0
+card 0 type 2 T 6 jobs 10 pre 0 us 33.0938
+card 0 type 2 T 6 jobs 10 pre 1 us 19.1055
+card 0 type 2 T 6 jobs 10 pre 1 us 19.0115
+card 0 type 2 T 6 jobs 10 pre 0 us 32.6962
+compare card 0 type 2 T 6 jobs 24 differences 0 rel_l2 0
+card 0 type 2 T 6 jobs 24 pre 0 us 37.2615
+card 0 type 2 T 6 jobs 24 pre 1 us 23.3824
+card 0 type 2 T 6 jobs 24 pre 1 us 23.0212
+card 0 type 2 T 6 jobs 24 pre 0 us 36.241
+compare card 0 type 2 T 6 jobs 48 differences 0 rel_l2 0
+card 0 type 2 T 6 jobs 48 pre 0 us 44.2284
+card 0 type 2 T 6 jobs 48 pre 1 us 28.7245
+card 0 type 2 T 6 jobs 48 pre 1 us 27.8833
+card 0 type 2 T 6 jobs 48 pre 0 us 43.5024
+compare card 0 type 2 T 8 jobs 10 differences 0 rel_l2 0
+card 0 type 2 T 8 jobs 10 pre 0 us 40.8931
+card 0 type 2 T 8 jobs 10 pre 1 us 20.8348
+card 0 type 2 T 8 jobs 10 pre 1 us 20.5524
+card 0 type 2 T 8 jobs 10 pre 0 us 40.0987
+compare card 0 type 2 T 8 jobs 24 differences 0 rel_l2 0
+card 0 type 2 T 8 jobs 24 pre 0 us 42.7147
+card 0 type 2 T 8 jobs 24 pre 1 us 24.0232
+card 0 type 2 T 8 jobs 24 pre 1 us 24.1776
+card 0 type 2 T 8 jobs 24 pre 0 us 43.4876
+compare card 0 type 2 T 8 jobs 48 differences 0 rel_l2 0
+card 0 type 2 T 8 jobs 48 pre 0 us 51.3909
+card 0 type 2 T 8 jobs 48 pre 1 us 30.0257
+card 0 type 2 T 8 jobs 48 pre 1 us 30.3113
+card 0 type 2 T 8 jobs 48 pre 0 us 48.4716
+compare card 0 type 2 T 16 jobs 10 differences 0 rel_l2 0
+card 0 type 2 T 16 jobs 10 pre 0 us 80.8666
+card 0 type 2 T 16 jobs 10 pre 1 us 33.2178
+card 0 type 2 T 16 jobs 10 pre 1 us 33.5866
+card 0 type 2 T 16 jobs 10 pre 0 us 78.1674
+compare card 0 type 2 T 16 jobs 24 differences 0 rel_l2 0
+card 0 type 2 T 16 jobs 24 pre 0 us 87.7724
+card 0 type 2 T 16 jobs 24 pre 1 us 39.1791
+card 0 type 2 T 16 jobs 24 pre 1 us 38.7123
+card 0 type 2 T 16 jobs 24 pre 0 us 89.6632
+compare card 0 type 2 T 16 jobs 48 differences 0 rel_l2 0
+card 0 type 2 T 16 jobs 48 pre 0 us 97.4241
+card 0 type 2 T 16 jobs 48 pre 1 us 48.7765
+card 0 type 2 T 16 jobs 48 pre 1 us 48.6908
+card 0 type 2 T 16 jobs 48 pre 0 us 99.3353
+compare card 1 type 20 T 1 jobs 10 differences 0 rel_l2 0
+card 1 type 20 T 1 jobs 10 pre 0 us 15.3227
+card 1 type 20 T 1 jobs 10 pre 1 us 12.7182
+card 1 type 20 T 1 jobs 10 pre 1 us 12.8862
+card 1 type 20 T 1 jobs 10 pre 0 us 12.3182
+compare card 1 type 20 T 3 jobs 10 differences 0 rel_l2 0
+card 1 type 20 T 3 jobs 10 pre 0 us 22.4984
+card 1 type 20 T 3 jobs 10 pre 1 us 18.3636
+card 1 type 20 T 3 jobs 10 pre 1 us 17.7079
+card 1 type 20 T 3 jobs 10 pre 0 us 23.194
+compare card 1 type 20 T 3 jobs 24 differences 0 rel_l2 0
+card 1 type 20 T 3 jobs 24 pre 0 us 28.0749
+card 1 type 20 T 3 jobs 24 pre 1 us 22.234
+card 1 type 20 T 3 jobs 24 pre 1 us 20.7892
+card 1 type 20 T 3 jobs 24 pre 0 us 27.8517
+compare card 1 type 20 T 6 jobs 10 differences 0 rel_l2 0
+card 1 type 20 T 6 jobs 10 pre 0 us 39.4696
+card 1 type 20 T 6 jobs 10 pre 1 us 24.0785
+card 1 type 20 T 6 jobs 10 pre 1 us 23.8233
+card 1 type 20 T 6 jobs 10 pre 0 us 38.6559
+compare card 1 type 20 T 6 jobs 24 differences 0 rel_l2 0
+card 1 type 20 T 6 jobs 24 pre 0 us 41.8156
+card 1 type 20 T 6 jobs 24 pre 1 us 26.9169
+card 1 type 20 T 6 jobs 24 pre 1 us 27.4261
+card 1 type 20 T 6 jobs 24 pre 0 us 43.8224
+compare card 1 type 20 T 6 jobs 48 differences 0 rel_l2 0
+card 1 type 20 T 6 jobs 48 pre 0 us 51.7154
+card 1 type 20 T 6 jobs 48 pre 1 us 33.091
+card 1 type 20 T 6 jobs 48 pre 1 us 33.6166
+card 1 type 20 T 6 jobs 48 pre 0 us 52.3018
+compare card 1 type 20 T 8 jobs 10 differences 0 rel_l2 0
+card 1 type 20 T 8 jobs 10 pre 0 us 47.9589
+card 1 type 20 T 8 jobs 10 pre 1 us 26.9045
+card 1 type 20 T 8 jobs 10 pre 1 us 27.1361
+card 1 type 20 T 8 jobs 10 pre 0 us 46.5257
+compare card 1 type 20 T 8 jobs 24 differences 0 rel_l2 0
+card 1 type 20 T 8 jobs 24 pre 0 us 49.5645
+card 1 type 20 T 8 jobs 24 pre 1 us 31.2806
+card 1 type 20 T 8 jobs 24 pre 1 us 30.4082
+card 1 type 20 T 8 jobs 24 pre 0 us 51.1402
+compare card 1 type 20 T 8 jobs 48 differences 0 rel_l2 0
+card 1 type 20 T 8 jobs 48 pre 0 us 55.6999
+card 1 type 20 T 8 jobs 48 pre 1 us 36.4567
+card 1 type 20 T 8 jobs 48 pre 1 us 36.1131
+card 1 type 20 T 8 jobs 48 pre 0 us 54.8547
+compare card 1 type 20 T 16 jobs 10 differences 0 rel_l2 0
+card 1 type 20 T 16 jobs 10 pre 0 us 96.345
+card 1 type 20 T 16 jobs 10 pre 1 us 44.6489
+card 1 type 20 T 16 jobs 10 pre 1 us 44.4492
+card 1 type 20 T 16 jobs 10 pre 0 us 95.1126
+compare card 1 type 20 T 16 jobs 24 differences 0 rel_l2 0
+card 1 type 20 T 16 jobs 24 pre 0 us 97.6467
+card 1 type 20 T 16 jobs 24 pre 1 us 48.2597
+card 1 type 20 T 16 jobs 24 pre 1 us 47.8869
+card 1 type 20 T 16 jobs 24 pre 0 us 97.0063
+compare card 1 type 20 T 16 jobs 48 differences 0 rel_l2 0
+card 1 type 20 T 16 jobs 48 pre 0 us 105.301
+card 1 type 20 T 16 jobs 48 pre 1 us 57.8655
+card 1 type 20 T 16 jobs 48 pre 1 us 59.2631
+card 1 type 20 T 16 jobs 48 pre 0 us 109.771
+compare card 1 type 2 T 1 jobs 10 differences 0 rel_l2 0
+card 1 type 2 T 1 jobs 10 pre 0 us 20.4792
+card 1 type 2 T 1 jobs 10 pre 1 us 15.7683
+card 1 type 2 T 1 jobs 10 pre 1 us 13.9631
+card 1 type 2 T 1 jobs 10 pre 0 us 11.7718
+compare card 1 type 2 T 3 jobs 10 differences 0 rel_l2 0
+card 1 type 2 T 3 jobs 10 pre 0 us 19.8832
+card 1 type 2 T 3 jobs 10 pre 1 us 16.7211
+card 1 type 2 T 3 jobs 10 pre 1 us 15.5335
+card 1 type 2 T 3 jobs 10 pre 0 us 20.5312
+compare card 1 type 2 T 3 jobs 24 differences 0 rel_l2 0
+card 1 type 2 T 3 jobs 24 pre 0 us 24.7389
+card 1 type 2 T 3 jobs 24 pre 1 us 19.5396
+card 1 type 2 T 3 jobs 24 pre 1 us 19.3636
+card 1 type 2 T 3 jobs 24 pre 0 us 25.5717
+compare card 1 type 2 T 6 jobs 10 differences 0 rel_l2 0
+card 1 type 2 T 6 jobs 10 pre 0 us 33.7886
+card 1 type 2 T 6 jobs 10 pre 1 us 19.6416
+card 1 type 2 T 6 jobs 10 pre 1 us 19.0928
+card 1 type 2 T 6 jobs 10 pre 0 us 33.809
+compare card 1 type 2 T 6 jobs 24 differences 0 rel_l2 0
+card 1 type 2 T 6 jobs 24 pre 0 us 38.4703
+card 1 type 2 T 6 jobs 24 pre 1 us 24.0781
+card 1 type 2 T 6 jobs 24 pre 1 us 23.7356
+card 1 type 2 T 6 jobs 24 pre 0 us 38.0115
+compare card 1 type 2 T 6 jobs 48 differences 0 rel_l2 0
+card 1 type 2 T 6 jobs 48 pre 0 us 47.1285
+card 1 type 2 T 6 jobs 48 pre 1 us 29.3078
+card 1 type 2 T 6 jobs 48 pre 1 us 29.415
+card 1 type 2 T 6 jobs 48 pre 0 us 46.1249
+compare card 1 type 2 T 8 jobs 10 differences 0 rel_l2 0
+card 1 type 2 T 8 jobs 10 pre 0 us 42.0088
+card 1 type 2 T 8 jobs 10 pre 1 us 20.956
+card 1 type 2 T 8 jobs 10 pre 1 us 20.6
+card 1 type 2 T 8 jobs 10 pre 0 us 41.5484
+compare card 1 type 2 T 8 jobs 24 differences 0 rel_l2 0
+card 1 type 2 T 8 jobs 24 pre 0 us 44.2548
+card 1 type 2 T 8 jobs 24 pre 1 us 24.7165
+card 1 type 2 T 8 jobs 24 pre 1 us 24.8581
+card 1 type 2 T 8 jobs 24 pre 0 us 45.3249
+compare card 1 type 2 T 8 jobs 48 differences 0 rel_l2 0
+card 1 type 2 T 8 jobs 48 pre 0 us 51.0006
+card 1 type 2 T 8 jobs 48 pre 1 us 31.465
+card 1 type 2 T 8 jobs 48 pre 1 us 30.8862
+card 1 type 2 T 8 jobs 48 pre 0 us 49.0841
+compare card 1 type 2 T 16 jobs 10 differences 0 rel_l2 0
+card 1 type 2 T 16 jobs 10 pre 0 us 86.4297
+card 1 type 2 T 16 jobs 10 pre 1 us 34.2415
+card 1 type 2 T 16 jobs 10 pre 1 us 34.2323
+card 1 type 2 T 16 jobs 10 pre 0 us 88.5229
+compare card 1 type 2 T 16 jobs 24 differences 0 rel_l2 0
+card 1 type 2 T 16 jobs 24 pre 0 us 89.7829
+card 1 type 2 T 16 jobs 24 pre 1 us 38.7071
+card 1 type 2 T 16 jobs 24 pre 1 us 39.0596
+card 1 type 2 T 16 jobs 24 pre 0 us 89.8121
+compare card 1 type 2 T 16 jobs 48 differences 0 rel_l2 0
+card 1 type 2 T 16 jobs 48 pre 0 us 97.6011
+card 1 type 2 T 16 jobs 48 pre 1 us 49.0805
+card 1 type 2 T 16 jobs 48 pre 1 us 51.5178
+card 1 type 2 T 16 jobs 48 pre 0 us 101.313

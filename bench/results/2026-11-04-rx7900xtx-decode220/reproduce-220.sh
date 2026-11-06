@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export TP_EXE=${TP_EXE:-build-tensor-parralize-baseline/strata-split-q8s-ab-v26}
+export FNX_STATIC_CACHE_ARENA=1 FNX_STATIC_CACHE_FUSED_GU=1 FNX_PACKED_Q2_DOWN=1
+export FNX_STATIC_CACHE_MIN_PADDING=1 FNX_MTP_HEAD_MODE=3 TP_EXPERT_RAM_GIB=11.25
+export FNX_STATIC_CACHE_MAX_AGE=2 FNX_ROUTER_BF16=1
+export FNX_Q8S_FUSED_AB=1 TP_PREFILL_ROWS=256
+export TP_CPU_AFFINITY=0-3 HSA_OVERRIDE_CPU_AFFINITY_DEBUG=0
+unset HSA_ENABLE_INTERRUPT HSA_ENABLE_MWAITX FNX_GPU_TIMING
+exec bash "$(dirname -- "$0")/run-heads-experiment.sh" "$@"

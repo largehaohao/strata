@@ -1,0 +1,162 @@
+```go
+package workerpool
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// Task represents a unit of work to be executed by a worker.
+type Task struct {
+	ID      int
+	Execute func(ctx context.Context) error
+}
+
+// Result represents the outcome of a task execution.
+type Result struct {
+	TaskID int
+	Err    error
+}
+
+// Pool is a bounded worker pool with context cancellation, backpressure,
+// panic recovery, and graceful shutdown.
+type Pool struct {
+	// Configuration
+	workerCount int
+	queueSize   int
+
+	// Channels
+	taskQueue   chan Task
+	resultChan  chan Result
+	doneChan    chan struct{}
+
+	// Synchronization
+	wg          sync.WaitGroup
+	closeOnce   sync.Once
+
+	// State
+	closed      atomic.Bool
+	started     atomic.Bool
+
+	// Context for the pool
+	ctx         context.Context
+	cancel      context.CancelFunc
+}
+
+// NewPool creates a new worker pool with the given number of workers and queue size.
+// The queueSize provides backpressure: if the queue is full, Submit will block
+// until a worker picks up a task.
+func NewPool(workerCount, queueSize int) *Pool {
+	if workerCount <= 0 {
+		panic("workerCount must be positive")
+	}
+	if queueSize < 0 {
+		panic("queueSize must be non-negative")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	p := &Pool{
+		workerCount: workerCount,
+		queueSize:   queueSize,
+		taskQueue:   make(chan Task, queueSize),
+		resultChan:  make(chan Result, queueSize),
+		doneChan:    make(chan struct{}),
+		ctx:         ctx,
+		cancel:      cancel,
+	}
+
+	return p
+}
+
+// Start launches the worker goroutines. It must be called before Submit.
+// It is safe to call Start multiple times; subsequent calls are no-ops.
+func (p *Pool) Start() {
+	if p.started.CompareAndSwap(false, true) {
+		for i := 0; i < p.workerCount; i++ {
+			p.wg.Add(1)
+			go p.worker(i)
+		}
+	}
+}
+
+// Submit sends a task to the pool. It blocks if the queue is full (backpressure).
+// Returns an error if the pool is closed.
+func (p *Pool) Submit(task Task) error {
+	if p.closed.Load() {
+		return fmt.Errorf("pool is closed")
+	}
+
+	select {
+	case p.taskQueue <- task:
+		return nil
+	case <-p.ctx.Done():
+		return p.ctx.Err()
+	case <-p.doneChan:
+		return fmt.Errorf("pool is closed")
+	}
+}
+
+// worker is the main loop for each worker goroutine.
+func (p *Pool) worker(id int) {
+	defer p.wg.Done()
+
+	for {
+		select {
+		case <-p.ctx.Done():
+			// Context cancelled: drain remaining tasks in queue and exit.
+			p.drainQueue()
+			return
+		case <-p.doneChan:
+			// Pool closed: drain remaining tasks in queue and exit.
+			p.drainQueue()
+			return
+		case task, ok := <-p.taskQueue:
+			if !ok {
+				// Channel closed, exit.
+				return
+			}
+			p.executeTask(task)
+		}
+	}
+}
+
+// executeTask runs a single task with panic recovery.
+func (p *Pool) executeTask(task Task) {
+	defer func() {
+		if r := recover(); r != nil {
+			p.resultChan <- Result{
+				TaskID: task.ID,
+				Err:    fmt.Errorf("panic recovered: %v", r),
+			}
+		}
+	}()
+
+	err := task.Execute(p.ctx)
+	p.resultChan <- Result{
+		TaskID: task.ID,
+		Err:    err,
+	}
+}
+
+// drainQueue processes any remaining tasks in the queue after shutdown signal.
+func (p *Pool) drainQueue() {
+	for {
+		select {
+		case task, ok := <-p.taskQueue:
+			if !ok {
+				return
+			}
+			p.executeTask(task)
+		default:
+			return
+		}
+	}
+}
+
+// Close initiates graceful shutdown. It stops accepting new tasks,
+// drains the queue, and waits for all workers to finish.
+// It is safe to call Close multiple times.

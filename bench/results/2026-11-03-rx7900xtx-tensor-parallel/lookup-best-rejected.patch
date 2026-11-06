@@ -1,0 +1,52 @@
+diff --git a/src/split/src/session.cpp b/src/split/src/session.cpp
+index 8e429c76..789a951b 100644
+--- a/src/split/src/session.cpp
++++ b/src/split/src/session.cpp
+@@ -371,23 +371,29 @@ CacheStats Session::cache_stats() const {
+ }
+ 
+ // lookup_drafts with this session's LK, after the draft layer's d1
+-std::vector<int> Session::lookup(const std::vector<int>& ctx, int d1) const { return lookup_drafts(ctx, LK_, d1); }
++std::vector<int> Session::lookup(const std::vector<int>& ctx, int d1) const {
++    return lookup_drafts(ctx, LK_, d1, env_flag("FNX_LOOKUP_BEST"));
++}
+ 
+ // A window's cost grows with its rows (Q4: 8 rows ~20 ms, 16 ~34): in a run being copied (a code edit) the match is long
+ // and the drafts are kept, a short match (new code) is mostly a coincidence
+-std::vector<int> lookup_drafts(const std::vector<int>& ctx, int lk, int d1) {
++std::vector<int> lookup_drafts(const std::vector<int>& ctx, int lk, int d1, bool best_match) {
+     std::vector<int> r;
+     if (lk == 0 || (int) ctx.size() <= LOOKUP_N) return r;
+     const size_t n0 = ctx.size() - LOOKUP_N;
++    int best = -1;
+     for (size_t s = n0; s-- > 0;)
+         if (std::equal(ctx.begin() + s, ctx.begin() + s + LOOKUP_N, ctx.begin() + n0)) {
+             if (s + LOOKUP_N < ctx.size() && (d1 < 0 || ctx[s + LOOKUP_N] == d1)) {
+                 int m = LOOKUP_N;
+                 while (m < lk && (size_t) (m - LOOKUP_N) < s && ctx[s - 1 - (m - LOOKUP_N)] == ctx[n0 - 1 - (m - LOOKUP_N)]) ++m;
+-                const int k = std::min(lk, std::max(LOOKUP_MIN, m));
+-                r.assign(ctx.begin() + s + LOOKUP_N, ctx.begin() + std::min(ctx.size(), s + LOOKUP_N + k));
++                if (!best_match || m > best) {
++                    best = m;
++                    const int k = std::min(lk, std::max(LOOKUP_MIN, m));
++                    r.assign(ctx.begin() + s + LOOKUP_N, ctx.begin() + std::min(ctx.size(), s + LOOKUP_N + k));
++                }
+             }
+-            break;
++            if (!best_match || best >= lk) break;
+         }
+     // an image cell is never a draft (nor anything after it)
+     r.erase(std::find_if(r.begin(), r.end(), [](int t) { return t >= Engine::IMAGE_TOK; }), r.end());
+diff --git a/src/split/src/session.hpp b/src/split/src/session.hpp
+index 0a144c3d..18ba1f7d 100644
+--- a/src/split/src/session.hpp
++++ b/src/split/src/session.hpp
+@@ -48,7 +48,7 @@ int draw(const Dist& d, double u);
+ // n-gram lookup drafts: the tokens after the latest earlier place of ctx's last 3 tokens, if the first of them is d1
+ // (d1 < 0: whatever it is), as many as the match is long (the 3 tokens and how far before them the two places still
+ // agree), 3 to lk; none when lk is 0. Never an image cell
+-std::vector<int> lookup_drafts(const std::vector<int>& ctx, int lk, int d1);
++std::vector<int> lookup_drafts(const std::vector<int>& ctx, int lk, int d1, bool best_match = false);
+ 
+ struct GenStats {
+     int prompt_tokens = 0, reused = 0, generated = 0;

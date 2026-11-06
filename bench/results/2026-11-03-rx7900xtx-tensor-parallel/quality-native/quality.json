@@ -1,0 +1,30 @@
+{
+  "binary_sha256": "8001a6cc0dad7766352f2cccc4796867ac2155ef91f5dca5a46c177b6477c868",
+  "cases": [
+    {
+      "case": "merge_intervals",
+      "finish": "stop",
+      "input_sha256": "6bc12901139a71e58b48af16e3afd13120816cc15bdda231315b4cb86419c35e",
+      "source_sha256": "e27e5147ec3e10102e42cd7e51ae79bef12824c26afec5f8b659f0d637c610af",
+      "checks_passed": 316,
+      "passed": true
+    },
+    {
+      "case": "topological_sort",
+      "finish": "stop",
+      "input_sha256": "727b03519b701b6cac121119a62c65dc14d5cf00799d5690a348fd45c7b46ab7",
+      "source_sha256": "a596cf6ea601384d88354a309fba4bcf3ff8b00e87dc34e697229e08a144efba",
+      "checks_passed": 125,
+      "passed": true
+    },
+    {
+      "case": "varint",
+      "finish": "stop",
+      "input_sha256": "4243c16cf7e639dfe1c807098382e17d15d687b1716c724ff553dba6e630a5b9",
+      "source_sha256": "c9ec471c684089bad9dce13d8fe3d10713eebfdf5ea2268b5a0f9ef7b557e13e",
+      "checks_passed": 885,
+      "passed": true
+    }
+  ],
+  "passed": true
+}

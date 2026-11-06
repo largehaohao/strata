@@ -275,6 +275,15 @@ private:
     // FNX_ARENA: pages [0, arena_base_) are the K/V pool's own, [arena_base_, arena_w_) borrowed from the arena pool's
     // slots (the coldest first), up to arena_cap_ (the pool keeps 2 MAXT TOPK slots on every card); all 0 without one
     int arena_base_ = 0, arena_w_ = 0, arena_cap_ = 0;
+    bool static_arena_ = false;   // unused K/V pages hold only host-backed static-cache entries
+    // Temporary prefill ownership of a top range, excluded from free_pages_.
+    // Reclaim/churn must respect it even though it is not a lane's K/V.
+    int prefill_arena_begin_ = 0, prefill_arena_end_ = 0;
+    bool borrow_prefill_arena(size_t bytes, int end_pos);
+    void release_prefill_arena();
+    void* prefill_arena_data(int card) const;
+    ExpertCache& arena_cache(int c);
+    const ExpertCache& arena_cache(int c) const;
     std::chrono::steady_clock::time_point arena_last_lend_{};
     void arena_fill(int c, cudaStream_t st);   // card c's arena pool slots from the experts' host copies, the tables (on st)
     size_t arena_slot_off(int c) const;     // where card c's arena pool slots start in its pool allocation
@@ -372,6 +381,7 @@ private:
     void df2_catch_up(int lane, int pos0);
     void df2_forget(int lane);       // the lane's sequence changed: drafter ring and host ring empty
     void df2_prompt_tap(int slot, int pos_first, int row, int n, CardBuf& b, const float* R, const float* bo, const float* inj);
+    int mtp_head_mode_ = 0;  // per-call draft mode; zero for penalties and sampled candidates
     void mtp_enqueue(int T);
     void mtp_enqueue_lanes(const std::vector<DraftReq>& reqs, int T);
     const Mtp* mtp_ = nullptr;
@@ -382,6 +392,7 @@ private:
     // FNX_PF_PEER (AMD, needs the peer push): the prompt chunk sums' receive slots, gather rows and flags live in the receiving card's fine-grained device memory, the
     // sending card's kernels store into it directly (no hop through host memory); the sums are the same arithmetic as the host exchange's
     bool pf_peer_ = false;
+    bool gdn_replay_ = false;   // single-lane exact rollback from first state and logged rank-one updates
     // the prompt path's rows per chunk (FNX_PF_ROWS, a multiple of MAXT up to 8192, default 4096: prompts over 1k tokens
     // read ~20% faster than at 1024 for ~1.1 GiB more a card; Q4 at 262k makes room with FNX_EXPERT_RAM_GIB) and its jobs
     int pf_c_ = 4096, pf_jobs_ = 0;
@@ -414,7 +425,7 @@ private:
     void dense(const DW& W, const void* y, float* out, CardBuf& b, int T);
     void attention(int T, CardBuf& b, const CardW& w, const LayerW& L, uint16_t* kc, uint16_t* vc, const int* ctl,
                    uint16_t* qsa_ring, uint16_t* qsa_pooled, int call);
-    void ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW& L, float* R, const int* ctl);
+    void ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW& L, float* R, const int* ctl, int lyr);
 #if FNX_27B
     // the 27B's window (s27_engine.cu): the layers and head over T rows, one sequence's or a batched window's (lanes),
     // with the recurrent core each kind runs

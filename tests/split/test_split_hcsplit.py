@@ -71,7 +71,7 @@ class PerFileSwitches(unittest.TestCase):
     def test_gdn_scan_is_decided_by_the_files_expert_types(self):
         k, g, m = text("kernels.cu"), text("gguf.cpp"), text("engine.cu")
         # the rule: IQ-type routed experts (the set convert_small_tensors converts) -> off; the variable overrides
-        self.assertRegex(g, r"mixed \|= kv\.second\.type == T_IQ2_S \|\| kv\.second\.type == T_IQ3_XXS \|\| kv\.second\.type == T_IQ3_S \|\| kv\.second\.type == T_Q2_0;")
+        self.assertRegex(g, r"mixed \|= kv\.second\.type == T_IQ2_XXS \|\| kv\.second\.type == T_IQ2_S \|\| kv\.second\.type == T_IQ3_XXS \|\| kv\.second\.type == T_IQ3_S \|\| kv\.second\.type == T_Q2_0;")
         self.assertIn("iq_experts_ = mixed;", g)
         self.assertIn("gdn_tc_set_default(!m_.g.iq_experts());", m)
         self.assertRegex(k, r'gdn_tc_env = \(int\) fnx::env_int\("FNX_PFX_GDN_TC", -1\)')
@@ -80,7 +80,7 @@ class PerFileSwitches(unittest.TestCase):
 
     def test_the_rule_in_python_terms(self):
         """The same rule as a function, over the type names a GGUF's routed experts carry (what strata_control/split_engine.py reads)."""
-        iq = {"IQ2_S", "IQ3_XXS", "IQ3_S", "Q2_0"}
+        iq = {"IQ2_XXS", "IQ2_S", "IQ3_XXS", "IQ3_S", "Q2_0"}
 
         def gdn_tc(expert_types, env=None):
             if env is not None:
@@ -89,6 +89,7 @@ class PerFileSwitches(unittest.TestCase):
 
         self.assertFalse(gdn_tc({"IQ4_NL", "IQ2_S", "IQ3_XXS", "IQ3_S", "Q4_0"}))   # the ISTA IQ3_S set
         self.assertTrue(gdn_tc({"Q4_K", "Q5_K", "Q5_1", "Q8_0"}))                    # UD-Q4_K_XL
+        self.assertFalse(gdn_tc({"IQ2_XXS"}))
         self.assertTrue(gdn_tc({"Q8_0"}))
         self.assertTrue(gdn_tc({"IQ3_S"}, env="1"))
         self.assertFalse(gdn_tc({"Q4_K"}, env="0"))

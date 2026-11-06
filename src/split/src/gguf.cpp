@@ -38,6 +38,7 @@ TypeInfo type_info(uint32_t t) {
         case T_IQ3_XXS: return {256, 98};
         case T_IQ3_S: return {256, 110};
         case T_IQ2_S: return {256, 82};
+        case T_IQ2_XXS: return {256, 66};
         case T_IQ4_XS: return {256, 136};
         case T_Q2_0: return {64, 18};
     }
@@ -95,7 +96,7 @@ int64_t read_int(Cur& c, uint32_t t) {
 }
 }  // namespace
 
-Gguf::Gguf(const std::string& first) {
+Gguf::Gguf(const std::string& first, bool packed_q2_down) {
     std::smatch m;
     static const std::regex split(R"((.*-)(\d{5})(-of-)(\d{5})(\.gguf)$)");
     if (std::regex_match(first, m, split)) {
@@ -108,22 +109,26 @@ Gguf::Gguf(const std::string& first) {
     } else {
         load_shard(first, true);
     }
-    convert_small_tensors();
+    convert_small_tensors(packed_q2_down);
 }
 
 // A file with routed experts in the IQ types or Strata's 2-bit type (the ISTA IQ3_S set) also keeps its dense matrices, routers,
 // embeddings and projections in K-quants, IQ4_XS and BF16, which the engine does not read. Those are dequantized and written
 // again as Q8_0 (F32 for the small ones), once, here; the routed experts are left as they are. A file without such experts
 // (UD-Q4_K_XL, Q8_0) is not touched at all: the check below is the only difference for it.
-void Gguf::convert_small_tensors() {
+void Gguf::convert_small_tensors(bool packed_q2_down) {
     bool mixed = false;
     for (const auto& kv : tensors_)
-        mixed |= kv.second.type == T_IQ2_S || kv.second.type == T_IQ3_XXS || kv.second.type == T_IQ3_S || kv.second.type == T_Q2_0;
+        mixed |= kv.second.type == T_IQ2_XXS || kv.second.type == T_IQ2_S || kv.second.type == T_IQ3_XXS || kv.second.type == T_IQ3_S || kv.second.type == T_Q2_0;
     iq_experts_ = mixed;
     if (!mixed) return;
     for (auto& kv : tensors_) {
         Tensor& t = kv.second;
         if (t.type == T_Q2_0) {   // the routed down experts of some layers: the same values as Q4_0 blocks
+            const std::string suffix = ".ffn_down_exps.weight";
+            if (packed_q2_down && t.name.size() >= suffix.size() &&
+                t.name.compare(t.name.size() - suffix.size(), suffix.size(), suffix) == 0)
+                continue;
             owned_.emplace_back();
             conv::repack_q2_0_to_q4_0(t, owned_.back());
             ++converted_;
@@ -136,6 +141,25 @@ void Gguf::convert_small_tensors() {
         ++converted_;
     }
     std::fprintf(stderr, "gguf: %d dense/small tensors converted to Q8_0/F32 at load (the file's routed experts keep their types)\n", converted_);
+}
+
+size_t Gguf::release_owned_except(const std::set<std::string>& keep) {
+    std::set<const uint8_t*> retained;
+    for (const auto& name : keep) {
+        const Tensor* tensor = find(name);
+        if (!tensor || !tensor->data) throw std::runtime_error("gguf: cannot retain unavailable tensor " + name);
+        retained.insert(tensor->data);
+    }
+    size_t released = 0;
+    for (auto& bytes : owned_) {
+        if (bytes.empty() || retained.count(bytes.data())) continue;
+        const uint8_t* data = bytes.data();
+        for (auto& kv : tensors_)
+            if (kv.second.data == data) kv.second.data = nullptr;
+        released += bytes.size();
+        std::vector<uint8_t>().swap(bytes);
+    }
+    return released;
 }
 
 Gguf::~Gguf() {

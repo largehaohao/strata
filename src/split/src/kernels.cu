@@ -2,6 +2,7 @@
 // (src/models/qwen4exp.cpp) operation by operation.
 #include "kernels.hpp"
 #include "env.hpp"
+#include "attn_head_split.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -138,6 +139,8 @@ template <ggml_type type> __device__ __forceinline__ float vdot(const void* v, c
     else if constexpr (type == GGML_TYPE_Q4_K) return vec_dot_q4_K_q8_1(v, y, kbx, iqs);
     else if constexpr (type == GGML_TYPE_Q5_K) return vec_dot_q5_K_q8_1(v, y, kbx, iqs);
     else if constexpr (type == GGML_TYPE_Q5_1) return vec_dot_q5_1_q8_1(v, y, kbx, iqs);
+    else if constexpr (type == GGML_TYPE_Q5_0) return vec_dot_q5_0_q8_1(v, y, kbx, iqs);
+    else if constexpr (type == GGML_TYPE_IQ2_XXS) return vec_dot_iq2_xxs_q8_1(v, y, kbx, iqs);
     else if constexpr (type == GGML_TYPE_Q4_0) return vec_dot_q4_0_q8_1(v, y, kbx, iqs);
     else if constexpr (type == GGML_TYPE_Q6_K) return vec_dot_q6_K_q8_1(v, y, kbx, iqs);
     else if constexpr (type == GGML_TYPE_IQ4_NL) return vec_dot_iq4_nl_q8_1(v, y, kbx, iqs);
@@ -164,6 +167,8 @@ template <ggml_type type> constexpr int vdr_of() {
     else if constexpr (type == GGML_TYPE_Q4_K) return VDR_Q4_K_Q8_1_MMVQ;
     else if constexpr (type == GGML_TYPE_Q5_K) return VDR_Q5_K_Q8_1_MMVQ;
     else if constexpr (type == GGML_TYPE_Q5_1) return VDR_Q5_1_Q8_1_MMVQ;
+    else if constexpr (type == GGML_TYPE_Q5_0) return VDR_Q5_0_Q8_1_MMVQ;
+    else if constexpr (type == GGML_TYPE_IQ2_XXS) return VDR_IQ2_XXS_Q8_1_MMVQ;
     else if constexpr (type == GGML_TYPE_Q4_0) return VDR_Q4_0_Q8_1_MMVQ;
     else if constexpr (type == GGML_TYPE_Q6_K) return VDR_Q6_K_Q8_1_MMVQ;
     else if constexpr (type == GGML_TYPE_IQ4_NL) return VDR_IQ4_NL_Q8_1_MMVQ;
@@ -215,14 +220,16 @@ __global__ void __launch_bounds__(MMVQ_THREADS) k_mmvq(const char* __restrict__ 
     }
 }
 
+#include "mtp_head_gemv.cuh"
+#include "bf16_weight_load.cuh"
 #include "dense.cuh"
 #include "moe.cuh"
 #include "moe_q4k.cuh"
 
 // ---------------------------------------------------------------- f32 matrix x vectors (router, alpha / beta, gates)
 // y[t][row] = W[row] . x[t]: a warp per row (WPR = 1) or a block per row (WPR = 4 warps, the columns split), n = N
-template <int T, int WPR>
-__global__ void __launch_bounds__(256) k_gemv_f32(const float* __restrict__ W, const float* __restrict__ x, float* __restrict__ y,
+template <int T, int WPR, bool BF16 = false>
+__global__ void __launch_bounds__(256) k_gemv_f32(const void* __restrict__ W, const float* __restrict__ x, float* __restrict__ y,
                                                  int rows) {
     constexpr int NC = N / 4 / (32 * WPR);   // float4 chunks per lane
     static_assert(N % (4 * 32 * WPR) == 0, "chunks per lane");
@@ -230,10 +237,10 @@ __global__ void __launch_bounds__(256) k_gemv_f32(const float* __restrict__ W, c
     const int row = WPR == 1 ? blockIdx.x * 8 + warp : blockIdx.x;
     const int part = WPR == 1 ? 0 : warp;     // this warp's share of the columns
     if (row >= rows) return;
-    const float4* w4 = reinterpret_cast<const float4*>(W + (size_t) row * N) + part * NC * 32;
+    const size_t first4 = (size_t) row * (N / 4) + part * NC * 32;
     float4 wv[NC];
 #pragma unroll
-    for (int i = 0; i < NC; ++i) wv[i] = __ldg(w4 + i * 32 + lane);
+    for (int i = 0; i < NC; ++i) wv[i] = load_weight4<BF16>(W, first4 + i * 32 + lane);
     float s[T];
 #pragma unroll
     for (int t = 0; t < T; ++t) {
@@ -485,8 +492,10 @@ __global__ void k_gdn_out_norm(const float* o, const float* z, const float* w, f
 }
 
 #include "gdn_core.cuh"
+#if FNX_KPART == 4 || FNX_KPART == 99
 #include "gdn_prompt.cuh"
 #include "gdn_tc_prompt.cuh"
+#endif
 
 // ---------------------------------------------------------------- attention
 // per (t, head): RMS norm with the weight, then NEOX rotary on dims [0, NROT): pairs (i, i + NROT/2)
@@ -784,6 +793,7 @@ __global__ void __launch_bounds__(HD) k_attn_combine(const float* qg, const floa
 
 #include "attn_prompt.cuh"
 #include "attn_prompt_i8.cuh"
+#include "attn_heads.cuh"
 #include "topk.cuh"
 
 // ---------------------------------------------------------------- PLE block
@@ -1020,6 +1030,51 @@ __global__ void k_ring_a2a_push(Ring r, float* x, int T, const unsigned* tagp, i
     }
 }
 
+#if FNX_HIP
+// Send both words before waiting for the peer. Each still carries its own tag,
+// and the receiver sums the rounded values in the original card order.
+__global__ void k_ring_a2a_push_pair(Ring r, float* x, int T, const unsigned* tagp, int call, RingMoe m) {
+    const unsigned tag = *tagp * 256u + (unsigned) call + 1u;
+    const int card = r.card, step = gridDim.x * blockDim.x;
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t slot = (size_t) MAXT * NP, offset = (size_t) (tag & 1) * NCARD * slot;
+    auto* mine = (unsigned long long*) r.pk + offset;
+    for (int base = tid; base < T * NP; base += 2 * step) {
+        if (*(volatile const unsigned*) r.err & 1u) return;
+        __half2 sent[2];
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int e = base + j * step;
+            if (e < T * NP) {
+                const float2 v = ring_x2(x, m, T, e / NP, e % NP);
+                if (!(fabsf(v.x) <= RING_MAX && fabsf(v.y) <= RING_MAX)) atomicOr(r.err, 2u);
+                sent[j] = __floats2half2_rn(v.x, v.y);
+                const unsigned long long word = (unsigned long long) __builtin_bit_cast(unsigned, sent[j]) |
+                                                ((unsigned long long) tag << 32);
+#pragma unroll
+                for (int d = 0; d < NCARD; ++d)
+                    if (d != card)
+                        *(volatile unsigned long long*) ((unsigned long long*) r.peer_pk[d] + offset + (size_t) card * slot + e) = word;
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const int e = base + j * step;
+            if (e < T * NP) {
+                float2 sum = make_float2(0.f, 0.f);
+#pragma unroll
+                for (int src = 0; src < NCARD; ++src) {
+                    const float2 v = src == card ? __half22float2(sent[j]) : rtake(mine + (size_t) src * slot + e, tag, r.err);
+                    sum = src == 0 ? v : add2(sum, v);
+                }
+                x[2 * e] = sum.x;
+                x[2 * e + 1] = sum.y;
+            }
+        }
+    }
+}
+#endif
+
 // ---------------------------------------------------------------- argmax
 // a float's bits made monotone as unsigned (larger float, larger key)
 __device__ __forceinline__ unsigned fkey(float v) {
@@ -1094,6 +1149,10 @@ void mmvq_t(const DW& W, size_t w_stride, const Job* jobs, const int* njobs, int
     const int lanes = (W.n_in / qk) * per_block;   // lanes that keep every block of a row busy
     int G = per_block;
     while (G < lanes && G < 32) G *= 2;
+#if FNX_HIP && !FNX_27B
+    // The optional Q4 draft head: more rows in flight for its one-token steps.
+    if constexpr (type == GGML_TYPE_Q4_0) { if (W.n_out >= 8192) G = 8; }
+#endif
     const int ys = W.n_in / 32;
 #define FNX_G(g) k_mmvq<type, g><<<dim3((W.n_out + MMVQ_THREADS / g - 1) / (MMVQ_THREADS / g), njobs_max), MMVQ_THREADS, 0, s>>>( \
         (const char*) W.p, w_stride, W.row_bytes, W.n_out, W.n_in, jobs, njobs, njobs_max, (const block_q8_1*) y, ys, out, out_stride)
@@ -1111,6 +1170,7 @@ void mmvq(const DW& W, size_t w_stride, const Job* jobs, const int* njobs, int n
     cudaStream_t s = (cudaStream_t) st;
     switch (W.type) {
         case T_Q8_0: mmvq_t<GGML_TYPE_Q8_0>(W, w_stride, jobs, njobs, njobs_max, y, out, out_stride, s); break;
+        case T_Q4_0: mmvq_t<GGML_TYPE_Q4_0>(W, w_stride, jobs, njobs, njobs_max, y, out, out_stride, s); break;
         case T_Q4_K: mmvq_t<GGML_TYPE_Q4_K>(W, w_stride, jobs, njobs, njobs_max, y, out, out_stride, s); break;
         case T_Q5_K: mmvq_t<GGML_TYPE_Q5_K>(W, w_stride, jobs, njobs, njobs_max, y, out, out_stride, s); break;
         case T_Q5_1: mmvq_t<GGML_TYPE_Q5_1>(W, w_stride, jobs, njobs, njobs_max, y, out, out_stride, s); break;
@@ -1120,35 +1180,53 @@ void mmvq(const DW& W, size_t w_stride, const Job* jobs, const int* njobs, int n
     ck_launch("mmvq");
 }
 
+
+// This wrapper is reserved for the speculative draft head. Mode 1 is exact;
+// modes 2/3 screen rows using respectively one/two quarters of the dot.
+void mtp_head_gemv(const DW& W, const void* y, float* out, int mode, void* st) {
+    if (W.type != T_Q4_0 || W.n_in % 32 || W.row_bytes != (size_t)(W.n_in / 32) * sizeof(block_q4_0))
+        throw std::runtime_error("mtp_head_gemv: expected packed Q4_0 rows");
+    if (mode < 1 || mode > 3) throw std::runtime_error("mtp_head_gemv: invalid mode");
+    if (W.n_out < 1) return;
+    const dim3 grid((W.n_out + 15) / 16);
+    const auto stream = (cudaStream_t) st;
+    const auto weights = (const char*) W.p;
+    const auto input = (const block_q8_1*) y;
+    if (mode == 1) k_draft_head_full<<<grid, 128, 0, stream>>>(weights, W.row_bytes, W.n_out, W.n_in, input, out);
+    else if (mode == 2) k_draft_head_prune<4, 1><<<grid, 128, 0, stream>>>(weights, W.row_bytes, W.n_out, W.n_in, input, out);
+    else k_draft_head_prune<4, 2><<<grid, 128, 0, stream>>>(weights, W.row_bytes, W.n_out, W.n_in, input, out);
+    ck_launch("mtp_head_gemv");
+}
+
 namespace {
-template <int T>
-void gemv_f32_t(const float* W, const float* x, float* y, int rows, cudaStream_t s) {
+template <int T, bool BF16>
+void gemv_f32_t(const void* W, const float* x, float* y, int rows, cudaStream_t s) {
     // a block per row while that still gives every SM a block or two; a warp per row beyond
-    if (rows <= 160) k_gemv_f32<T, 4><<<rows, 128, 0, s>>>(W, x, y, rows);
-    else k_gemv_f32<T, 1><<<(rows + 7) / 8, 256, 0, s>>>(W, x, y, rows);
+    if (rows <= 160) k_gemv_f32<T, 4, BF16><<<rows, 128, 0, s>>>(W, x, y, rows);
+    else k_gemv_f32<T, 1, BF16><<<(rows + 7) / 8, 256, 0, s>>>(W, x, y, rows);
 }
 }  // namespace
 
-void gemv_f32(const float* W, const float* x, float* y, int rows, int n, int T, void* st) {
+void gemv_f32(const float* W, const float* x, float* y, int rows, int n, int T, void* st, const uint16_t* packed) {
     if (n != N) throw std::runtime_error("gemv_f32: rows of N columns only");
     cudaStream_t s = (cudaStream_t) st;
     switch (T) {
-        case 1: gemv_f32_t<1>(W, x, y, rows, s); break;
-        case 2: gemv_f32_t<2>(W, x, y, rows, s); break;
-        case 3: gemv_f32_t<3>(W, x, y, rows, s); break;
-        case 4: gemv_f32_t<4>(W, x, y, rows, s); break;
-        case 5: gemv_f32_t<5>(W, x, y, rows, s); break;
-        case 6: gemv_f32_t<6>(W, x, y, rows, s); break;
-        case 7: gemv_f32_t<7>(W, x, y, rows, s); break;
-        case 8: gemv_f32_t<8>(W, x, y, rows, s); break;
-        case 9: gemv_f32_t<9>(W, x, y, rows, s); break;
-        case 10: gemv_f32_t<10>(W, x, y, rows, s); break;
-        case 11: gemv_f32_t<11>(W, x, y, rows, s); break;
-        case 12: gemv_f32_t<12>(W, x, y, rows, s); break;
-        case 13: gemv_f32_t<13>(W, x, y, rows, s); break;
-        case 14: gemv_f32_t<14>(W, x, y, rows, s); break;
-        case 15: gemv_f32_t<15>(W, x, y, rows, s); break;
-        case 16: gemv_f32_t<16>(W, x, y, rows, s); break;
+        case 1: if (packed) gemv_f32_t<1, true>(packed, x, y, rows, s); else gemv_f32_t<1, false>(W, x, y, rows, s); break;
+        case 2: if (packed) gemv_f32_t<2, true>(packed, x, y, rows, s); else gemv_f32_t<2, false>(W, x, y, rows, s); break;
+        case 3: if (packed) gemv_f32_t<3, true>(packed, x, y, rows, s); else gemv_f32_t<3, false>(W, x, y, rows, s); break;
+        case 4: if (packed) gemv_f32_t<4, true>(packed, x, y, rows, s); else gemv_f32_t<4, false>(W, x, y, rows, s); break;
+        case 5: if (packed) gemv_f32_t<5, true>(packed, x, y, rows, s); else gemv_f32_t<5, false>(W, x, y, rows, s); break;
+        case 6: if (packed) gemv_f32_t<6, true>(packed, x, y, rows, s); else gemv_f32_t<6, false>(W, x, y, rows, s); break;
+        case 7: if (packed) gemv_f32_t<7, true>(packed, x, y, rows, s); else gemv_f32_t<7, false>(W, x, y, rows, s); break;
+        case 8: if (packed) gemv_f32_t<8, true>(packed, x, y, rows, s); else gemv_f32_t<8, false>(W, x, y, rows, s); break;
+        case 9: if (packed) gemv_f32_t<9, true>(packed, x, y, rows, s); else gemv_f32_t<9, false>(W, x, y, rows, s); break;
+        case 10: if (packed) gemv_f32_t<10, true>(packed, x, y, rows, s); else gemv_f32_t<10, false>(W, x, y, rows, s); break;
+        case 11: if (packed) gemv_f32_t<11, true>(packed, x, y, rows, s); else gemv_f32_t<11, false>(W, x, y, rows, s); break;
+        case 12: if (packed) gemv_f32_t<12, true>(packed, x, y, rows, s); else gemv_f32_t<12, false>(W, x, y, rows, s); break;
+        case 13: if (packed) gemv_f32_t<13, true>(packed, x, y, rows, s); else gemv_f32_t<13, false>(W, x, y, rows, s); break;
+        case 14: if (packed) gemv_f32_t<14, true>(packed, x, y, rows, s); else gemv_f32_t<14, false>(W, x, y, rows, s); break;
+        case 15: if (packed) gemv_f32_t<15, true>(packed, x, y, rows, s); else gemv_f32_t<15, false>(W, x, y, rows, s); break;
+        case 16: if (packed) gemv_f32_t<16, true>(packed, x, y, rows, s); else gemv_f32_t<16, false>(W, x, y, rows, s); break;
         default: throw std::runtime_error("gemv_f32: T out of range");
     }
     ck_launch("gemv_f32");
@@ -1156,7 +1234,7 @@ void gemv_f32(const float* W, const float* x, float* y, int rows, int n, int T, 
 
 #endif
 #if FNX_KPART == 3
-size_t hc_scratch_floats(int T) { return (size_t) H_NS * T * H_ROWS + (size_t) T * H_NS + (size_t) T * LR / 4 + (size_t) T * LR / 32 + 1; }
+size_t hc_scratch_floats(int T) { return (size_t) H_NS * T * H_ROWS + (size_t) T * H_NS + (size_t) T * LR / 4 + (size_t) T * LR / 32 + 2; }
 
 // FNX_HC1=R: windows of up to R rows (at most 8) take k_hc's one-barrier form (default 3: kbench 1-2 us faster a read at
 // 1-3 rows, the same at 4-5, slower at 8). Read once; the engine reads it when made, so a bad value fails at start
@@ -1174,6 +1252,34 @@ int hc_blocks() { return H_BLOCKS; }
 // the read's grid on each card (0: hc_prepare not run there)
 constexpr int HC_MAXDEV = 64;
 int hc_grid_[HC_MAXDEV] = {};
+int hc_wide_grid_[HC_MAXDEV] = {};
+unsigned long long hc_timeout_[HC_MAXDEV] = {};
+
+bool hc_compact() {
+    static const bool compact = [] {
+        const auto rows = env_int("FNX_HC_ROW_GROUP", 96);
+        if (rows != 64 && rows != 96) throw std::runtime_error("FNX_HC_ROW_GROUP: expected 64 or 96");
+#if !FNX_HIP
+        if (rows == 64) throw std::runtime_error("FNX_HC_ROW_GROUP=64 requires HIP gfx1100");
+#endif
+        return rows == 64;
+    }();
+    return compact;
+}
+
+#if FNX_HIP
+template <int T> int hc_compact_residency() {
+    int blocks = 0;
+    hipError_t e;
+    if constexpr (T <= 8) {
+        if (T <= hc1_rows()) e = hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, k_hc<T, true, true, 64>, 512, 0);
+        else e = hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, k_hc<T, false, true, 64>, 512, 0);
+    } else e = hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, k_hc<T, false, true, 64>, 512, 0);
+    if (e != hipSuccess || blocks <= 0)
+        throw std::runtime_error("hc_prepare: cannot determine compact kernel residency");
+    return blocks;
+}
+#endif
 
 int hc_dev() {
     int dev = -1;
@@ -1196,15 +1302,42 @@ int hc_prepare(float* scratch, int cap) {
     if (e != cudaSuccess) throw std::runtime_error(std::string("hc_prepare: SM count: ") + cudaGetErrorString(e));
     if (sms <= 0) throw std::runtime_error("hc_prepare: card " + std::to_string(dev) + " reports " + std::to_string(sms) + " SMs");
     if (cap < 0 || cap > H_BLOCKS) throw std::runtime_error("hc_prepare: cap 1.." + std::to_string(H_BLOCKS) + " (0: none), got " + std::to_string(cap));
-    hc_grid_[dev] = std::min(sms, cap ? cap : H_BLOCKS);
+    int capacity = sms;
+    hc_timeout_[dev] = 2000000000ULL;
+#if FNX_HIP
+    int wall_khz = 0;
+    if (hipDeviceGetAttribute(&wall_khz, hipDeviceAttributeWallClockRate, dev) != hipSuccess || wall_khz <= 0)
+        throw std::runtime_error("hc_prepare: cannot determine wall-clock rate");
+    hc_timeout_[dev] = (unsigned long long) wall_khz * 1000;   // one second
+    if (hc_compact()) {
+        hipDeviceProp_t prop{};
+        if (hipGetDeviceProperties(&prop, dev) != hipSuccess || std::string(prop.gcnArchName).rfind("gfx1100", 0) != 0)
+            throw std::runtime_error("FNX_HC_ROW_GROUP=64 has only been validated on gfx1100");
+        const int per_sm = std::min({hc_compact_residency<1>(), hc_compact_residency<2>(),
+            hc_compact_residency<3>(), hc_compact_residency<4>(), hc_compact_residency<5>(), hc_compact_residency<6>(),
+            hc_compact_residency<7>(), hc_compact_residency<8>(), hc_compact_residency<9>(), hc_compact_residency<10>(),
+            hc_compact_residency<11>(), hc_compact_residency<12>()});
+        capacity = sms * per_sm;
+    }
+#endif
+    hc_grid_[dev] = std::min(capacity, cap ? cap : H_BLOCKS);
+    hc_wide_grid_[dev] = std::min(sms, cap ? cap : H_BLOCKS);
 #if FNX_HIP
     // FNX_HC_GRID=n (screen): n blocks of the read resident at once instead of one per multiprocessor. An R9700 reports 32 (one per WGP of two CUs), so the 80 blocks of work
     // ran in 2-3 turns each; several blocks fit one WGP, and a barrier that waits too long sets err bit 4 rather than hang
-    if (const long long g = env_int("FNX_HC_GRID", 0); g > 0) hc_grid_[dev] = (int) std::min<long long>(g, cap ? cap : H_BLOCKS);
+    if (const long long g = env_int("FNX_HC_GRID", 0); g > 0) {
+        const int requested = (int) std::min<long long>(g, cap ? cap : H_BLOCKS);
+        if (hc_compact() && requested > capacity)
+            throw std::runtime_error("FNX_HC_GRID exceeds compact kernel residency");
+        hc_grid_[dev] = requested;
+        hc_wide_grid_[dev] = hc_compact() ? std::min(requested, sms) : requested;
+    }
+    if (hc_compact()) std::fprintf(stderr, "fnx: HC row group 64, grid %d, resident capacity %d on card %d\n",
+                                   hc_grid_[dev], capacity, dev);
 #endif
     // a counter left by another grid sits mid-generation for this one: its next barrier would let blocks through early
-    const unsigned zero = 0;
-    const cudaError_t z = cudaMemcpy(scratch + hc_scratch_floats(MAXT) - 1, &zero, sizeof zero, cudaMemcpyHostToDevice);
+    const unsigned zero[2] = {};
+    const cudaError_t z = cudaMemcpy(scratch + hc_scratch_floats(MAXT) - 2, zero, sizeof zero, cudaMemcpyHostToDevice);
     if (z != cudaSuccess) throw std::runtime_error(std::string("hc_prepare: the barrier counter: ") + cudaGetErrorString(z));
     return hc_grid_[dev];
 }
@@ -1218,40 +1351,47 @@ void hc_read(float* R, const float* bo, const float* inj_prev, const float* w_no
     a.ssp = a.part + (size_t) H_NS * T * H_ROWS;
     a.loq = (int8_t*) (a.ssp + (size_t) T * H_NS);
     a.lod = a.ssp + (size_t) T * H_NS + (size_t) T * LR / 4;
-    // the barrier's counter: the last float of a scratch sized for MAXT rows, so it stays put whatever T is
-    a.bar = (unsigned*) (scratch + hc_scratch_floats(MAXT) - 1);
+    // Separate counters keep each grid in its own barrier generation when T changes.
+    const bool compact = hc_compact() && T <= 12;
+    a.bar = (unsigned*) (scratch + hc_scratch_floats(MAXT) - (compact ? 1 : 2));
     if (q8) twin_of(q8, N, a.tq, a.td);
     cudaStream_t s = (cudaStream_t) st;
     const bool one = T <= hc1_rows();
-    const int grid = hc_grid();
+    const int prepared_grid = hc_grid(), dev = hc_dev();
+    const int grid = compact ? prepared_grid : hc_wide_grid_[dev];
+    a.timeout_ticks = hc_timeout_[dev];
     switch (T) {
-        case 1: hc_launch<1>(a, s, one, grid); break;
-        case 2: hc_launch<2>(a, s, one, grid); break;
-        case 3: hc_launch<3>(a, s, one, grid); break;
-        case 4: hc_launch<4>(a, s, one, grid); break;
-        case 5: hc_launch<5>(a, s, one, grid); break;
-        case 6: hc_launch<6>(a, s, one, grid); break;
-        case 7: hc_launch<7>(a, s, one, grid); break;
-        case 8: hc_launch<8>(a, s, one, grid); break;
-        case 9: hc_launch<9>(a, s, one, grid); break;
-        case 10: hc_launch<10>(a, s, one, grid); break;
-        case 11: hc_launch<11>(a, s, one, grid); break;
-        case 12: hc_launch<12>(a, s, one, grid); break;
-        case 13: hc_launch<13>(a, s, one, grid); break;
-        case 14: hc_launch<14>(a, s, one, grid); break;
-        case 15: hc_launch<15>(a, s, one, grid); break;
-        case 16: hc_launch<16>(a, s, one, grid); break;
+        case 1: hc_launch<1>(a, s, one, grid, compact); break;
+        case 2: hc_launch<2>(a, s, one, grid, compact); break;
+        case 3: hc_launch<3>(a, s, one, grid, compact); break;
+        case 4: hc_launch<4>(a, s, one, grid, compact); break;
+        case 5: hc_launch<5>(a, s, one, grid, compact); break;
+        case 6: hc_launch<6>(a, s, one, grid, compact); break;
+        case 7: hc_launch<7>(a, s, one, grid, compact); break;
+        case 8: hc_launch<8>(a, s, one, grid, compact); break;
+        case 9: hc_launch<9>(a, s, one, grid, compact); break;
+        case 10: hc_launch<10>(a, s, one, grid, compact); break;
+        case 11: hc_launch<11>(a, s, one, grid, compact); break;
+        case 12: hc_launch<12>(a, s, one, grid, compact); break;
+        case 13: hc_launch<13>(a, s, one, grid, compact); break;
+        case 14: hc_launch<14>(a, s, one, grid, compact); break;
+        case 15: hc_launch<15>(a, s, one, grid, compact); break;
+        case 16: hc_launch<16>(a, s, one, grid, compact); break;
         default: throw std::runtime_error("hc_read: T out of range");
     }
     ck_launch("hc_read");
 }
 
 void hc_preset_barrier(float* scratch, unsigned barriers_left) {
-    const unsigned g = (unsigned) hc_grid(), mod = hc_bar_mod(g);
-    if (barriers_left == 0 || barriers_left > mod / g)
-        throw std::runtime_error("hc_preset_barrier: barriers_left must be 1.." + std::to_string(mod / g));
-    const unsigned v = mod - barriers_left * g;
-    const cudaError_t e = cudaMemcpy(scratch + hc_scratch_floats(MAXT) - 1, &v, sizeof v, cudaMemcpyHostToDevice);
+    const unsigned grids[2] = {(unsigned) hc_wide_grid_[hc_dev()], (unsigned) hc_grid()};
+    unsigned values[2];
+    for (int i = 0; i < 2; ++i) {
+        const unsigned g = grids[i], mod = hc_bar_mod(g);
+        if (barriers_left == 0 || barriers_left > mod / g)
+            throw std::runtime_error("hc_preset_barrier: barriers_left must be 1.." + std::to_string(mod / g));
+        values[i] = mod - barriers_left * g;
+    }
+    const cudaError_t e = cudaMemcpy(scratch + hc_scratch_floats(MAXT) - 2, values, sizeof values, cudaMemcpyHostToDevice);
     if (e != cudaSuccess) throw std::runtime_error(std::string("hc_preset_barrier: ") + cudaGetErrorString(e));
 }
 
@@ -1321,13 +1461,36 @@ void qsa_index(const float* y, const float* qn, const float* kn, uint16_t* ring,
     ck_launch("qsa_index");
 }
 
+static void qsa_select_positions(const float* scores, int* cells, int* n_cells, int max_pools, const int* pos0,
+                                 LaneRows lr, int T, int stride, int card, cudaStream_t s) {
+    if (!attn_head_split()) {
+        k_idx_select<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, card, lr);
+        return;
+    }
+#if FNX_HIP && FNX_NCARD == 2 && !FNX_27B
+    static const bool paired = env_flag("FNX_QSA_PAIRED");
+    if (paired && max_pools <= QSA_PAIR_MAX_POOLS) {
+        static const bool sample = env_flag("FNX_QSA_SAMPLE_PIVOT");
+        static const bool prompt_sample = env_flag("FNX_PF_QSA_SAMPLE");
+        if (sample && (T <= 16 || (prompt_sample && stride <= 512)))
+            k_idx_select_pair<true><<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, stride, lr);
+        else
+            k_idx_select_pair<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, stride, lr);
+        return;
+    }
+#endif
+    for (int partition = 0; partition < 2; ++partition)
+        k_idx_select<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells + (size_t) partition * stride * QSA_MAXSEL,
+            n_cells + partition * stride, max_pools, pos0, partition, lr);
+}
+
 void qsa_select(const float* q, const uint16_t* pooled, const KvPages& g, float* scores, int* cells, int* n_cells, int max_pools, const int* pos0, int T,
-                int card, void* st) {
+                int card, void* st, int selection_stride) {
     cudaStream_t s = (cudaStream_t) st;
     const __half* pl = reinterpret_cast<const __half*>(pooled);
     k_idx_score_tc<<<dim3((max_pools + QSC_KEYS - 1) / QSC_KEYS, (T + QSC_ROWS - 1) / QSC_ROWS), 256, 0, s>>>(q, pl, g, scores, max_pools,
                                                                                                          pos0, T);
-    k_idx_select<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, card, LaneRows{});
+    qsa_select_positions(scores, cells, n_cells, max_pools, pos0, {}, T, selection_stride ? selection_stride : T, card, s);
     ck_launch("qsa_select");
 }
 
@@ -1337,13 +1500,13 @@ void qsa_select_lanes(const float* q, const uint16_t* pooled, const KvPages& g, 
     if (!lr.pos || !lr.pt) throw std::runtime_error("qsa_select_lanes: no lane rows");
     static const bool dense_only = env_flag("FNX_QSA_DENSE");
     if (dense_only) {
-        cudaMemsetAsync(n_cells, 0xff, (size_t) T * sizeof(int), s);   // checked by ck_launch below
+        cudaMemsetAsync(n_cells, 0xff, (size_t) attn_position_partitions() * T * sizeof(int), s);   // checked by ck_launch below
         ck_launch("qsa_select_lanes");
         return;
     }
     const __half* pl = reinterpret_cast<const __half*>(pooled);
     k_idx_score<<<dim3((max_pools + 255) / 256, T), 256, 0, s>>>(q, pl, g, scores, max_pools, nullptr, lr);
-    k_idx_select<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, nullptr, card, lr);
+    qsa_select_positions(scores, cells, n_cells, max_pools, nullptr, lr, T, T, card, s);
     ck_launch("qsa_select_lanes");
 }
 int qsa_rows() { return QSA_ROWS; }
@@ -1387,12 +1550,12 @@ void qsa(const uint16_t* wq, const uint16_t* wk, const float* x, float* y, const
     // FNX_QSA_DENSE=1 (for comparisons): no selection, every row attends every position
     static const bool dense_only = env_flag("FNX_QSA_DENSE");
     if (dense_only) {
-        cudaMemsetAsync(n_cells, 0xff, (size_t) T * sizeof(int), s);   // checked by ck_launch below
+        cudaMemsetAsync(n_cells, 0xff, (size_t) attn_position_partitions() * T * sizeof(int), s);   // checked by ck_launch below
         ck_launch("qsa");
         return;
     }
     k_idx_score<<<dim3((max_pools + 255) / 256, T), 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, LaneRows{});
-    k_idx_select<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, card, LaneRows{});
+    qsa_select_positions(scores, cells, n_cells, max_pools, pos0, {}, T, T, card, s);
     ck_launch("qsa");
 }
 
@@ -1401,8 +1564,24 @@ size_t att_ring_words() { return (size_t) 2 * (NCARD - 1) * ATT_ROWS * ATT_OWN *
 int attn_rows() { return ATT_ROWS; }
 int kv_rows_per_card(int n_ctx) { return (n_ctx / 4 + NCARD - 1) / NCARD * 4 + 4; }
 
+static void attn_head_partials(const float* qg, const __half* kc, const __half* vc, const KvPages& g, float* acc,
+                               AttPart* mz, const int* pos, const int* cells, const int* counts, int card, int T,
+                               LaneRows lr, int stride, cudaStream_t s) {
+    const dim3 grid(ATT_SPLITS, T, 2);
+#if FNX_HIP && FNX_NCARD == 2 && !FNX_27B
+    static const bool gather = env_flag("FNX_ATTN_HEAD_Q8_GATHER");
+    if (gather && g.q8) {
+        k_attn_part_head<true><<<grid, HD, 0, s>>>(qg, kc, vc, g, acc, mz, ATT_OWN, card * ATT_OWN, 1, card,
+                                                   pos, cells, counts, card, T, lr, stride);
+        return;
+    }
+#endif
+    k_attn_part_head<<<grid, HD, 0, s>>>(qg, kc, vc, g, acc, mz, ATT_OWN, card * ATT_OWN, 1, card,
+                                         pos, cells, counts, card, T, lr, stride);
+}
+
 void attn(const float* qg, const uint16_t* kc16, const uint16_t* vc16, const KvPages& g, float* out, const AttRing& ar, const unsigned* tag,
-          int call, const int* pos0, int T, float* scratch, void* st, const int* cells, const int* n_cells) {
+          int call, const int* pos0, int T, float* scratch, void* st, const int* cells, const int* n_cells, int selection_stride) {
     ring_call_check(call, "attn");
     float* acc = scratch;
     if (T > ATT_ROWS) throw std::runtime_error("attn: more rows than its buffers hold");
@@ -1411,6 +1590,13 @@ void attn(const float* qg, const uint16_t* kc16, const uint16_t* vc16, const KvP
     const __half* kc = reinterpret_cast<const __half*>(kc16);
     const __half* vc = reinterpret_cast<const __half*>(vc16);
     cudaStream_t s = (cudaStream_t) st;
+    if (attn_head_split()) {
+        attn_head_partials(qg, kc, vc, g, acc, mz, pos0, cells, n_cells, ar.card, T, {}, selection_stride ? selection_stride : T, s);
+        k_attn_local_head<<<dim3(ATT_OWN, T, 2), HD, 0, s>>>(acc, mz, part, T);
+        k_attn_merge_head<<<dim3(ATT_OWN, T), HD, 0, s>>>(qg, part, out, T, ar.onehop ? 0 : 1 - ar.card);
+        ck_launch("attn head split");
+        return;
+    }
     k_attn_part<<<dim3(ATT_SPLITS, T, NKVH), HD, 0, s>>>(qg, kc, vc, g, acc, mz, NQH, 0, NKVH, 0, pos0, cells, n_cells, ar.card, LaneRows{});
     k_attn_local<<<dim3(NQH, T), HD, 0, s>>>(acc, mz, part);
     if (ar.onehop) k_att_merge_a2a<<<dim3(ATT_OWN, T), HD, 0, s>>>(ar, qg, part, out, T, tag, call);
@@ -1423,6 +1609,12 @@ void attn_part_lanes(const float* qg, const uint16_t* kc16, const uint16_t* vc16
     if (T > ATT_ROWS) throw std::runtime_error("attn: more rows than its buffers hold");
     if (!lr.pos || !lr.pt) throw std::runtime_error("attn_part_lanes: no lane rows");
     AttPart* mz = reinterpret_cast<AttPart*>(scratch + (size_t) ATT_ROWS * NQH * ATT_SPLITS * HD);
+    if (attn_head_split()) {
+        attn_head_partials(qg, reinterpret_cast<const __half*>(kc16), reinterpret_cast<const __half*>(vc16),
+                           g, scratch, mz, nullptr, cells, n_cells, card, T, lr, T, (cudaStream_t) st);
+        ck_launch("attn head lanes");
+        return;
+    }
     k_attn_part<<<dim3(ATT_SPLITS, T, NKVH), HD, 0, (cudaStream_t) st>>>(qg, reinterpret_cast<const __half*>(kc16),
                                                                        reinterpret_cast<const __half*>(vc16), g, scratch, mz, NQH, 0,
                                                                        NKVH, 0, nullptr, cells, n_cells, card, lr);
@@ -1434,6 +1626,12 @@ void attn_finish(const float* qg, float* out, const AttRing& ar, const unsigned*
     AttPart* mz = reinterpret_cast<AttPart*>(scratch + (size_t) ATT_ROWS * NQH * ATT_SPLITS * HD);
     float* part = scratch + (size_t) ATT_ROWS * NQH * ATT_SPLITS * (HD + 2);
     cudaStream_t s = (cudaStream_t) st;
+    if (attn_head_split()) {
+        k_attn_local_head<<<dim3(ATT_OWN, T, 2), HD, 0, s>>>(scratch, mz, part, T);
+        k_attn_merge_head<<<dim3(ATT_OWN, T), HD, 0, s>>>(qg, part, out, T, ar.onehop ? 0 : 1 - ar.card);
+        ck_launch("attn head finish");
+        return;
+    }
     k_attn_local<<<dim3(NQH, T), HD, 0, s>>>(scratch, mz, part);
     if (ar.onehop) k_att_merge_a2a<<<dim3(ATT_OWN, T), HD, 0, s>>>(ar, qg, part, out, T, tag, call);
     else k_att_merge<<<dim3(ATT_OWN, T), HD, 0, s>>>(ar, qg, part, out, T, tag, call);
@@ -1468,6 +1666,27 @@ void attn_prompt(const float* qg, const uint16_t* kc, const uint16_t* vc, const 
                                                                          reinterpret_cast<const __half*>(vc), g, pos0, cells, n_cells,
                                                                          card, C, r0, part);
     ck_launch("attn_prompt");
+}
+
+void attn_prompt_heads(const float* qg, const uint16_t* kc, const uint16_t* vc, const KvPages& g, const int* pos0,
+                       const int* cells, const int* n_cells, int card, int C, float* part, float* out, void* st) {
+    cudaStream_t s = (cudaStream_t) st;
+#if FNX_HIP
+    static const bool direct = env_flag("FNX_PF_ATTN_DIRECT");
+    if (direct && g.q8) {
+        int dev = 0; hipDeviceProp_t prop{};
+        if (hipGetDevice(&dev) != hipSuccess || hipGetDeviceProperties(&prop, dev) != hipSuccess ||
+            std::string(prop.gcnArchName).rfind("gfx1100", 0) != 0)
+            throw std::runtime_error("FNX_PF_ATTN_DIRECT requires gfx1100");
+        k_pf_attn_head_direct<<<dim3(C, 2), 256, 0, s>>>(qg, reinterpret_cast<const __half*>(kc),
+            reinterpret_cast<const __half*>(vc), g, pos0, cells, n_cells, card, C, 0, part);
+    } else
+#endif
+    k_pf_attn_head<<<dim3(C, 2), AP_THREADS, AP_SMEM, s>>>(qg, reinterpret_cast<const __half*>(kc),
+        reinterpret_cast<const __half*>(vc), g, pos0, cells, n_cells, card, C, 0, part);
+    const size_t block = attn_prompt_block_floats(C);
+    k_pf_attn_merge_head<<<dim3(C, ATT_OWN), HD, 0, s>>>(part + card * block, part + (1 - card) * block, qg, out, C, card);
+    ck_launch("attn prompt heads");
 }
 
 void attn_prompt_merge(const float* own, const float* recv, const float* qg, float* out, int C, int card, void* st) {
@@ -1619,7 +1838,13 @@ void ring_sum(const Ring& r, float* x, int T, const unsigned* tag, int call, voi
     }
 #endif
     if (r.peer && T <= MAXT) {
-        k_ring_a2a_push<<<grid, 256, 0, (cudaStream_t) st>>>(r, x, T, tag, call, m);
+#if FNX_HIP
+        static const auto paired = env_int("FNX_RING_PAIRED_PUSH", 0);
+        if (paired != 0 && paired != 1) throw std::runtime_error("FNX_RING_PAIRED_PUSH: expected 0 or 1");
+        if (paired) k_ring_a2a_push_pair<<<grid, 256, 0, (cudaStream_t) st>>>(r, x, T, tag, call, m);
+        else
+#endif
+            k_ring_a2a_push<<<grid, 256, 0, (cudaStream_t) st>>>(r, x, T, tag, call, m);
         ck_launch("ring_sum (one hop, peer push)");
         return;
     }
@@ -1853,12 +2078,15 @@ void cache_copy(const ExpertCache& ec, int p, const int* list, void* st) {
     k_cache_copy<<<640, 256, 0, (cudaStream_t) st>>>(ec, p, list, ec.dn_off[p], ec.slot_bytes[p] - ec.dn_off[p]);
     ck_launch("cache_copy");
 }
-void moe_cache(int layer, size_t gu_stride, size_t dn_stride, const ExpertCache& ec, int* list, void* st, const Job* jobs, const int* njobs) {
+void moe_cache(int layer, size_t gu_stride, size_t dn_stride, const ExpertCache& ec, int* list, void* st, const Job* jobs, const int* njobs, bool padded, bool gu_only, bool defer_gu) {
     const int p = ec.pool_of[layer];
-    if (gu_stride != ec.dn_off[p] || ec.dn_off[p] + dn_stride != ec.slot_bytes[p])
-        throw std::runtime_error("moe_cache: the layer's experts are not its pool's size");
+    const bool fits = padded ? gu_stride <= ec.dn_off[p] && dn_stride <= ec.slot_bytes[p] - ec.dn_off[p]
+                             : gu_stride == ec.dn_off[p] && ec.dn_off[p] + dn_stride == ec.slot_bytes[p];
+    if (!fits || gu_stride % 16 || dn_stride % 16)
+        throw std::runtime_error("moe_cache: the layer's experts do not fit its pool");
+    if (defer_gu && !gu_only) throw std::runtime_error("moe_cache: deferred GU requires a fused down copy");
     if (jobs) k_cache_plan<<<1, 32, 0, (cudaStream_t) st>>>(jobs, njobs, layer, ec, list);
-    k_cache_copy<<<160, 256, 0, (cudaStream_t) st>>>(ec, p, list, gu_stride, dn_stride);
+    if (!defer_gu) k_cache_copy<<<160, 256, 0, (cudaStream_t) st>>>(ec, p, list, gu_stride, gu_only ? 0 : dn_stride);
     ck_launch("moe_cache");
 }
 namespace {
@@ -1876,6 +2104,7 @@ __global__ void k_arena_slots(ExpertCache ec, int from, int to) {
         }
         ec.owner[s] = -1;
         ec.ref[s] = lend ? 3 : 0;
+        if (ec.age) ec.age[s] = 0;
     }
     if (blockIdx.x == 0 && threadIdx.x == 0) {
         ec.lent[p] = to;
@@ -1916,12 +2145,23 @@ bool kv_q8() {
     return q8;
 }
 void kv_append(const float* k, const float* v, uint16_t* kc, uint16_t* vc, const KvPages& g, int card, int T, const int* pos0, void* st) {
+    if (attn_head_split()) {
+        k_kv_append_head<<<dim3(1, T), 256, 0, (cudaStream_t) st>>>(k, v, reinterpret_cast<__half*>(kc), reinterpret_cast<__half*>(vc), g, card, pos0);
+        ck_launch("kv_append heads");
+        return;
+    }
     k_kv_append<<<dim3(1, T), 256, 0, (cudaStream_t) st>>>(k, v, reinterpret_cast<__half*>(kc), reinterpret_cast<__half*>(vc), g, card,
                                                            pos0);
     ck_launch("kv_append");
 }
 void attn_prep_append(float* qg, float* k, const float* v, const float* q_norm, const float* k_norm, uint16_t* kc, uint16_t* vc,
                       const KvPages& g, int card, int T, const int* pos0, float eps, Rope base, void* st) {
+    if (attn_head_split()) {
+        k_attn_prep_append_head<<<dim3(ATT_OWN + 2, T), HD, 0, (cudaStream_t) st>>>(qg, k, v, q_norm, k_norm,
+            reinterpret_cast<__half*>(kc), reinterpret_cast<__half*>(vc), g, card, pos0, eps, base);
+        ck_launch("attn prep append heads");
+        return;
+    }
     k_attn_prep_append<<<dim3(NQH + 2 * NKVH, T), HD, 0, (cudaStream_t) st>>>(qg, k, v, q_norm, k_norm, reinterpret_cast<__half*>(kc),
                                                                           reinterpret_cast<__half*>(vc), g, card, pos0, eps, base);
     ck_launch("attn_prep_append");
@@ -1941,13 +2181,26 @@ size_t gdn_scratch_floats(int nv) { return (size_t) MAXT * nv * HS + (size_t) nv
 
 void gdn_core(const float* qkvz, const float* ab, float* hist, const float* convw, const float* dt, const float* a, const float* nw,
               float* S, void* yq, const int* ctl, float* scratch, float* snap, float* hsnap, int nk, int nv, const int* vmap, int T,
-              float eps, void* st, float* y32) {
+              float eps, void* st, float* y32, float* replay_log) {
     cudaStream_t s = (cudaStream_t) st;
     block_q8_1* y = (block_q8_1*) yq;
     int8_t* tq;
     float* td;
     twin_of(yq, nv * HS, tq, td);
+#if FNX_HIP && !FNX_27B
+    static const bool eight_parts = [] {
+        const auto value = env_int("FNX_GDN_EIGHT_PARTS", 0);
+        if (value != 0 && value != 1) throw std::runtime_error("FNX_GDN_EIGHT_PARTS: expected 0 or 1");
+        return value == 1;
+    }();
+#define FNX_GDN(t) \
+    if (replay_log && eight_parts && t >= 6) k_gdn_core_8<t, true><<<nv * GDN_Q, 256, 0, s>>>(qkvz, ab, hist, convw, dt, a, nw, S, y, ctl, scratch, snap, hsnap, nk, nv, vmap, eps, tq, td, y32, GdnLanes{}, replay_log); \
+    else if (replay_log) k_gdn_core<t, true><<<nv * GDN_Q, GDN_THREADS, 0, s>>>(qkvz, ab, hist, convw, dt, a, nw, S, y, ctl, scratch, snap, hsnap, nk, nv, vmap, eps, tq, td, y32, GdnLanes{}, replay_log); \
+    else k_gdn_core<t><<<nv * GDN_Q, GDN_THREADS, 0, s>>>(qkvz, ab, hist, convw, dt, a, nw, S, y, ctl, scratch, snap, hsnap, nk, nv, vmap, eps, tq, td, y32, GdnLanes{})
+#else
+    if (replay_log) throw std::runtime_error("GDN replay requires the Flash-Next HIP build");
 #define FNX_GDN(t) k_gdn_core<t><<<nv * GDN_Q, GDN_THREADS, 0, s>>>(qkvz, ab, hist, convw, dt, a, nw, S, y, ctl, scratch, snap, hsnap, nk, nv, vmap, eps, tq, td, y32, GdnLanes{})
+#endif
     switch (T) {
         case 1: FNX_GDN(1); break;
         case 2: FNX_GDN(2); break;
@@ -1969,6 +2222,14 @@ void gdn_core(const float* qkvz, const float* ab, float* hist, const float* conv
     }
 #undef FNX_GDN
     ck_launch("gdn_core");
+}
+
+void gdn_replay(const GdnReplayJob* jobs, int layers, int nv, int keep, void* st) {
+    if (!jobs || layers < 1 || nv < 1 || keep < 1 || keep >= MAXT)
+        throw std::runtime_error("gdn_replay: invalid jobs, shape or kept count");
+    const unsigned blocks = (unsigned) std::min<size_t>(32, ((size_t) nv * HS * HS + 255) / 256);
+    k_gdn_replay<<<dim3(blocks, layers), 256, 0, (cudaStream_t) st>>>(jobs, nv, keep);
+    ck_launch("gdn_replay");
 }
 
 void gdn_core_lanes(const float* qkvz, const float* ab, const float* convw, const float* dt, const float* a, const float* nw, void* yq,
@@ -2022,7 +2283,11 @@ static void gdn_prompt_impl(const float* qkvz, const float* ab, float* hist, con
                        float* chw, void* st) {
     cudaStream_t s = (cudaStream_t) st;
     const int ch = (2 * nk + nv) * HS;
-    k_gdn_pf_conv<<<dim3(C, 2 * nk + nv), HS, 0, s>>>(qkvz, hist, convw, ctl, xc, nk, nv);
+    static const bool row_waves = env_flag("FNX_PF_GDN_ROWS");
+    if (row_waves)
+        k_gdn_pf_conv_rows<<<(C * (2 * nk + nv) + GDN_PF_ROW_WAVES - 1) / GDN_PF_ROW_WAVES,
+            GDN_PF_ROW_THREADS, 0, s>>>(qkvz, hist, convw, ctl, xc, nk, nv, C);
+    else k_gdn_pf_conv<<<dim3(C, 2 * nk + nv), HS, 0, s>>>(qkvz, hist, convw, ctl, xc, nk, nv);
     k_gdn_pf_hist<<<(ch + 255) / 256, 256, 0, s>>>(qkvz, hist, ctl, ng, C, nk, nv);
 #if FNX_GDN_TC_ON
     // FNX_PFX_GDN_TC: on by default on NVIDIA sm_80+ except for the IQ3_S-type sets (FNX_PFX_GDN_TC=0/1 overrides): Strata's tensor-core chunk scan (gdn_tc_prompt.cuh); false -> this card cannot run it, the sub-chunk kernels below do
@@ -2040,11 +2305,15 @@ static void gdn_prompt_impl(const float* qkvz, const float* ab, float* hist, con
         return !e || !std::strcmp(e, "1");
     }();
     if (chunked) {
+        static const bool wide = env_flag("FNX_PF_GDN_WIDE");
         static thread_local bool smem_set[16] = {};
         int dev = 0;
         cudaGetDevice(&dev);
         if (!smem_set[dev]) {
-            if (cudaFuncSetAttribute(k_gdn_ch_rec, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) GCH_REC_SMEM) != cudaSuccess)
+            const auto status = wide
+                ? cudaFuncSetAttribute(k_gdn_ch_rec<32, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) GCH_REC_WIDE_SMEM)
+                : cudaFuncSetAttribute(k_gdn_ch_rec<GCB, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) GCH_REC_SMEM);
+            if (status != cudaSuccess)
                 ck_launch("gdn_prompt: shared memory");
             smem_set[dev] = true;
         }
@@ -2065,8 +2334,14 @@ static void gdn_prompt_impl(const float* qkvz, const float* ab, float* hist, con
             cudaStreamSynchronize(s);
             cudaFree(s0), cudaFree(yr);
         }
-        k_gdn_ch_prep<<<dim3((C + GCH - 1) / GCH, nv), GCH_THREADS, 0, s>>>(xc, ab, dt, a, vmap, nk, nv, C, chw);
-        k_gdn_ch_rec<<<nv * GCH_REC_BLOCKS_PER_HEAD, GCR_THREADS, GCH_REC_SMEM, s>>>(xc, chw, S, y32, nk, nv, vmap, C);
+        static const bool compact_prep = env_flag("FNX_PF_GDN_PREP_COMPACT");
+        if (compact_prep)
+            k_gdn_ch_prep_compact<<<dim3((C + GCH - 1) / GCH, nv), GCH_THREADS, 0, s>>>(xc, ab, dt, a, vmap, nk, nv, C, chw);
+        else k_gdn_ch_prep<<<dim3((C + GCH - 1) / GCH, nv), GCH_THREADS, 0, s>>>(xc, ab, dt, a, vmap, nk, nv, C, chw);
+        if (wide)
+            k_gdn_ch_rec<32, true><<<nv * (HS / 32), 256, GCH_REC_WIDE_SMEM, s>>>(xc, chw, S, y32, nk, nv, vmap, C);
+        else
+            k_gdn_ch_rec<GCB, false><<<nv * GCH_REC_BLOCKS_PER_HEAD, GCR_THREADS, GCH_REC_SMEM, s>>>(xc, chw, S, y32, nk, nv, vmap, C);
         if (check) {
             std::vector<float> y(ny), sn(ns);
             cudaMemcpyAsync(y.data(), y32, ny * 4, cudaMemcpyDeviceToHost, s);
@@ -2080,7 +2355,10 @@ static void gdn_prompt_impl(const float* qkvz, const float* ab, float* hist, con
             std::fprintf(stderr, "gdn check: C %d, outputs %.3g, end state %.3g (largest difference over largest value)\n", C,
                          rel(y_ref, y), rel(s_ref, sn));
         }
-        k_gdn_pf_norm_own<<<dim3(C, nv), HS, 0, s>>>(qkvz, nw, y32, nk, nv, eps);
+        if (row_waves)
+            k_gdn_pf_norm_rows<<<(C * nv + GDN_PF_ROW_WAVES - 1) / GDN_PF_ROW_WAVES,
+                GDN_PF_ROW_THREADS, 0, s>>>(qkvz, nw, y32, nk, nv, eps, C);
+        else k_gdn_pf_norm_own<<<dim3(C, nv), HS, 0, s>>>(qkvz, nw, y32, nk, nv, eps);
     } else {
         k_gdn_pf_rec<<<nv * GDN_Q, GDN_PF_THREADS, 0, s>>>(xc, ab, dt, a, S, y32, sq, nk, nv, vmap, C);
         k_gdn_pf_norm<<<dim3(C, nv), HS, 0, s>>>(qkvz, nw, sq, y32, nk, nv, eps);
@@ -2132,7 +2410,7 @@ namespace fnx {
 #if FNX_KPART == 8
 void router_route(const float* W, const float* x, float* logits, int T, int* topi, float* topw, Job* jobs_gu, Job* jobs_dn,
                   int* njobs, void* st, const ExpertCache* ec, int layer, int* list, const Q8S* sh_gu, int sh_rows, const void* sh_y,
-                  float* sh_out) {
+                  float* sh_out, const uint16_t* packed) {
     cudaStream_t s = (cudaStream_t) st;
     ShexpUp su;
     if (sh_gu) {
@@ -2149,7 +2427,10 @@ void router_route(const float* W, const float* x, float* logits, int T, int* top
     unsigned* counter = (unsigned*) (njobs + 1);
     const ExpertCache none{};
     if (ec && (layer < 0 || layer >= NL || !list)) throw std::runtime_error("router_route: a cache plan needs its layer and list");
-#define FNX_RR(t) k_router_route<t><<<grid, RR_THREADS, 0, s>>>(W, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su)
+#define FNX_RR(t) do { \
+    if (packed) k_router_route<t, true><<<grid, RR_THREADS, 0, s>>>(packed, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su); \
+    else k_router_route<t, false><<<grid, RR_THREADS, 0, s>>>(W, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su); \
+} while (0)
     switch (T) {
         case 1: FNX_RR(1); break;
         case 2: FNX_RR(2); break;
@@ -2177,7 +2458,10 @@ void router_route(const float* W, const float* x, float* logits, int T, int* top
 #if FNX_KPART == 2
 namespace {
 void moe_mm(bool down, const DW& A, size_t sa, const Job* jobs, const int* njobs, int njobs_max, const void* in, void* out,
-            void* st, int tt = 0) {
+            void* st, int tt = 0, const CacheDownCopy* copy = nullptr, const CacheGateUpCopy* gu_copy = nullptr) {
+    if ((copy || gu_copy) && (down || (A.type != T_IQ2_S && A.type != T_IQ3_XXS && A.type != T_IQ3_S)))
+        throw std::runtime_error("moe: cache copy requires IQ gate/up");
+    if (gu_copy && !copy) throw std::runtime_error("moe: gate/up copy requires a fused down copy");
     const int T = tt ? tt : njobs_max / TOPK;   // the most rows a job has
     const MoeW w{(const char*) A.p, sa, A.row_bytes, A.n_out, A.n_in, A.ep};
     cudaStream_t s = (cudaStream_t) st;
@@ -2188,13 +2472,16 @@ void moe_mm(bool down, const DW& A, size_t sa, const Job* jobs, const int* njobs
             break;
         case T_Q5_K: moe_launch<GGML_TYPE_Q5_K>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
         case T_Q5_1: moe_launch<GGML_TYPE_Q5_1>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
+        case T_Q5_0: moe_launch<GGML_TYPE_Q5_0>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
+        case T_IQ2_XXS: moe_launch<GGML_TYPE_IQ2_XXS>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
         case T_Q4_0: moe_launch<GGML_TYPE_Q4_0>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
+        case T_Q2_0: moe_launch<GGML_TYPE_Q4_0, true>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
         case T_Q8_0: moe_launch<GGML_TYPE_Q8_0>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
         case T_IQ4_NL: moe_launch<GGML_TYPE_IQ4_NL>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
         case T_IQ4_XS: moe_launch<GGML_TYPE_IQ4_XS>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
-        case T_IQ3_S: moe_launch<GGML_TYPE_IQ3_S>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
-        case T_IQ3_XXS: moe_launch<GGML_TYPE_IQ3_XXS>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
-        case T_IQ2_S: moe_launch<GGML_TYPE_IQ2_S>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
+        case T_IQ3_S: moe_launch<GGML_TYPE_IQ3_S>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T, copy, gu_copy); break;
+        case T_IQ3_XXS: moe_launch<GGML_TYPE_IQ3_XXS>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T, copy, gu_copy); break;
+        case T_IQ2_S: moe_launch<GGML_TYPE_IQ2_S>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T, copy, gu_copy); break;
         default: throw std::runtime_error("moe: expert type " + std::to_string(A.type) + " not handled");
     }
     ck_launch(down ? "moe_down" : "moe_gate_up");
@@ -2219,9 +2506,10 @@ __global__ void k_swiglu_stacked(const float* gu, block_q8_1* hq, int ffs, int8_
 }  // namespace
 
 void moe_gate_up(const DW& A, size_t sa, const Job* jobs, const int* njobs, int njobs_max, const void* xq, float* gu, void* st,
-                 const Q8S* sh_down, int sh_ffs, const float* sh_gu, float* sh_out) {
+                 const Q8S* sh_down, int sh_ffs, const float* sh_gu, float* sh_out, const CacheDownCopy* copy, const CacheGateUpCopy* gu_copy) {
+    if ((copy || gu_copy) && sh_down) throw std::runtime_error("moe_gate_up: cache copy cannot share Q4_K launch");
     if (!sh_down) {
-        moe_mm(false, A, sa, jobs, njobs, njobs_max, xq, gu, st);
+        moe_mm(false, A, sa, jobs, njobs, njobs_max, xq, gu, st, 0, copy, gu_copy);
         return;
     }
     if (sh_ffs < 32 || sh_ffs > SH_MAXF || sh_ffs % 32) throw std::runtime_error("moe_gate_up: the shared expert's FF slice");
@@ -2236,6 +2524,8 @@ void moe_gate_up(const DW& A, size_t sa, const Job* jobs, const int* njobs, int 
         case T_Q4_K: gu_q4k_launch(T, w, jobs, njobs, njobs_max, y, gu, s, sd); break;
         case T_Q5_K: gu_sd_launch<GGML_TYPE_Q5_K>(T, w, jobs, njobs, njobs_max, y, gu, s, sd); break;
         case T_Q5_1: gu_sd_launch<GGML_TYPE_Q5_1>(T, w, jobs, njobs, njobs_max, y, gu, s, sd); break;
+        case T_Q5_0: gu_sd_launch<GGML_TYPE_Q5_0>(T, w, jobs, njobs, njobs_max, y, gu, s, sd); break;
+        case T_IQ2_XXS: gu_sd_launch<GGML_TYPE_IQ2_XXS>(T, w, jobs, njobs, njobs_max, y, gu, s, sd); break;
         case T_Q4_0: gu_sd_launch<GGML_TYPE_Q4_0>(T, w, jobs, njobs, njobs_max, y, gu, s, sd); break;
         case T_Q8_0: gu_sd_launch<GGML_TYPE_Q8_0>(T, w, jobs, njobs, njobs_max, y, gu, s, sd); break;
         case T_IQ4_NL: gu_sd_launch<GGML_TYPE_IQ4_NL>(T, w, jobs, njobs, njobs_max, y, gu, s, sd); break;
@@ -2263,7 +2553,10 @@ void moe_mm_big(bool down, const DW& A, size_t sa, const BigJob* jobs, const int
             break;
         case T_Q5_K: moe_launch_big<GGML_TYPE_Q5_K>(down, w, jobs, njobs, njobs_cap, in, (float*) out, s); break;
         case T_Q5_1: moe_launch_big<GGML_TYPE_Q5_1>(down, w, jobs, njobs, njobs_cap, in, (float*) out, s); break;
+        case T_Q5_0: moe_launch_big<GGML_TYPE_Q5_0>(down, w, jobs, njobs, njobs_cap, in, (float*) out, s); break;
+        case T_IQ2_XXS: moe_launch_big<GGML_TYPE_IQ2_XXS>(down, w, jobs, njobs, njobs_cap, in, (float*) out, s); break;
         case T_Q4_0: moe_launch_big<GGML_TYPE_Q4_0>(down, w, jobs, njobs, njobs_cap, in, (float*) out, s); break;
+        case T_Q2_0: moe_launch_big<GGML_TYPE_Q4_0, true>(down, w, jobs, njobs, njobs_cap, in, (float*) out, s); break;
         case T_Q8_0: moe_launch_big<GGML_TYPE_Q8_0>(down, w, jobs, njobs, njobs_cap, in, (float*) out, s); break;
         case T_IQ4_NL: moe_launch_big<GGML_TYPE_IQ4_NL>(down, w, jobs, njobs, njobs_cap, in, (float*) out, s); break;
         case T_IQ4_XS: moe_launch_big<GGML_TYPE_IQ4_XS>(down, w, jobs, njobs, njobs_cap, in, (float*) out, s); break;
@@ -2338,11 +2631,30 @@ void q8s_launch(const Q8Segs& g, int rows, int cols, const block_q8_1* y, int T,
 template <bool SEG>
 void q8s_run(const Q8Segs& g, int rows, int cols, const void* y, int T, void* st) {
     if (cols % 16) throw std::runtime_error("q8s_gemv: columns must be a multiple of 16");
+    static const int row_group = [] {
+        const long long n = env_int("FNX_Q8S_ROW_GROUP", 0);
+        if (n != 0 && n != 1 && n != 2 && n != 4)
+            throw std::runtime_error("FNX_Q8S_ROW_GROUP: expected 0, 1, 2 or 4");
+        return (int) n;
+    }();
     const block_q8_1* yq = (const block_q8_1*) y;
     cudaStream_t s = (cudaStream_t) st;
+    // Optional large-matrix override; small projections retain their existing dispatch.
+    if (rows >= 8192 && row_group) {
+        if (row_group == 1) q8s_launch<1, SEG>(g, rows, cols, yq, T, s);
+        else if (row_group == 2) q8s_launch<2, SEG>(g, rows, cols, yq, T, s);
+        else q8s_launch<4, SEG>(g, rows, cols, yq, T, s);
+        ck_launch("q8s_gemv row group");
+        return;
+    }
     // rows per warp: four for big matrices (activation loads shared by more rows), one when that leaves few blocks. The
     // segmented variant only for its one use, q/k/v (8192 rows and more): fewer kernels to compile
     if constexpr (SEG) {
+        if (rows < 8192 && attn_head_split()) {
+            q8s_launch<2, SEG>(g, rows, cols, yq, T, s);
+            ck_launch("q8s head segments");
+            return;
+        }
         if (rows < 8192) throw std::runtime_error("q8s_gemv_segs: compiled for 8192 rows or more (q, k and v)");
         q8s_launch<4, SEG>(g, rows, cols, yq, T, s);
     } else {
@@ -2436,7 +2748,8 @@ void q8s_gemv_f32(const Q8S& w, int rows, int cols, const void* y, float* out, c
     if (rows >= 8192) q8s_ab_launch<4>(g, rows, cols, yq, W, x, yf, rf, T, s);
     else q8s_ab_launch<2>(g, rows, cols, yq, W, x, yf, rf, T, s);
 #else
-    if (rows < 4096 || rows >= 8192) throw std::runtime_error("q8s_gemv_f32: compiled for 4096..8191 rows (qkvz)");
+    if (rows < 4096 || (rows >= 8192 && env_int("FNX_Q8S_ROW_GROUP", 0) != 2))
+        throw std::runtime_error("q8s_gemv_f32: requires rows >= 4096 and FNX_Q8S_ROW_GROUP=2 for rows >= 8192");
     q8s_ab_launch<2>(g, rows, cols, yq, W, x, yf, rf, T, s);
 #endif
     ck_launch("q8s_gemv_f32");

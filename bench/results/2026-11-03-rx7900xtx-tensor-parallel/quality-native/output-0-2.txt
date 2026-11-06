@@ -1,0 +1,47 @@
+```python
+from collections import defaultdict, deque
+import heapq
+
+
+def topological_sort(nodes, edges):
+    # Convert inputs to sets to handle duplicates and avoid mutation
+    node_set = set(nodes)
+    edge_set = set(edges)
+    
+    # Validate edge endpoints
+    for src, tgt in edge_set:
+        if src not in node_set:
+            raise ValueError(f"Edge endpoint {src} not in nodes")
+        if tgt not in node_set:
+            raise ValueError(f"Edge endpoint {tgt} not in nodes")
+    
+    # Build adjacency list and in-degree count
+    adj = defaultdict(list)
+    in_degree = {node: 0 for node in node_set}
+    
+    for src, tgt in edge_set:
+        adj[src].append(tgt)
+        in_degree[tgt] += 1
+    
+    # Use a min-heap to get lexicographically smallest order
+    # Start with all nodes that have in-degree 0
+    heap = [node for node in node_set if in_degree[node] == 0]
+    heapq.heapify(heap)
+    
+    result = []
+    
+    while heap:
+        node = heapq.heappop(heap)
+        result.append(node)
+        
+        for neighbor in adj[node]:
+            in_degree[neighbor] -= 1
+            if in_degree[neighbor] == 0:
+                heapq.heappush(heap, neighbor)
+    
+    # Check for cycle: if not all nodes are in result, there's a cycle
+    if len(result) != len(node_set):
+        raise ValueError("Cycle detected in graph")
+    
+    return result
+```<|im_end|>
