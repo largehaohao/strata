@@ -1111,11 +1111,21 @@ void Engine::attention(int T, CardBuf& b, const CardW& w, const LayerW& L, uint1
 void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW& L, float* R, const int* ctl, int lyr) {
     const int P = T * TOPK, ffs = w.ff1 - w.ff0;
     hc_read(R, b.bo_a, b.inj_a, L.hc_norm[1], L.hc_down[1], L.hc_up[1], L.hc_inj[1], m_.eps, b.mixed, b.inj_f, b.hcs, b.ring.err, T, b.st, b.xq);
+    const bool static_live = b.static_cache.n_slots && lyr >= 0 && lyr < NL;
+    const ExpertCache& ec = static_live ? b.static_cache : w.ec;
+    static const int fused_dn_blocks = (int) env_int("FNX_STATIC_CACHE_FUSED_DN", 0);
+    const bool fused_dn = static_live && fused_dn_blocks &&
+        (L.gu_e.type == T_IQ2_S || L.gu_e.type == T_IQ3_XXS || L.gu_e.type == T_IQ3_S);
+    static const bool fused_gu_enabled = env_int("FNX_STATIC_CACHE_FUSED_GU", 0) == 1;
+    const bool fused_gu = fused_dn && fused_gu_enabled;
     // the shared expert (rows P + t of part): its gate|up in the router's launch and its swiglu and down in the routed
     // gate|up's (Q4_K experts), else on the second stream (a fork and a join cost ~5 us more than the launches' blocks)
     // (every expert type moe_gate_up handles; FNX_SH_FUSE=0 puts the non-Q4_K types back on the second stream)
     static const bool sh_all = env_int("FNX_SH_FUSE", 1) != 0;
-    const bool sh_in = (L.gu_e.type == T_Q4_K || (sh_all && (L.gu_e.type == T_Q5_K || L.gu_e.type == T_Q5_1 || L.gu_e.type == T_Q4_0 || L.gu_e.type == T_Q8_0 || L.gu_e.type == T_IQ4_NL || L.gu_e.type == T_IQ4_XS || L.gu_e.type == T_IQ3_S || L.gu_e.type == T_IQ3_XXS || L.gu_e.type == T_IQ2_S))) && L.sh_gu.s.q && L.sh_down.s.q && ffs % 32 == 0 && ffs <= SH_MAXF;
+    // The shared-expert launch does not consume the fused cache-copy descriptors.
+    // If moe_cache defers those copies, the IQ launch must perform them before
+    // either projection reads a cold expert; run the shared expert on st2 then.
+    const bool sh_in = !fused_dn && (L.gu_e.type == T_Q4_K || (sh_all && (L.gu_e.type == T_Q5_K || L.gu_e.type == T_Q5_1 || L.gu_e.type == T_Q4_0 || L.gu_e.type == T_Q8_0 || L.gu_e.type == T_IQ4_NL || L.gu_e.type == T_IQ4_XS || L.gu_e.type == T_IQ3_S || L.gu_e.type == T_IQ3_XXS || L.gu_e.type == T_IQ2_S))) && L.sh_gu.s.q && L.sh_down.s.q && ffs % 32 == 0 && ffs <= SH_MAXF;
     if (!sh_in) {
         ck(cudaEventRecord(b.fork, b.st), "fork");
         ck(cudaStreamWaitEvent(b.st2, b.fork, 0), "fork wait");
@@ -1126,13 +1136,6 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
     }
     // experts in RAM: the router's last block plans this window's slots (the prefetch probe scores the picks against
     // the slots as they were, so with it the plan runs after, in moe_cache)
-    const bool static_live = b.static_cache.n_slots && lyr >= 0 && lyr < NL;
-    const ExpertCache& ec = static_live ? b.static_cache : w.ec;
-    static const int fused_dn_blocks = (int) env_int("FNX_STATIC_CACHE_FUSED_DN", 0);
-    const bool fused_dn = static_live && fused_dn_blocks &&
-        (L.gu_e.type == T_IQ2_S || L.gu_e.type == T_IQ3_XXS || L.gu_e.type == T_IQ3_S);
-    static const bool fused_gu_enabled = env_int("FNX_STATIC_CACHE_FUSED_GU", 0) == 1;
-    const bool fused_gu = fused_dn && fused_gu_enabled;
     const bool live = (static_live || cache_live()) && lyr >= 0 && lyr < NL;
     const bool plan_in_router = live && !b.probe_cnt;
     router_route(L.router, b.mixed, b.logits, T, b.topi, b.topw, b.jobs_gu, b.jobs_dn, b.njobs, b.st, plan_in_router ? &ec : nullptr,
