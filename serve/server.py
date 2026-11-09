@@ -224,8 +224,8 @@ DS41_DEFAULT_BUDGET = 32768   # DeepSeek-V4.1 only: the thinking budget when nei
 DS41_SMALL_CAP_MIN = 48       # DeepSeek-V4.1 only: from this max_tokens up to ANSWER_ROOM_MIN_CAP, thinking is capped at half of it
 ANSWER_RESERVE_MIN = 512     # #984: the tokens kept for the answer when a thinking budget is cut down to fit max_tokens
 # #123: what closes the thinking when it reaches reasoning_budget_tokens (the model's own end-of-thinking tag after it)
-# #1053 (opt-in "reasoning_close_retry": true): a reply that ends on its stop token still inside <think>, with no answer
-# and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
+# #1053 (opt-in "reasoning_close_retry": true): a reply that stops or repeats one token inside <think>, with no answer
+# and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it).
 REASONING_CLOSE = "\n</think>\n\n"
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
 # #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
@@ -6537,17 +6537,33 @@ class Service:
                                   f"(coverage={repeat_coverage:.3f}); resuming the same output with the low-effort "
                                   "instruction (reasoning_loop_recovery)", flush=True)
                             continue
-                        if (self.reasoning_close_retry and thinking and finish == "stop" and not close_retried
+                        repeat_close = repeated and parser.clean and not detok.pending()
+                        if (self.reasoning_close_retry and thinking and (finish == "stop" or repeat_close) and not close_retried
                                 and not answered and not wrap and not opens and parser.state == "reasoning"
                                 and parser.buf != THINK_END         # #537: not after a held </think>, the end
                                 and (stops is None or stops.hit is None) and not cancel.is_set()):
-                            # #1053: the model wrote its reasoning and stopped before </think>: the client would get
-                            # an empty answer.  Close the thinking once and let it answer.
+                            # #1053: stopping inside thinking, including the single-token repeat guard, leaves
+                            # no answer. Close the thinking once, within the same output cap, and let it answer.
                             close_retried = True
                             extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
                             if max_new - n - len(extra) >= 1:
-                                print("[strata] the reply ended inside its thinking with no answer: closing the "
-                                      "thinking once and continuing (reasoning_close_retry)", flush=True)
+                                cause = "repeated one token inside its thinking" if repeated else "ended inside its thinking"
+                                if repeated:
+                                    # The opt-in recovery must not resume the same greedy loop. Only this
+                                    # continuation gets sampling and penalties; preserve the original request.
+                                    top_k = (sampling or {}).get("top_k")
+                                    sampling = {**(sampling or {}),
+                                        "temperature": max(1.0, float((sampling or {}).get("temperature") or 0)),
+                                        "top_p": max(0.95, float((sampling or {}).get("top_p") or 0)),
+                                        "top_k": 0 if top_k == 0 else max(20, int(top_k or 20)),
+                                        "presence_penalty": max(1.5, float((sampling or {}).get("presence_penalty") or 0)),
+                                        "frequency_penalty": max(0.25, float((sampling or {}).get("frequency_penalty") or 0)),
+                                        "penalty_last_n": max(256, int((sampling or {}).get("penalty_last_n") or 0))}
+                                print(f"[strata] the reply {cause} with no answer: closing the thinking once and "
+                                      f"continuing{' with anti-repeat sampling' if repeated else ''} "
+                                      "(reasoning_close_retry)", flush=True)
+                                repeated = False
+                                run_tok, run_len = None, 0
                                 for t in extra:
                                     n += 1
                                     raw_ids.append(t)

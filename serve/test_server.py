@@ -4236,8 +4236,9 @@ class ReasoningCloseRetry(unittest.TestCase):
         self.httpd.shutdown()
         self.httpd.server_close()
 
-    def chat(self):
+    def chat(self, **extra):
         body = {"model": "m", "messages": [{"role": "user", "content": "2+2?"}], "max_tokens": 300}
+        body.update(extra)
         req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=30) as r:
@@ -4272,6 +4273,103 @@ class ReasoningCloseRetry(unittest.TestCase):
         self.assertEqual(len(self.engine.prompts), 1)
         self.assertFalse(c["message"].get("content"))
         self.assertEqual(c["message"]["reasoning_content"], 'two plus two is "4"')
+
+    def test_repeated_thinking_still_ends_as_length_by_default(self):
+        self.engine.THOUGHT = "!" * 500
+        self.svc.repeat_stop_tokens = 8
+        c = self.chat()
+        self.assertEqual(len(self.engine.prompts), 1)
+        self.assertEqual(c["finish_reason"], "length")
+        self.assertFalse(c["message"].get("content"))
+
+    def test_repeated_thinking_is_closed_once_and_answers(self):
+        self.engine.THOUGHT = "!" * 500
+        self.svc.repeat_stop_tokens = 8
+        self.svc.reasoning_close_retry = True
+        c = self.chat()
+        self.assertEqual(len(self.engine.prompts), 2)
+        self.assertTrue(self.tok.decode(self.engine.prompts[1]).endswith("</think>\n\n"))
+        self.assertEqual(c["message"]["content"], self.engine.ANSWER)
+        self.assertEqual(c["finish_reason"], "stop")
+
+    def test_repeat_in_an_answer_is_not_retried(self):
+        self.engine.THOUGHT = "ok</think>\n\n" + "!" * 500
+        self.svc.repeat_stop_tokens = 8
+        self.svc.reasoning_close_retry = True
+        c = self.chat()
+        self.assertEqual(len(self.engine.prompts), 1)
+        self.assertEqual(c["finish_reason"], "length")
+
+    def test_only_the_repeat_continuation_relaxes_greedy_sampling(self):
+        self.engine.THOUGHT = "!" * 500
+        self.svc.repeat_stop_tokens = 8
+        self.svc.reasoning_close_retry = True
+        with mock.patch.object(self.engine, "generate", wraps=self.engine.generate) as generate:
+            c = self.chat(temperature=0, top_k=1, top_p=0.1)
+        first, retry = [call.args[2] for call in generate.call_args_list]
+        self.assertEqual((first["temperature"], first["top_k"], first["top_p"]), (0, 1, 0.1))
+        self.assertGreater(retry["temperature"], 0)
+        self.assertGreater(retry["top_k"], 1)
+        self.assertGreater(retry["presence_penalty"], 0)
+        self.assertGreater(retry["frequency_penalty"], 0)
+        self.assertEqual(c["finish_reason"], "stop")
+
+    def test_a_second_repeat_is_not_retried(self):
+        self.engine.THOUGHT = "!" * 500
+        self.engine.ANSWER = "?" * 500
+        self.svc.repeat_stop_tokens = 8
+        self.svc.reasoning_close_retry = True
+        c = self.chat()
+        self.assertEqual(len(self.engine.prompts), 2)
+        self.assertEqual(c["finish_reason"], "length")
+
+    def test_repeat_retry_does_not_exceed_the_output_cap(self):
+        self.engine.THOUGHT = "!" * 500
+        self.svc.repeat_stop_tokens = 8
+        self.svc.reasoning_close_retry = True
+        c = self.chat(max_tokens=8)
+        self.assertEqual(len(self.engine.prompts), 1)
+        self.assertEqual(c["finish_reason"], "length")
+        self.assertFalse(c["message"].get("content"))
+
+    def test_repeat_retry_can_finish_with_a_tool_call(self):
+        self.engine.THOUGHT = "!" * 500
+        self.engine.ANSWER = '<tool_call>\n{"name":"check","arguments":{"value":4}}\n</tool_call>'
+        self.svc.repeat_stop_tokens = 8
+        self.svc.reasoning_close_retry = True
+        c = self.chat(tools=[{"type": "function", "function": {"name": "check", "parameters": {
+            "type": "object", "properties": {"value": {"type": "integer"}}, "required": ["value"]}}}])
+        self.assertEqual(len(self.engine.prompts), 2)
+        self.assertEqual(c["finish_reason"], "tool_calls")
+        call = c["message"]["tool_calls"][0]["function"]
+        self.assertEqual(call["name"], "check")
+        self.assertEqual(json.loads(call["arguments"]), {"value": 4})
+
+    def test_repeat_retry_completes_the_stream(self):
+        self.engine.THOUGHT = "!" * 500
+        self.svc.repeat_stop_tokens = 8
+        self.svc.reasoning_close_retry = True
+        body = {"model": "m", "messages": [{"role": "user", "content": "2+2?"}],
+                "max_tokens": 300, "stream": True, "stream_options": {"include_usage": True}}
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        events, ended = [], False
+        with urllib.request.urlopen(req, timeout=30) as response:
+            for line in response:
+                if not line.startswith(b"data: "):
+                    continue
+                data = line[6:].strip()
+                if data == b"[DONE]":
+                    ended = True
+                    break
+                events.append(json.loads(data))
+        choices = [c for e in events for c in e.get("choices", [])]
+        text = "".join(c.get("delta", {}).get("content", "") for c in choices)
+        self.assertTrue(ended)
+        self.assertEqual(text, self.engine.ANSWER)
+        self.assertEqual([c["finish_reason"] for c in choices if c.get("finish_reason")], ["stop"])
+        self.assertLessEqual(next(e["usage"]["completion_tokens"] for e in events if e.get("usage")), 300)
+        self.assertEqual(len(self.engine.prompts), 2)
 
 
 class ThinkingBudget(unittest.TestCase):
