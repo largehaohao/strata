@@ -1319,9 +1319,34 @@ bool strata_pf_gemm_narrow_f16(const uint16_t* X, const uint16_t* W, float* Y, i
     return strata_pf_gemm_narrow_f16_ld(X, K, W, K, Y, T, N, K, ldy, stream);
 }
 
+// The measured rocBLAS small-row sum order also matches rows 2..15 on
+// gfx1100. A one-row GEMV uses a different order and keeps its original path.
+// Cache the architecture check per device; this opt-in does no property query
+// when disabled, or for the existing 16..63-row dispatch.
+static bool short_gsu3_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("STRATA_PF_SHORT_GSU3");
+        return v && v[0] == '1' && v[1] == 0;
+    }();
+    if (!enabled) return false;
+    static std::atomic<int> cache[64];
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 64) return false;
+    int c = cache[dev].load(std::memory_order_acquire);
+    if (!c) {
+        hipDeviceProp_t prop{};
+        const bool ok = hipGetDeviceProperties(&prop, dev) == hipSuccess &&
+                        strata::kernels::gfx_arch_is(prop.gcnArchName, "gfx1100");
+        c = ok ? 1 : 2;
+        cache[dev].store(c, std::memory_order_release);
+    }
+    return c == 1;
+}
+
 template<int k, int mask>
 static bool launch_gsu3(const uint16_t* x, const uint16_t* w, float* y, int rows, int n, int ldy, void* stream) {
-    if (!x || !w || !y || rows < 16 || rows >= 64 || ldy < n ||
+    const int min_rows = rows >= 2 && rows < 16 && short_gsu3_enabled() ? 2 : 16;
+    if (!x || !w || !y || rows < min_rows || rows >= 64 || ldy < n ||
         ((reinterpret_cast<uintptr_t>(x) | reinterpret_cast<uintptr_t>(w)) & 15) || !strata_wmma_gfx11_device())
         return false;
     pfg::kernel_gsu3<k, mask><<<dim3(n / 8, (rows + 3) / 4), 96, 0, static_cast<hipStream_t>(stream)>>>(
@@ -1357,7 +1382,8 @@ static bool q8_gsu_selected(const uint16_t* x, const int8_t* q, const uint16_t* 
 
 bool strata_pf_q8_gsu3_f16(const uint16_t* x, const int8_t* q, const uint16_t* d, float* y,
                            int rows, int n, int k, int ldy, int reference_n, int first_column, void* stream) {
-    if (!x || !q || !d || !y || rows < 16 || rows >= 64 || n < 1 || n % 8 || ldy < n ||
+    const int min_rows = rows >= 2 && rows < 16 && short_gsu3_enabled() ? 2 : 16;
+    if (!x || !q || !d || !y || rows < min_rows || rows >= 64 || n < 1 || n % 8 || ldy < n ||
         first_column < 0 || reference_n < n || first_column > reference_n - n ||
         ((reinterpret_cast<uintptr_t>(x) | reinterpret_cast<uintptr_t>(q)) & 15) || !strata_wmma_gfx11_device()) return false;
     if (k == 10240 && reference_n == 320)

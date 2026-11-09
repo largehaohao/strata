@@ -3,6 +3,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
+#include "strata/kernels/gfx_arch.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -24,6 +25,15 @@ struct Buffer {
     ~Buffer() { if (p) (void) hipFree(p); }
 };
 struct Shape { int t, n, k, pad; };
+static bool short_gsu3_enabled() {
+    const char* value = std::getenv("STRATA_PF_SHORT_GSU3");
+    if (!value || std::strcmp(value, "1")) return false;
+    int device = 0;
+    ck(hipGetDevice(&device));
+    hipDeviceProp_t properties{};
+    ck(hipGetDeviceProperties(&properties, device));
+    return strata::kernels::gfx_arch_is(properties.gcnArchName, "gfx1100");
+}
 static bool native(const uint16_t* x,const uint16_t* w,float* y,Shape s,hipStream_t stream,int ld=0) {
     if(!ld)ld=s.k;
     return strata_pf_gemm_f16_ld(x,ld,w,ld,y,s.t,s.n,s.k,s.n+s.pad,0,stream) ||
@@ -161,6 +171,7 @@ static int check_gsu3(int n, int k, hipStream_t stream, hipblasHandle_t blas) {
     std::mt19937 rng(597);
     std::uniform_real_distribution<float> uniform(-1.f, 1.f);
     int checks = 0;
+    const int min_t = short_gsu3_enabled() ? 2 : 16;
     for (bool mixed_magnitudes : {false, true}) {
         auto value = [&]() {
             const float v = uniform(rng);
@@ -170,7 +181,7 @@ static int check_gsu3(int n, int k, hipStream_t stream, hipblasHandle_t blas) {
         std::generate(hw.begin(), hw.end(), value);
         ck(hipMemcpy(x.p, hx.data(), hx.size()*2, hipMemcpyHostToDevice));
         ck(hipMemcpy(w.p, hw.data(), hw.size()*2, hipMemcpyHostToDevice));
-        for (int t = 16; t <= max_t; ++t) for (int ld : {n, max_ld}) {
+        for (int t = min_t; t <= max_t; ++t) for (int ld : {n, max_ld}) {
             const size_t size = (size_t)t * ld + 17;
             std::vector<uint32_t> reference(size), actual(size);
             const float one = 1.f, zero = 0.f;
@@ -194,7 +205,7 @@ static int check_gsu3(int n, int k, hipStream_t stream, hipblasHandle_t blas) {
             ++checks;
         }
     }
-    for (const Shape s : {Shape{15,n,k,0}, {64,n,k,0}, {19,n-1,k,0}, {19,n,k-16,0}, {19,n,k,-1}}) {
+    for (const Shape s : {Shape{min_t-1,n,k,0}, {64,n,k,0}, {19,n-1,k,0}, {19,n,k-16,0}, {19,n,k,-1}}) {
         if (dispatch((uint16_t*)x.p,(uint16_t*)w.p,(float*)y.p,s.t,s.n,s.k,s.n+s.pad,stream))
             throw std::runtime_error("unsupported GSU3 shape accepted");
         ++checks;
@@ -240,7 +251,10 @@ static int check_q8_gsu3(int n, int k, int first, int owned, hipStream_t stream)
     const auto* scale = static_cast<const uint16_t*>(scales.p) + (size_t)first * k / 32;
     auto* output = static_cast<float*>(y.p);
     int checks = 0;
-    for (int rows : {16, 19, 27, max_t}) for (int ld : {n, n + pad}) {
+    std::vector<int> tested_rows{16, 19, 27, max_t};
+    if (short_gsu3_enabled())
+        for (int t = 2; t < 16; ++t) tested_rows.push_back(t);
+    for (int rows : tested_rows) for (int ld : {n, n + pad}) {
         const size_t cells = (size_t)rows * ld + guard;
         const size_t size = cells * sizeof(float);
         std::vector<uint32_t> expected(cells), actual(cells);
@@ -262,6 +276,21 @@ static int check_q8_gsu3(int n, int k, int first, int owned, hipStream_t stream)
                          rows, n, k, ld, first, owned);
             throw std::runtime_error("Q8 GSU3 rounding, sum or padding");
         }
+        ++checks;
+    }
+    // The opt-in range starts at two. Neither a one-row GEMV nor a
+    // 64-row wide product may write output through this entry point.
+    const size_t fallback_cells = (size_t)max_t * (n + pad) + guard;
+    for (int rows : {1, 64}) {
+        ck(hipMemsetAsync(output, 0xa5, fallback_cells * sizeof(float), stream));
+        if (strata_pf_q8_gsu3_f16(input, bytes, scale, output + first, rows, owned, k,
+                                   n + pad, n, first, stream))
+            throw std::runtime_error("unsupported Q8 GSU3 rows accepted");
+        std::vector<uint32_t> actual(fallback_cells);
+        ck(hipMemcpyAsync(actual.data(), output, fallback_cells * sizeof(float), hipMemcpyDeviceToHost, stream));
+        ck(hipStreamSynchronize(stream));
+        if (!std::all_of(actual.begin(), actual.end(), [](uint32_t v) { return v == guard_bits; }))
+            throw std::runtime_error("Q8 GSU3 fallback wrote output");
         ++checks;
     }
     return checks;

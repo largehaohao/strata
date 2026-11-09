@@ -1,5 +1,12 @@
 # UD 3.1 Pi task completion
 
+The November 9 selected binary also enables the
+[short incremental GSU3 range](UD31_TP_OPT.md#short-incremental-gsu3-projections).
+Its matched incremental prefill time falls 21.24%. Its separate four-task
+counterbalanced trial changes total time by 2.32%, with one pair slower, so
+the further 5% complete-task target remains open. The measurements below keep
+their original binary and sampling settings.
+
 On November 9, the daily service also received a Pi response-recovery fix.
 Its forced greedy sampling defaults were removed, and a repeated token inside
 thinking can trigger one bounded continuation when `reasoning_close_retry` is
@@ -7,7 +14,7 @@ enabled. The measurements below retain their original sampling configuration;
 they do not measure throughput after that change. The incident and validation
 are recorded in `local-tuning/2026-11-09/pi-truncation/README.md`.
 
-On two RX 7900 XTX cards, the current selected build completed the four-task
+On two RX 7900 XTX cards, the November 7 selected build completed the four-task
 Pi panel in **103.38 seconds with a 512 MiB conversation cache**, versus
 **123.11 seconds with the cache disabled**. The **16.02% reduction** exceeds
 the 5% target for this representative panel. Both runs passed all task checks.

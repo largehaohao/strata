@@ -611,6 +611,86 @@ were run for these candidates. Formal source and daily configuration remain
 unchanged. The record is `iq2-lds-decision.json` in
 `local-tuning/2026-11-06/ud31-residual-opt/`.
 
+## Short incremental GSU3 projections
+
+Measured on November 9 with Unsloth UD IQ2_XS, two RX 7900 XTX cards and
+262144-token capacity. `STRATA_PF_SHORT_GSU3=1` extends the existing eligible
+HC-down and dense GSU3 products to 2–15 input rows. It retains their three
+ordered FP32 partial sums and the original FP16 weight rounding. The existing
+HC-down, wide and Q8 GSU3 options must also be enabled. This option defaults
+off and checks for gfx1100, with the device result cached in the process.
+
+One-row products retain rocBLAS: their reference sum order differs. The
+K=320 short-row experiment also differs and is excluded. The selected medium
+K=320 option keeps its previous range. No weights, context limit, generation
+budget or sampling distribution change.
+
+Conversation checkpoints can leave a short assistant-prefix segment at the
+end of a read. The thinking Pi traces include four-row tails. Accelerating
+these segments helps requests whose total new input is larger than 15 tokens.
+
+The formal binary has SHA-256
+`4ac155a41109fcf346826e28c70a72b16ea817fd7c6cabccf5328887fcdc70ba`.
+Two repetitions of the matched 17-request panel use a 72539-token prefix and
+3994 total fresh tokens. Each reply is the single token `READY`; cold seed
+requests are excluded. Requests, outputs and generation/cache/draft counts
+match with the option disabled and enabled. Times below sum engine prefill
+latency, including its checkpoint work.
+
+| Fresh input | Requests | Disabled | Enabled | Time reduction |
+| --- | ---: | ---: | ---: | ---: |
+| All matched increments | 34 | 9.4942 s | 7.4775 s | 21.24% |
+| Below 32 tokens | 20 | 4.4873 s | 3.1396 s | 30.03% |
+| 256–511 tokens | 8 | 3.2727 s | 2.9031 s | 11.29% |
+
+The GPU regression passes 3344 checks with the option disabled and 4632
+enabled. These include comparisons with rocBLAS over 2–63 rows, mixed
+magnitudes, Q8 scales with signed zeros and subnormals, head slices, padding,
+fallback guards, and the existing K=320 graph cases. Three seeded model
+requests also match the previously selected executable with the option off,
+and match the enabled run in output and counters. Other GPU architectures and
+backends were not tested for this option.
+
+The formal build also passes a 261888-token request and a cached continuation,
+returning `1517` and `1683`. The continuation reuses 261892 tokens. A separate
+long request is cancelled after its first 32768-token pass. Ordinary and
+thinking requests then return `323` and `1683` on the same engine process.
+The local daily config now selects this binary and enables the new option;
+its other settings are retained. The daily 8081 service was stopped before
+this tuning run and remains stopped. Validation uses the isolated 18081 service.
+
+The separate complete-task trial uses the isolated prototype
+`f517dd7453f51be3f3406e7008bcb53b60b6e6b20766bea21755482d7ddc63c1`.
+The formal version adds the cached gfx1100 gate and excludes the failed K=320
+experiment. Each arm completes the same four live Pi tasks with all attempts,
+tools and independent acceptance counted. Each pair shares its sampling seed;
+temperature, top-p, top-k, medium thinking, 32768-token output ceiling, context,
+task text and workspace paths stay fixed. Tool outputs retain their actual
+timings. There are no separate warmup requests.
+
+| Seed and order | Disabled | Enabled | Task-time reduction |
+| --- | ---: | ---: | ---: |
+| 101, disabled first | 233.235 s | 221.386 s | 5.08% |
+| 202, enabled first | 106.643 s | 110.611 s | -3.72% |
+| Combined | 339.878 s | 331.997 s | 2.32% |
+
+All 16 task acceptances pass on the first attempt, with zero HTTP errors.
+Generated output differs: 61819 versus 60701 tokens. The supplied Pi export
+contains request metadata without the original task text; these fixtures
+represent its request pattern. These two pairs do not establish a stable 5%
+complete-task gain. That goal remains open; the selected increment is justified
+by the repeated matched-input prefill gain.
+
+Evidence is in `local-tuning/2026-11-09/ud31-pi-task-opt/`:
+`short-formal-check-pipeline.json`, `short-gsu3-gpu-regressions.json` and
+`short-gsu3-task-pipeline.json`. Capacity, recovery and application are recorded
+in `short-gsu3-qualification.json` and `short-gsu3-deployment.json`.
+The earlier cache-hit staging prototype passes
+320 exact GPU checks and preserves seeded model output, but copying 11.67%
+fewer bytes does not establish a speed gain: matched prefill time increases
+0.79%. It is excluded. The earlier fixed-three-draft trial changes complete
+task time by only 0.63% and also remains excluded.
+
 ## Screened decode indexer and QKV overlap
 
 An isolated November 7 probe schedules the original BF16 indexer projection,
