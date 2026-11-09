@@ -11,6 +11,9 @@
 #include <mma.h>   // HIP: src/hip/mma.h (gfx12 WMMA)
 
 #include <algorithm>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -806,6 +809,9 @@ __global__ void __launch_bounds__(HD) k_attn_combine(const float* qg, const floa
 #include "attn_heads_packed.cuh"
 #endif
 #include "topk.cuh"
+#if FNX_KPART == 0 || FNX_KPART == 99
+#include "topk_parts.cuh"
+#endif
 
 // ---------------------------------------------------------------- PLE block
 // part 1 per (row, stream): grouped norms of key and hidden, the gate, the gated value and its grouped norm
@@ -1582,6 +1588,15 @@ void qsa(const uint16_t* wq, const uint16_t* wk, const float* x, float* y, const
         ck_launch("qsa");
         return;
     }
+    static const int score_budget = [] {
+        const auto n = env_int("FNX_QSA_SCORE_GRID", 0);
+        if (n < 0 || n > 1024) throw std::runtime_error("FNX_QSA_SCORE_GRID: expected0..1024");
+        return (int)n;
+    }();
+    if (score_budget) {
+        const int blocks = std::min((max_pools + 255) / 256, std::max(1, (score_budget + T - 1) / T));
+        k_idx_score_persistent<<<dim3(blocks, T), 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, LaneRows{});
+    } else
     k_idx_score<<<dim3((max_pools + 255) / 256, T), 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, LaneRows{});
     qsa_select_positions(scores, cells, n_cells, max_pools, pos0, {}, T, T, card, s);
     ck_launch("qsa");
@@ -1896,6 +1911,7 @@ void ring_sum(const Ring& r, float* x, int T, const unsigned* tag, int call, voi
 void top_tokens(float* logits, int n, int T, int v0, const int* pen_tok, const int* pen_cnt, const int* pen_n, int pen_stride,
                 const float* pen_par, float* out_v, int* out_i, unsigned* err, void* st) {
     if (n < TOPK_N) throw std::runtime_error("top_tokens: a vocabulary slice smaller than the candidates");
+    if (!topk_parts(logits, n, T, v0, pen_tok, pen_cnt, pen_n, pen_stride, pen_par, out_v, out_i, err, st))
     k_topk_rows<<<T, TOPK_THREADS, 0, (cudaStream_t) st>>>(logits, n, v0, pen_tok, pen_cnt, pen_n, pen_stride, pen_par,
                                                          out_v, out_i, err);
     ck_launch("top_tokens");

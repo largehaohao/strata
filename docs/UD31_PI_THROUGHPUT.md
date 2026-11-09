@@ -1,18 +1,21 @@
 # UD 3.1 Pi task completion
 
-The November 9 selected binary also enables the
-[short incremental GSU3 range](UD31_TP_OPT.md#short-incremental-gsu3-projections).
-Its matched incremental prefill time falls 21.24%. Its separate four-task
-counterbalanced trial changes total time by 2.32%, with one pair slower, so
-the further 5% complete-task target remains open. The measurements below keep
-their original binary and sampling settings.
+The November 9 selected build adds
+[bounded lookup and exact sampling kernels](UD31_TP_OPT.md#pi-lookup-and-exact-sampling-kernels)
+to the earlier short GSU3 optimization. Two independent task pairs using
+previously unused seeds complete in **274.57 seconds versus 301.43 seconds**,
+an **8.91% reduction**, with all 16 task acceptances passing. This meets the
+further 5% task-time target for the declared representative panel. The final section records all six pairs,
+including the slower pair and changes in generated length.
 
 On November 9, the daily service also received a Pi response-recovery fix.
 Its forced greedy sampling defaults were removed, and a repeated token inside
 thinking can trigger one bounded continuation when `reasoning_close_retry` is
-enabled. The measurements below retain their original sampling configuration;
-they do not measure throughput after that change. The incident and validation
-are recorded in `local-tuning/2026-11-09/pi-truncation/README.md`.
+enabled. The November 7 measurements below retain their original sampling
+configuration; they do not measure throughput after that change. The final
+November 9 comparison uses the corrected model-card sampling defaults.
+The incident and validation are recorded in
+`local-tuning/2026-11-09/pi-truncation/README.md`.
 
 On two RX 7900 XTX cards, the November 7 selected build completed the four-task
 Pi panel in **103.38 seconds with a 512 MiB conversation cache**, versus
@@ -227,3 +230,86 @@ requests return 323 and 1683 without restarting the engine. The record is
 `ud31-residual-opt/pi-hc-selected-pipeline.json`, with full API and acceptance
 captures in `pi-hc-selected-cache{0,512}-r0/` and service checks in
 `production-after-pi-hc-selected/summary.json`.
+
+## November 9 model-card sampling task comparison
+
+The new goal starts from executable
+`832ed3729d89738bd21293cd47219d90ce21b0e1b14c168ed64640a198ed5a37`,
+with the 512 MiB cache and earlier QSA, HC and K=320 settings already enabled.
+It does not compare against the cache-disabled or greedy November 7 runs.
+The selected short GSU3 increment alone previously reduced complete-task time
+by only 2.32%. The new candidate retains it and adds `FNX_LOOKUP_SEARCH=32`,
+`FNX_TOPK_PARTS=16` and `FNX_QSA_SCORE_GRID=128`.
+
+Each arm runs the same four actual Pi coding tasks and tools described above.
+Both arms keep model-card sampling, medium thinking, six MTP drafts, lookup
+limit 15, a 32768-token output ceiling, context 262144 and the 512 MiB cache.
+Initial request bytes match within each seed pair. Later text and tool results
+can differ. All failed attempts, retries, tool execution and independent final
+acceptance count toward total time. Server startup is outside the task timer;
+there are no excluded warmup requests. No build or GPU test runs alongside
+these measurements.
+
+The first four pairs use the combined prototype. Their seeds and alternating
+order are declared before timing. The acceptance rule requires a pooled
+reduction of at least 5%, three of four pairs improving, all 32 final task
+acceptances and no HTTP errors. That panel passes. For the formal build,
+seeds 505 and 606 and their acceptance rule are declared before observing the
+results. After capacity checks, these two independent pairs must also improve
+pooled task time by at least 5%, pass all 16 final task checks, have no HTTP
+errors, and retain a reduction of at least 5% across all six pairs. They pass
+those requirements.
+
+| Seed, build and order | Goal-start reference | Candidate | Time reduction |
+| --- | ---: | ---: | ---: |
+| 101, prototype, reference first | 219.070 s | 122.270 s | 44.19% |
+| 202, prototype, candidate first | 110.021 s | 94.052 s | 14.51% |
+| 303, prototype, reference first | 141.904 s | 176.590 s | -24.44% |
+| 404, prototype, candidate first | 146.082 s | 122.624 s | 16.06% |
+| First four pairs | 617.077 s | 515.536 s | 16.46% |
+| 505, formal build, candidate first | 145.494 s | 124.949 s | 14.12% |
+| 606, formal build, reference first | 155.938 s | 149.618 s | 4.05% |
+| Independent formal-build pairs | 301.432 s | 274.567 s | 8.91% |
+| All six pairs | 918.509 s | 790.102 s | 13.98% |
+
+All 48 final task acceptances pass across 52 attempts, with 26 attempts per
+arm and zero HTTP errors. The independent candidate needs one retry; its time
+is included. Five pairs improve, but seed 303 becomes 24.44% slower. These
+results do not establish a speedup for every task or session.
+
+Generated length and trajectories account for much of the total difference.
+Across all six pairs, output totals change from 161873 to 139711 tokens and
+request counts from 246 to 216. Aggregate measured Pi decode throughput is
+223.19 versus 223.86 tok/s, almost unchanged. The separate fixed-input
+diagnostic increases decode throughput by 10.44%; it is not a 10.44% decode
+gain over this actual-task panel. The task result measures time to accepted
+completion and does not isolate a GPU-kernel speedup. The supplied export has
+metadata without original task text, so this remains a representative panel,
+not an exact replay of the user's historical sessions.
+
+The formal binary has SHA-256
+`a1e3e8417002394ca6a6c27b2c0cde142cd77c98840d8b3704de11f7e7d08a7b`.
+Its default path matches the earlier selected binary on the ordered seeded
+request sequence. With the new controls enabled, its outputs and native
+counters match the prototype. Exact GPU tests, near-limit sampled continuation,
+cancellation recovery and seven installed-Pi provider cases pass; details are
+in the [kernel measurements](UD31_TP_OPT.md#pi-lookup-and-exact-sampling-kernels).
+The lookup proposal policy can change fixed-seed sampled text. Target sampling
+parameters, output budgets and the existing rejection calculation are retained.
+
+The local `strata-unsloth-ud-iq2_xs.json` now points to the immutable qualified
+formal binary and enables the three controls above. Short GSU3 and all earlier
+accepted controls remain enabled. Both GPUs, 256K context, model-card sampling,
+cache capacity and the Pi response-recovery fix are retained. The daily 8081
+service remains stopped as it was before tuning; the next normal start uses
+this configuration. To undo this selection, restore the private
+`before-pi-goal.private.json` backup. That backup includes credentials and must
+not be published.
+
+Evidence is in `local-tuning/2026-11-09/ud31-pi-task-opt/`:
+`lookup-search-task-pipeline.json` contains all four prototype pairs;
+`formal-pi-heldout-plan.json` and `formal-pi-heldout.json` contain the independent
+protocol and results. `formal-pi-model-checks.json`, `formal-pi-qualification.json`
+and `formal-pi-deployment.json` record the build comparison, recovery checks
+and applied selection. Full requests, responses, tool traces and acceptance
+logs are retained locally, including unsuccessful earlier experiments.

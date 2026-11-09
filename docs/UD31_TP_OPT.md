@@ -4,7 +4,9 @@ A later Pi task-completion measurement and the selected host conversation
 cache setting are recorded in [UD31_PI_THROUGHPUT.md](UD31_PI_THROUGHPUT.md).
 The earlier measurements below retain their original configurations. Later
 sections record the selected two-card QSA query partition and HC row partition,
-with the 512 MiB conversation cache.
+with the 512 MiB conversation cache. The November 9
+[lookup and exact sampling comparison](#pi-lookup-and-exact-sampling-kernels)
+uses model-card sampling and keeps the earlier accepted kernel options.
 
 Measured on 2026-11-06 on two RX 7900 XTX cards (gfx1100), with a Ryzen 7 7700,
 ROCm 10.1, Qwen3.8-Flash-Next-UD-IQ2_XS and a 262144-token context. The branch is
@@ -678,8 +680,9 @@ All 16 task acceptances pass on the first attempt, with zero HTTP errors.
 Generated output differs: 61819 versus 60701 tokens. The supplied Pi export
 contains request metadata without the original task text; these fixtures
 represent its request pattern. These two pairs do not establish a stable 5%
-complete-task gain. That goal remains open; the selected increment is justified
-by the repeated matched-input prefill gain.
+complete-task gain. At this stage, that goal remained open; the selected
+increment was justified by the repeated matched-input prefill gain. The later
+lookup comparison below records the next complete-task trial.
 
 Evidence is in `local-tuning/2026-11-09/ud31-pi-task-opt/`:
 `short-formal-check-pipeline.json`, `short-gsu3-gpu-regressions.json` and
@@ -713,3 +716,78 @@ No model integration is selected. These results establish no request-level
 throughput or complete-task improvement. Formal source and daily configuration
 remain unchanged. The record is `qsa-qkv-overlap-decision.json` in
 `local-tuning/2026-11-06/ud31-residual-opt/`.
+
+## Pi lookup and exact sampling kernels
+
+Measured on November 9 with Unsloth UD IQ2_XS, two RX 7900 XTX cards,
+262144-token capacity, six MTP drafts, a 15-token lookup limit and a
+512 MiB conversation cache. Three new controls default off:
+
+| Control | Default | Measured value | Purpose |
+| --- | ---: | ---: | --- |
+| `FNX_LOOKUP_SEARCH` | 0 | 32 | Search more matching context trigrams for a usable draft continuation |
+| `FNX_TOPK_PARTS` | 0 | 16 | Find exact sampling candidates in smaller vocabulary partitions |
+| `FNX_QSA_SCORE_GRID` | 0 | 128 | Reuse each indexer query across several key tiles |
+
+The lookup reference stops at the nearest matching trigram, even when its
+next token differs from the already sampled first draft. A nearby overlapping
+match can also offer only one or two known continuation tokens. The new option
+examines up to the configured number of matching trigrams, chooses the longest
+usable continuation, and keeps the most recent occurrence on ties. The first
+token must still match the sampled draft. Copies stop before image cells.
+Values from 0 to 64 are accepted; 0 retains the original rule.
+
+The target sampler, penalties and speculative rejection calculation are
+unchanged. Changing the proposal chain changes random-number consumption,
+so a fixed seed can produce different text when lookup search is enabled.
+This option does not promise the same text as the nearest-match rule.
+
+Partitioned top-k retains the original FP32 penalty expressions, score bits
+and token tie order. It merges the best 64 candidates from each partition.
+Supported partition counts are 2, 4, 8, 16 and 32; this path requires two-card
+HIP Flash-Next on gfx1100. At 16 partitions, scratch uses 128 KiB per GPU
+compute stream, is allocated on first eager use and is released with the
+engine. A fresh stream inside graph capture falls back to the original kernel
+until scratch is available. Small vocabulary slices also keep that fallback.
+
+The local indexer score grid preserves each key's FP32 FMA and head-sum order
+and the existing selector. Queries that need ranking still score every visible
+key. The control accepts 0 through 1024; a positive value sets the target
+number of score blocks across the active query rows. It adds no peer exchange
+or GPU buffer. This is separate from the earlier rejected query-ownership probe.
+
+The complete HIP build has SHA-256
+`a1e3e8417002394ca6a6c27b2c0cde142cd77c98840d8b3704de11f7e7d08a7b`.
+The ordered four-request diagnostic uses the same captured inputs, seeds and
+1024-token API ceiling in each arm. With short GSU3 enabled throughout,
+weighted native decode throughput is 241.01 tok/s with the three controls
+disabled and 266.17 enabled, a 10.44% increase. Both arms generate 4062 native
+tokens. Lookup changes the sampled text, so this is a request diagnostic,
+not a measurement of a 10.44% gain over complete Pi tasks.
+
+Both disabled repetitions match the earlier selected executable in text,
+reasoning, tools, finish reasons and native counters. The enabled formal
+build matches the combined prototype on those checks. The combined prototype
+also matches lookup search alone, confirming that the two numerical kernel
+changes preserve that proposal policy's output on this sequence.
+
+The CPU suite passes 36002 compatibility and proposal checks. The two cards
+together pass 2016 exact top-k cases in each of two runs, with the dispatcher
+disabled and enabled, plus 80 total allocation, release and capture checks.
+The local score-grid suite passes 2520 exact score, selected-position, count,
+guard and graph checks. The complete HIP build passes. CUDA builds and other
+GPU architectures were not tested; the split engine is not a SYCL target.
+
+A cold 261888-token prompt and a sampled cached continuation return `1517`
+and `1683`; the continuation reuses 261892 tokens. A separate 200K prefill is
+cancelled after its first 32768-row pass. Ordinary and thinking requests then
+succeed on the same engine process. All seven installed-Pi provider checks
+pass, including tool calls, a long cached follow-up and repeated-thinking
+recovery. These checks establish capacity and recovery, not retrieval quality
+or long-generation throughput near the context limit.
+
+Evidence is in `local-tuning/2026-11-09/ud31-pi-task-opt/`:
+`lookup-search-screen.json`, `formal-pi-build.json`,
+`formal-pi-kernel-checks.json`, `formal-pi-model-checks.json` and
+`formal-pi-qualification.json`. The complete-task comparison is recorded in
+[UD31_PI_THROUGHPUT.md](UD31_PI_THROUGHPUT.md).

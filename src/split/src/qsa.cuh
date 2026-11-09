@@ -155,6 +155,38 @@ __global__ void __launch_bounds__(256) k_idx_score(const float* __restrict__ q, 
     scores[(size_t) t * max_pools + j] = s;
 }
 
+// Same per-key FP32 expressions; each CTA reuses its query across multiple key tiles.
+__global__ void __launch_bounds__(256) k_idx_score_persistent(const float* __restrict__ q, const __half* __restrict__ pooled, KvPages g,
+                                                   float* __restrict__ scores, int max_pools, const int* pos0p, LaneRows lr) {
+    const int t = blockIdx.y, p = row_pos(lr, pos0p, t), nv = (p + 1) / QSA_POOL;
+    if (nv <= QSA_TOP || blockIdx.x * blockDim.x >= (unsigned) nv) return;
+    g = row_pages(g, lr, t);
+    __shared__ float qs[QSA_HEADS * QSA_DIM];
+    for (int k = threadIdx.x; k < QSA_HEADS * QSA_DIM; k += blockDim.x) qs[k] = q[(size_t) t * QSA_HEADS * QSA_DIM + k];
+    __syncthreads();
+    for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < nv; j += blockDim.x * gridDim.x) {
+    const uint4* kr = reinterpret_cast<const uint4*>(pooled + kvp_block(g, j));
+    float d[QSA_HEADS] = {};
+#pragma unroll 4
+    for (int c = 0; c < QSA_DIM / 8; ++c) {
+        const uint4 u = kr[c];
+        const __half2* h2 = reinterpret_cast<const __half2*>(&u);
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const float2 kv = __half22float2(h2[k]);
+            const int dim = c * 8 + 2 * k;
+#pragma unroll
+            for (int h = 0; h < QSA_HEADS; ++h) d[h] = fmaf(qs[h * QSA_DIM + dim], kv.x, fmaf(qs[h * QSA_DIM + dim + 1], kv.y, d[h]));
+        }
+    }
+    const float w = rsqrtf((float) QSA_DIM);
+    float s = 0.f;
+#pragma unroll
+    for (int h = 0; h < QSA_HEADS; ++h) s += fmaxf(d[h], 0.f) * w;
+    scores[(size_t) t * max_pools + j] = s;
+    }
+}
+
 // the same for a prompt's rows on the tensor cores: a block takes 16 rows (their 4 heads: 64 rows of q, in f16 high and
 // low halves) against 64 blocks' keys (f16 already), f32 accumulation; each key is read once per 16 rows instead of once
 // per row. Columns past a row's visible blocks get scores too (the select reads only the visible ones)

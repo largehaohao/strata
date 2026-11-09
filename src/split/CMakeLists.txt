@@ -196,7 +196,7 @@ endif()
 list(GET STRATA_SPLIT_CARDS 0 _moe_cards)
 set(_fnx_kernel_checks moe_iq moe_down moe_cache dense_q8 mtp_head_gpu)
 if(_fnx_hip AND _moe_cards EQUAL 2)
-  list(APPEND _fnx_kernel_checks attn_heads attn_packed qsa_pair qsa_score qsa_query hc_row_split moe_cache_gu moe_q2_down moe_q2_mma moe_mma_wide moe_mma_fused mtp_head_gemv router_bf16 q8s_ab static_prefill_copy prefill_gemm gdn_prefill hc_prefill hcup_mix)
+  list(APPEND _fnx_kernel_checks attn_heads attn_packed qsa_pair qsa_score qsa_query hc_row_split moe_cache_gu moe_q2_down moe_q2_mma moe_mma_wide moe_mma_fused mtp_head_gemv router_bf16 q8s_ab static_prefill_copy prefill_gemm gdn_prefill hc_prefill hcup_mix topk_parts qsa_grid)
 endif()
 foreach(_kind ${_fnx_kernel_checks})
   set(_target split_${_kind}_test)
@@ -337,3 +337,8 @@ set_target_properties(split_static_kv_cache_test PROPERTIES CXX_STANDARD 17 CXX_
 add_executable(split_lossless_bf16_test EXCLUDE_FROM_ALL ${_sp}/tools/lossless_bf16_test.cpp)
 target_include_directories(split_lossless_bf16_test PRIVATE ${_sp}/src)
 set_target_properties(split_lossless_bf16_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+
+# Context lookup is a CPU proposal policy; this check needs no engine or GPU.
+add_executable(split_lookup_test EXCLUDE_FROM_ALL ${_sp}/tools/lookup_test.cpp)
+target_include_directories(split_lookup_test PRIVATE ${_sp}/src)
+set_target_properties(split_lookup_test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
