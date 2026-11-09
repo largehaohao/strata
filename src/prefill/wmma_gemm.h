@@ -40,6 +40,10 @@ bool strata_pf_wide_gsu3_f16(const uint16_t* x, const uint16_t* w, float* y, int
 // and column offset for the reference kernel's stagger along K.
 bool strata_pf_q8_gsu3_f16(const uint16_t* x, const int8_t* q, const uint16_t* d, float* y,
                            int rows, int n, int k, int ldy, int reference_n, int first_column, void* stream = nullptr);
+// Q8 expansion fused into the original ascending WMMA order, K=320,
+// N=2560 or 10240, 64..256 rows. Unsupported shapes leave the output untouched.
+bool strata_pf_q8_k320_f16(const uint16_t* x, const int8_t* q, const uint16_t* scales, float* y,
+                           int rows, int n, int k, int ldy, void* stream = nullptr);
 /// The same with row strides ldx >= K and ldw >= K (multiples of 8): a 4 KB-multiple row stride (K 2048 / 4096 /
 /// 6144) camps on the memory channels, K + 64 does not (S23 gemm_probe7/8: K 6144 19 -> 35 TFLOPS).
 /// S23 (STRATA_PF_HCDOWN=1): lo[t, n] = sum_k X[t, k] Wd[n, k] (n < nd) and inj[t, n] = sum_k X[t, k] Wi[n, k]
@@ -65,6 +69,12 @@ bool strata_pf_gemm_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t* W, in
 /// T x (N/4), FP32/FP16. N=10240, K=320, T>=64 on gfx11 only.
 bool strata_pf_hcup_mix_f16(const uint16_t* X, const uint16_t* W, const float* R, const float* norm, const float* rms,
                             float* Y, uint16_t* Yh, int64_t T, int64_t N, int64_t K, void* stream = nullptr);
+/// The same ordered projection and mixer with split Q8 weights. Each weight
+/// rounds to FP16 in the tile before FP32 accumulation. X/Q must be 16-byte
+/// aligned; N=10240, K=320 and T>=64 on gfx11. False leaves outputs untouched.
+bool strata_pf_hcup_q8_f16(const uint16_t* X, const int8_t* Q, const uint16_t* scales,
+                           const float* R, const float* norm, const float* rms, float* Y, uint16_t* Yh,
+                           int64_t T, int64_t N, int64_t K, void* stream = nullptr);
 /// True when the products above can run on the current device (the gfx11 matrix cores).  Host code that pads an
 /// activation's row stride for them (STRATA_PF_PAD, prefill.cpp) must ask this first: on another card no kernel takes
 /// a padded X, and Gemm::native would have to copy the rows unpadded.

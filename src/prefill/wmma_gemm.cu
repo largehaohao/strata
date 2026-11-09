@@ -918,6 +918,52 @@ __global__ void __launch_bounds__(512) kernel_hcup_register(const _Float16* __re
 #endif
 }
 
+// Q8 weights enter the same register-mixer tile without a full FP16 image.
+// Keep the original 20 ascending WMMA steps and four-stream epilogue order.
+__global__ void __launch_bounds__(512) kernel_hcup_q8_register(const _Float16* __restrict__ X,
+    const int8_t* __restrict__ Q, const uint16_t* __restrict__ scales,
+    float* __restrict__ Y, uint16_t* __restrict__ Yh,
+    const float* __restrict__ R, const float* __restrict__ norm, const float* __restrict__ rms, int M) {
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__)
+    constexpr int WIDTH = 2560, RANK = 320, COLS = 16, ROWS = 256, LD = RANK + 8;
+    __shared__ __align__(16) _Float16 weights[4 * COLS][LD];
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5, col = lane & 15, half = lane >> 4;
+    const int t0 = blockIdx.y * ROWS + wave * 16, d0 = blockIdx.x * COLS;
+    for (int i = tid; i < 4 * COLS * (RANK / 16); i += 512) {
+        const int row = i / (RANK / 16), k = i % (RANK / 16) * 16;
+        const size_t at = (size_t) (row / COLS * WIDTH + d0 + row % COLS) * RANK + k;
+        const h16 value = gsu_weight_fragment<true, false>(Q, scales, at);
+        __builtin_memcpy(&weights[row][k], &value, sizeof(value));
+    }
+    __syncthreads();
+    if (t0 >= M) return;
+    const _Float16* x = X + (size_t) min(t0 + col, M - 1) * RANK;
+    f8 acc[4] = {};
+#pragma unroll
+    for (int k = 0; k < RANK; k += 16) {
+        const h16 a = frag(x + k);
+#pragma unroll
+        for (int c = 0; c < 4; ++c)
+            acc[c] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, frag(&weights[c * COLS + col][k]), acc[c]);
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int t = t0 + 2 * i + half, d = d0 + col;
+        if (t >= M) continue;
+        float g[4];
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            const float xn = R[(size_t) t * (4 * WIDTH) + c * WIDTH + d] * norm[c * WIDTH + d] * rms[t * 4 + c];
+            const float gate = 1.f / (1.f + __expf(-acc[c][i]));
+            g[c] = gate * xn;
+        }
+        const float mixed = (g[0] + g[1] + g[2] + g[3]) / 4.f;
+        Y[(size_t) t * WIDTH + d] = mixed;
+        reinterpret_cast<_Float16*>(Yh)[(size_t) t * WIDTH + d] = (_Float16) mixed;
+    }
+#endif
+}
+
 // S23 (STRATA_PF_HCDOWN=1): the hyper-connection read's down (N nd = 320) and inject (N ni = 4) projections of xn16
 // (BF16, T x 10240, token stride ldx: 10240 + 64 avoids the 4 KB-multiple stride) as ONE GEMM - weight rows
 // [w_down; w_inject] read from the two tensors, the epilogue splitting the columns into lo (T x nd) and inj (T x ni),
@@ -1171,7 +1217,45 @@ __global__ void __launch_bounds__(HX_NT) kernel_hcd_exact(const uint16_t* __rest
         }
 #endif
 }
+// Q8 HC up / shared down for medium incremental chunks. Weight expansion
+// rounds to FP16 before the same twenty ascending WMMA steps as the wide path.
+template<int TileRows>
+__global__ void __launch_bounds__(128) kernel_q8_k320(const _Float16* x, const int8_t* q,
+        const uint16_t* scales, float* y, int rows, int ldy) {
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+    const int m0 = blockIdx.y * TileRows, n = blockIdx.x * 64 + wave * 16 + (lane & 15);
+    f8 acc[TileRows / 16]{};
+    for (int k = 0; k < 320; k += 16) {
+        const h16 weight = gsu_weight_fragment<true, false>(q, scales, (size_t) n * 320 + k);
+#pragma unroll
+        for (int i = 0; i < TileRows / 16; ++i) {
+            const int m = min(m0 + i * 16 + (lane & 15), rows - 1);
+            const h16 input = frag(x + (size_t) m * 320 + k);
+            acc[i] = WmmaTraits<_Float16>::mma(input, weight, acc[i]);
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < TileRows / 16; ++i)
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            const int m = m0 + i * 16 + e * 2 + (lane >> 4);
+            if (m < rows) y[(size_t) m * ldy + n] = acc[i][e];
+        }
+}
 }  // namespace pfg
+
+bool strata_pf_q8_k320_f16(const uint16_t* x, const int8_t* q, const uint16_t* scales, float* y,
+                           int rows, int n, int k, int ldy, void* stream) {
+    if (!x || !q || !scales || !y || k != 320 || rows < 64 || rows > 256 ||
+        (n != 2560 && n != 10240) || ldy < n ||
+        ((reinterpret_cast<uintptr_t>(x) | reinterpret_cast<uintptr_t>(q)) & 15) || !strata_wmma_gfx11_device()) return false;
+    auto st = static_cast<hipStream_t>(stream);
+    if (rows <= 96) pfg::kernel_q8_k320<32><<<dim3(n / 64, (rows + 31) / 32), 128, 0, st>>>(
+        (const _Float16*) x, q, scales, y, rows, ldy);
+    else pfg::kernel_q8_k320<64><<<dim3(n / 64, (rows + 63) / 64), 128, 0, st>>>(
+        (const _Float16*) x, q, scales, y, rows, ldy);
+    return hipGetLastError() == hipSuccess;
+}
 
 bool strata_pf_hcdown_bf16(const uint16_t* X, int64_t ldx, const uint16_t* Wd, const uint16_t* Wi, int64_t nd,
                            int64_t ni, float* lo, float* inj, int64_t T, int64_t K, void* stream) {
@@ -1199,6 +1283,18 @@ bool strata_pf_hcdown_exact_bf16(const uint16_t* X, int64_t ldx, const uint16_t*
 bool strata_pf_gemm_f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                         float beta, void* stream) {
     return strata_pf_gemm_f16_ld(X, K, W, K, Y, T, N, K, ldy, beta, stream);
+}
+
+bool strata_pf_hcup_q8_f16(const uint16_t* X, const int8_t* Q, const uint16_t* scales,
+                           const float* R, const float* norm, const float* rms, float* Y, uint16_t* Yh,
+                           int64_t T, int64_t N, int64_t K, void* stream) {
+    if (!X || !Q || !scales || !R || !norm || !rms || !Y || !Yh || T < 64 || T > (1LL << 28) ||
+        N != 10240 || K != 320 || ((reinterpret_cast<uintptr_t>(X) | reinterpret_cast<uintptr_t>(Q)) & 15))
+        return false;
+    if (!strata_wmma_gfx11_device()) return false;
+    pfg::kernel_hcup_q8_register<<<dim3(2560 / 16, (T + 255) / 256), 512, 0, static_cast<hipStream_t>(stream)>>>(
+        (const _Float16*) X, Q, scales, Y, Yh, R, norm, rms, (int) T);
+    return hipGetLastError() == hipSuccess;
 }
 
 bool strata_pf_hcup_mix_f16(const uint16_t* X, const uint16_t* W, const float* R, const float* norm, const float* rms,
@@ -1346,6 +1442,13 @@ bool strata_pf_gemm_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t* W, in
 
 #else
 // Non-HIP / Non-GFX11 compilation fallback
+bool strata_pf_hcup_q8_f16(const uint16_t*, const int8_t*, const uint16_t*, const float*, const float*, const float*,
+                           float*, uint16_t*, int64_t, int64_t, int64_t, void*) {
+    return false;
+}
+bool strata_pf_q8_k320_f16(const uint16_t*, const int8_t*, const uint16_t*, float*, int, int, int, int, void*) {
+    return false;
+}
 bool strata_pf_q8_gsu3_f16(const uint16_t*, const int8_t*, const uint16_t*, float*, int, int, int, int, int, int, void*) {
     return false;
 }

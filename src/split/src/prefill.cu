@@ -11,6 +11,7 @@
 #include "engine.hpp"
 #include "engine_impl.hpp"
 #include "env.hpp"
+#include "qsa_query_split.hpp"
 #include "attn_head_split.hpp"
 #include "pf_ring_plan.hpp"
 #include "static_prefill_stage.hpp"
@@ -250,6 +251,7 @@ struct Engine::Pf {
     cublasHandle_t blas = nullptr;
     bool native_gemm = false;         // FNX_PF_GEMM=1: native RDNA3 WMMA, FP32 accumulation/output
     bool q8_gsu3 = false;
+    bool q8_k320 = false;
     bool hc_streams = false;          // FNX_PF_HC_STREAMS=1: reduce all HC stream norms together
     bool hc_up_fused = false;         // FNX_PF_HC_UP_FUSED=1: large HC up products mix before the VRAM store
     bool compact_heads = false;       // native WMMA keeps its reduction order when missing heads are omitted
@@ -409,6 +411,8 @@ struct Engine::Pf {
     cudaStream_t cs = nullptr;
     cudaEvent_t ev_ready[2], ev_done[2];   // stage[k] filled; its layer's experts done with
 };
+
+#include "hc_row_split_dispatch.cuh"
 
 namespace {
 // out[t * ldo + r] = W[r] . X[t] for t < C: W f16 [rows][cols], X f16 [C][cols]
@@ -628,24 +632,37 @@ void pf_hc_read(Engine::Pf& p, float* R, const float* bo, const float* inj_prev,
         k_hcb_prep_streams<<<C, HCB_THREADS, 0, s>>>(R, bo, inj_prev, w_norm, p.rs, p.xh, eps, w_inj, inject);
     else
         k_hcb_prep<<<C, HCB_THREADS, 0, s>>>(R, bo, inj_prev, w_norm, p.rs, p.xh, eps, w_inj, inject);
-    bool fused_down = false;
+    // MTP has no cross-card sums and keeps its original path (w_inj == nullptr).
+    const bool split_down = w_inj && !mixh && hcs_down(p, w_down, C, s);
+    if (!split_down) {
+        bool fused_down = false;
 #if FNX_HIP
-    if (p.q8_gsu3) fused_down = strata_pf_q8_gsu3_f16(reinterpret_cast<const uint16_t*>(p.xh),
-        w_down.q, w_down.d, p.lo32, C, LR, D, LR, LR, 0, s);
+        if (p.q8_gsu3) fused_down = strata_pf_q8_gsu3_f16(reinterpret_cast<const uint16_t*>(p.xh),
+            w_down.q, w_down.d, p.lo32, C, LR, D, LR, LR, 0, s);
 #endif
-    if (!fused_down) {
-        k_q8s_f16<<<grid_for((size_t) LR * D), 256, 0, s>>>(w_down.q, w_down.d, (size_t) LR * D, p.wh);
+        if (!fused_down) {
+            k_q8s_f16<<<grid_for((size_t) LR * D), 256, 0, s>>>(w_down.q, w_down.d, (size_t) LR * D, p.wh);
 #if !FNX_HIP
-        if (!(p.down_lt && !p.f16acc && pf_down_lt(p, p.wh, p.xh, C, p.lo32, s)))
+            if (!(p.down_lt && !p.f16acc && pf_down_lt(p, p.wh, p.xh, C, p.lo32, s)))
 #endif
-            pf_gemm(p, p.wh, LR, D, p.xh, C, p.lo32, LR, s);
+                pf_gemm(p, p.wh, LR, D, p.xh, C, p.lo32, LR, s);
+        }
+        k_hcb_lo<<<grid_for((size_t) C * LR), 256, 0, s>>>(p.lo32, C * LR, p.lo16);
     }
-    k_hcb_lo<<<grid_for((size_t) C * LR), 256, 0, s>>>(p.lo32, C * LR, p.lo16);
-    k_q8s_f16<<<grid_for((size_t) D * LR), 256, 0, s>>>(w_up.q, w_up.d, (size_t) D * LR, p.wh);
     bool mixed_up = false;
+    bool fused_up = false;
+#if FNX_HIP
+    static const bool q8_mix = env_flag("FNX_PF_HC_UP_Q8");
+    if (q8_mix && p.hc_up_fused && !mixh && C >= 64)
+        mixed_up = strata_pf_hcup_q8_f16(reinterpret_cast<const uint16_t*>(p.lo16), w_up.q, w_up.d,
+            R, w_norm, p.rs, mixed, reinterpret_cast<uint16_t*>(p.xh), C, D, LR, s);
+    if (!mixed_up && p.q8_k320) fused_up = strata_pf_q8_k320_f16(reinterpret_cast<const uint16_t*>(p.lo16),
+        w_up.q, w_up.d, p.up32, C, D, LR, D, s);
+#endif
+    if (!mixed_up && !fused_up) k_q8s_f16<<<grid_for((size_t) D * LR), 256, 0, s>>>(w_up.q, w_up.d, (size_t) D * LR, p.wh);
 #if FNX_HIP
     // Smaller chunks measured faster with the separate product and mixer.
-    if (p.hc_up_fused && !mixh && C >= 3072) {
+    if (!mixed_up && p.hc_up_fused && !mixh && C >= 3072) {
         mixed_up = strata_pf_hcup_mix_f16(reinterpret_cast<const uint16_t*>(p.lo16),
             reinterpret_cast<const uint16_t*>(p.wh), R, w_norm, p.rs, mixed,
             reinterpret_cast<uint16_t*>(p.xh), C, D, LR, s);
@@ -653,13 +670,13 @@ void pf_hc_read(Engine::Pf& p, float* R, const float* bo, const float* inj_prev,
     }
 #endif
     if (!mixed_up) {
-        if (p.f16acc) {
+        if (!fused_up && p.f16acc) {
             // pf_gemm's f16 path stages through up32: here up32 is the result, so stage through xh (free once lo is made)
             const __half one = __float2half(1.0f), zero = __float2half(0.0f);
             ckb(cublasGemmEx(p.blas, CUBLAS_OP_T, CUBLAS_OP_N, D, C, LR, &one, p.wh, CUDA_R_16F, LR, p.lo16, CUDA_R_16F, LR, &zero, p.xh,
                              CUDA_R_16F, D, CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT_TENSOR_OP), "gemm f16 (hc up)");
             k_f16_f32<<<grid_for((size_t) D * C), 256, 0, s>>>(p.xh, C, D, p.up32, D);
-        } else {
+        } else if (!fused_up) {
             pf_gemm(p, p.wh, D, LR, p.lo16, C, p.up32, D, s);
         }
         k_hcb_mixinj<<<C, HCM_THREADS, 0, s>>>(R, w_norm, p.rs, p.up32, mixed, mixh ? mixh : p.xh, nullptr, nullptr);   // prep made the inject rows
@@ -939,6 +956,7 @@ void Engine::prefill_alloc() {
         p->f16acc = env_flag("FNX_PF_F16ACC");
         p->native_gemm = env_int("FNX_PF_GEMM", 0) != 0;
         p->q8_gsu3 = env_flag("FNX_PF_Q8_GSU3") && p->native_gemm && !p->f16acc;
+        p->q8_k320 = env_flag("FNX_PF_Q8_K320") && p->native_gemm && !p->f16acc;
         p->hc_streams = env_flag("FNX_PF_HC_STREAMS");
         p->hc_up_fused = env_flag("FNX_PF_HC_UP_FUSED");
         p->compact_heads = env_flag("FNX_PF_COMPACT_HEADS");
@@ -1563,6 +1581,19 @@ void Engine::prefill(const std::vector<int>& tokens, int after) {
         same_base = same_base && p->pass == base_K;
     }
     bool borrowed = false;
+    size_t borrow_rows = tokens.size();
+    const bool adaptive_borrow = env_flag("FNX_PF_BORROW_ADAPTIVE");
+    auto release_loan = [&] {
+        if (!borrowed) return;
+        release_prefill_arena();
+        for (Pf* p : pf_) {
+            p->R=p->Rk[0];p->bo_a=p->boak[0];p->bo_f=p->bofk[0];
+            p->inj_a=p->injak[0];p->inj_f=p->injfk[0];p->ctl=p->ctlk[0];
+            for (int k=base_K;k<borrow_K;++k) p->Rk[k]=p->boak[k]=p->bofk[k]=nullptr;
+        }
+        borrowed=false;
+        K=base_K;
+    };
     std::array<int, NCARD> residual_slots{};
     auto release = [&] {
         for (int c = 0; c < NCARD; ++c) {
@@ -1590,14 +1621,7 @@ void Engine::prefill(const std::vector<int>& tokens, int after) {
             }
             residual_slots[c] = 0;
         }
-        if (!borrowed) return;
-        release_prefill_arena();
-        for (Pf* p : pf_) {
-            p->R=p->Rk[0];p->bo_a=p->boak[0];p->bo_f=p->bofk[0];
-            p->inj_a=p->injak[0];p->inj_f=p->injfk[0];p->ctl=p->ctlk[0];
-            for (int k=base_K;k<borrow_K;++k) p->Rk[k]=p->boak[k]=p->bofk[k]=nullptr;
-        }
-        borrowed=false;
+        release_loan();
     };
     try {
         for (int c = 0; c < NCARD; ++c) {
@@ -1652,7 +1676,20 @@ void Engine::prefill(const std::vector<int>& tokens, int after) {
         if (staging && same_base && borrow_K>base_K && tokens.size()>(size_t)base_K*pf_c_ &&
             pos_<=max_ctx_ && tokens.size()<=(size_t)(max_ctx_-pos_)) {
             const size_t bytes=(size_t)(borrow_K-base_K)*pf_c_*(D+N)*sizeof(float);
-            if (borrow_prefill_arena(bytes,pos_+(int)tokens.size())) {
+            bool fits = borrow_prefill_arena(bytes,pos_+(int)tokens.size());
+            if (!fits && adaptive_borrow) {
+                // Reserve enough low pages for complete passes only. The loan
+                // is returned before a later pass can grow KV into its tail.
+                const size_t pass_rows = (size_t)borrow_K*pf_c_;
+                for (size_t horizon=(tokens.size()-1)/pass_rows*pass_rows; horizon>=pass_rows; horizon-=pass_rows) {
+                    if (borrow_prefill_arena(bytes,pos_+(int)horizon)) {
+                        borrow_rows=horizon;
+                        fits=true;
+                        break;
+                    }
+                }
+            }
+            if (fits) {
                 borrowed=true;
                 for (int c=0;c<NCARD;++c) {
                     Pf& p=*pf_[(size_t)c];
@@ -1665,6 +1702,8 @@ void Engine::prefill(const std::vector<int>& tokens, int after) {
                 K=borrow_K;
                 std::fprintf(stderr,"prefill: borrowed %zu MiB per card for %d chunks (base %d); full context remains %d\n",
                     bytes>>20,K,base_K,max_ctx_);
+                if (borrow_rows<tokens.size())
+                    std::fprintf(stderr,"prefill: adaptive loan ends after %zu rows, at position %d\n",borrow_rows,pos_+(int)borrow_rows);
             } else if (env_flag("FNX_PF_TIMING")) {
                 std::fprintf(stderr,"prefill: keeping %d chunks; KV ownership leaves no room for borrowed buffers\n",base_K);
             }
@@ -1700,12 +1739,14 @@ void Engine::prefill(const std::vector<int>& tokens, int after) {
 #endif
         const bool lone_tail = pf_[0]->hcs;
         const int lone_min = (int) env_int("FNX_PF_HCSPLIT_MIN", 3);
-        auto chunks_of = [&](size_t i0, int half) {
+        // Keep the two pinned halves disjoint when the device pass gets smaller.
+        const int set_stride=K;
+        auto chunks_of = [&](size_t i0, int half, int chunk_limit) {
             std::vector<PfChunk> ch;
-            for (size_t i = i0; i < nt && (int) ch.size() < K; i += pf_c_) {
+            for (size_t i = i0; i < nt && (int) ch.size() < chunk_limit; i += pf_c_) {
                 const size_t e = std::min(nt, i + pf_c_);
                 if (lone_tail && (int) ch.size() >= lone_min && e - i != (size_t) pf_c_) break;
-                ch.push_back({std::vector<int>(tokens.begin() + i, tokens.begin() + e), e < nt ? tokens[e] : after, half * K + (int) ch.size()});
+                ch.push_back({std::vector<int>(tokens.begin() + i, tokens.begin() + e), e < nt ? tokens[e] : after, half * set_stride + (int) ch.size()});
             }
             return ch;
         };
@@ -1752,12 +1793,13 @@ void Engine::prefill(const std::vector<int>& tokens, int after) {
                 std::fprintf(stderr,"prefill host embeddings: %zu rows, %d workers, %.1f ms\n",end-i0,
                     use_workers?(int)std::min<size_t>(NCARD,ch.size()):1,std::chrono::duration<double,std::milli>(done-begin).count());
         };
-        std::vector<PfChunk> ch = chunks_of(0, 0);
+        std::vector<PfChunk> ch = chunks_of(0, 0, K);
         embed(0, ch);
         for (size_t i = 0, k = 0; i < nt; ++k) {
             size_t cov = 0;
             for (const PfChunk& c : ch) cov += c.tokens.size();
-            std::vector<PfChunk> next = chunks_of(i + cov, (int) ((k + 1) & 1));
+            const int next_K=borrowed && i+cov>=borrow_rows ? base_K : K;
+            std::vector<PfChunk> next = chunks_of(i + cov, (int) ((k + 1) & 1), next_K);
             prefill_pass(ch, staging, [&] { embed(i + cov, next); });
             size_t e = i;
             for (const PfChunk& c : ch) {
@@ -1765,6 +1807,10 @@ void Engine::prefill(const std::vector<int>& tokens, int after) {
                 if (on_prefill_chunk) on_prefill_chunk((int) e);
             }
             i += cov;
+            if (borrowed && i>=borrow_rows && i<nt) {
+                release_loan();
+                std::fprintf(stderr,"prefill: adaptive loan returned at position %d; continuing with %d chunks\n",pos_,K);
+            }
             ch = std::move(next);
         }
     } catch (...) {
@@ -2017,6 +2063,10 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
         cudaStream_t s = b.st;
         pf_dense_xh(p, L.sh_gu.s, 2 * ffs, N, C, p.shg, 2 * ffs, s);
         k_pf_swiglu<<<grid_for((size_t) C * ffs), 256, 0, s>>>(p.shg, ffs, C, p.shh);
+#if FNX_HIP
+        if (p.q8_k320 && strata_pf_q8_k320_f16(reinterpret_cast<const uint16_t*>(p.shh),
+                L.sh_down.s.q, L.sh_down.s.d, p.part + (size_t) P * N, C, N, ffs, N, s)) return;
+#endif
         k_q8s_f16<<<grid_for((size_t) N * ffs), 256, 0, s>>>(L.sh_down.s.q, L.sh_down.s.d, (size_t) N * ffs, p.wh);
         pf_gemm(p, p.wh, N, ffs, p.shh, C, p.part + (size_t) P * N, N, s);
     };
@@ -2130,8 +2180,11 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, cons
                     for (int g = 0; g * AR < C; ++g) {
                         const int r0 = g * AR, Tg = std::min(AR, C - r0);
                         const int* gctl = p.ctl + 2 + 2 * (r0 / MAXT);
-                        qsa_select(p.qidx + (size_t) r0 * 512, b.qsa_pooled[l], b.pg, p.scores, p.cells + (size_t) r0 * qsa_maxsel(),
-                                   p.ncells + r0, max_ctx_ / 4, gctl, Tg, b.att_ring.card, s, C);
+                        if (!qsa_query_split(p.qidx + (size_t) r0 * 512, b.qsa_pooled[l], b.pg, p.scores,
+                                             p.cells + (size_t) r0 * qsa_maxsel(), p.ncells + r0, max_ctx_ / 4,
+                                             gctl, Tg, b.att_ring.card, s, C, pos0[(size_t) j] + r0))
+                            qsa_select(p.qidx + (size_t) r0 * 512, b.qsa_pooled[l], b.pg, p.scores, p.cells + (size_t) r0 * qsa_maxsel(),
+                                       p.ncells + r0, max_ctx_ / 4, gctl, Tg, b.att_ring.card, s, C);
                         if (!p.attn_dec) continue;
                         attn(p.qg + (size_t) r0 * attn_projected_q_heads() * 2 * HD, b.kc[l], b.vc[l], b.pg, p.att + (size_t) r0 * w.nq * HD, b.att_ring,
                              (const unsigned*) (gctl + 1), 128 + l, gctl, Tg, b.att_part, s, p.cells + (size_t) r0 * qsa_maxsel(),

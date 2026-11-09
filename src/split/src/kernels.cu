@@ -2,6 +2,8 @@
 // (src/models/qwen4exp.cpp) operation by operation.
 #include "kernels.hpp"
 #include "env.hpp"
+#include "owned.hpp"
+#include "qsa_query_split.hpp"
 #include "attn_head_split.hpp"
 
 #include <cuda_fp16.h>
@@ -526,6 +528,12 @@ __global__ void k_attn_prep(float* qg, float* k, const float* qn, const float* k
 }
 
 #include "qsa.cuh"
+#if FNX_HIP && FNX_NCARD == 2 && !FNX_27B
+#include "qsa_score_tile.cuh"
+#if FNX_KPART == 5 || FNX_KPART == 99
+#include "qsa_query_exchange.cuh"
+#endif
+#endif
 
 // split-K attention: block (split s, row t, local KV head kvl) takes positions [s * len, (s + 1) * len) of
 // [0, pos0 + t] (len: the context over ATT_SPLITS, rounded up to ATT_CH) in chunks of ATT_CH, for the local q heads
@@ -794,6 +802,9 @@ __global__ void __launch_bounds__(HD) k_attn_combine(const float* qg, const floa
 #include "attn_prompt.cuh"
 #include "attn_prompt_i8.cuh"
 #include "attn_heads.cuh"
+#if FNX_HIP && FNX_NCARD == 2 && !FNX_27B
+#include "attn_heads_packed.cuh"
+#endif
 #include "topk.cuh"
 
 // ---------------------------------------------------------------- PLE block
@@ -1472,9 +1483,18 @@ static void qsa_select_positions(const float* scores, int* cells, int* n_cells, 
     if (paired && max_pools <= QSA_PAIR_MAX_POOLS) {
         static const bool sample = env_flag("FNX_QSA_SAMPLE_PIVOT");
         static const bool prompt_sample = env_flag("FNX_PF_QSA_SAMPLE");
-        if (sample && (T <= 16 || (prompt_sample && stride <= 512)))
-            k_idx_select_pair<true><<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, stride, lr);
-        else
+        // A long prompt still selects in groups of at most 512 queries. Its
+        // output stride is the full chunk, not the number of active queries.
+        // Sampling only proposes the pivot; the selector counts every key
+        // and retains the full-radix fallback and chronological tie order.
+        static const bool long_sample = env_flag("FNX_PF_QSA_SAMPLE_LONG");
+        static const bool coalesced = env_flag("FNX_QSA_COALESCED");
+        if (sample && (T <= 16 || (prompt_sample && (stride <= 512 || (long_sample && T <= 512))))) {
+            if (coalesced)
+                k_idx_select_pair<true, true><<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, stride, lr);
+            else
+                k_idx_select_pair<true><<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, stride, lr);
+        } else
             k_idx_select_pair<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, n_cells, max_pools, pos0, stride, lr);
         return;
     }
@@ -1484,10 +1504,18 @@ static void qsa_select_positions(const float* scores, int* cells, int* n_cells, 
             n_cells + partition * stride, max_pools, pos0, partition, lr);
 }
 
+#include "qsa_query_split_dispatch.cuh"
+
 void qsa_select(const float* q, const uint16_t* pooled, const KvPages& g, float* scores, int* cells, int* n_cells, int max_pools, const int* pos0, int T,
                 int card, void* st, int selection_stride) {
     cudaStream_t s = (cudaStream_t) st;
     const __half* pl = reinterpret_cast<const __half*>(pooled);
+#if FNX_HIP && FNX_NCARD == 2 && !FNX_27B
+    static const bool wide = env_flag("FNX_PF_QSA_WIDE");
+    if (wide && selection_stride > 512 && T >= 32) {
+        k_idx_score_tc_wide<<<dim3((max_pools + 255) / 256, (T + 3) / 4), 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, T);
+    } else
+#endif
     k_idx_score_tc<<<dim3((max_pools + QSC_KEYS - 1) / QSC_KEYS, (T + QSC_ROWS - 1) / QSC_ROWS), 256, 0, s>>>(q, pl, g, scores, max_pools,
                                                                                                          pos0, T);
     qsa_select_positions(scores, cells, n_cells, max_pools, pos0, {}, T, selection_stride ? selection_stride : T, card, s);
@@ -1678,6 +1706,13 @@ void attn_prompt_heads(const float* qg, const uint16_t* kc, const uint16_t* vc, 
         if (hipGetDevice(&dev) != hipSuccess || hipGetDeviceProperties(&prop, dev) != hipSuccess ||
             std::string(prop.gcnArchName).rfind("gfx1100", 0) != 0)
             throw std::runtime_error("FNX_PF_ATTN_DIRECT requires gfx1100");
+#if FNX_NCARD == 2 && !FNX_27B
+        static const bool packed=env_flag("FNX_PF_ATTN_Q8_PACKED");
+        if (packed && C>=32)
+            k_pf_attn_head_packed<3><<<dim3(C, 2), 256, 0, s>>>(qg,reinterpret_cast<const __half*>(kc),
+                reinterpret_cast<const __half*>(vc),g,pos0,cells,n_cells,card,C,0,part);
+        else
+#endif
         k_pf_attn_head_direct<<<dim3(C, 2), 256, 0, s>>>(qg, reinterpret_cast<const __half*>(kc),
             reinterpret_cast<const __half*>(vc), g, pos0, cells, n_cells, card, C, 0, part);
     } else

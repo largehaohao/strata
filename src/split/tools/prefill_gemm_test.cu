@@ -267,6 +267,60 @@ static int check_q8_gsu3(int n, int k, int first, int owned, hipStream_t stream)
     return checks;
 }
 
+static int check_q8_k320(int n, hipStream_t stream) {
+    constexpr int k = 320, max_t = 256, guard = 17;
+    const size_t weights = (size_t)n * k;
+    Buffer x(max_t*k*2), q(weights), scales(weights/32*2), w(weights*2), y(((size_t)max_t*(n+9)+guard)*4);
+    std::vector<__half> hx(max_t*k);
+    std::vector<int8_t> hq(weights);
+    std::vector<uint16_t> hs(weights/32);
+    std::mt19937 rng(5137+n);
+    for (auto& value : hx) value = __float2half((int(rng()%2049)-1024)*0x1p-10f);
+    for (auto& value : hq) value = (int)(rng()%256)-128;
+    constexpr uint16_t bits[] = {0,1,3,0x200,0x3ff,0x400,0x1400,0x2400,0x3800};
+    for (size_t i=0;i<hs.size();++i) hs[i]=bits[i%9] | (i%11==0?0x8000:0);
+    ck(hipMemcpy(x.p,hx.data(),hx.size()*2,hipMemcpyHostToDevice));
+    ck(hipMemcpy(q.p,hq.data(),hq.size(),hipMemcpyHostToDevice));
+    ck(hipMemcpy(scales.p,hs.data(),hs.size()*2,hipMemcpyHostToDevice));
+    expand_q8<<<1024,256,0,stream>>>((int8_t*)q.p,(uint16_t*)scales.p,(__half*)w.p,weights,k,0,n);
+    int checks=0;
+    for (int rows : {64,65,66,91,96,97,123,128,131,235,255,256}) for (int ld : {n,n+9}) {
+        const size_t cells=(size_t)rows*ld+guard;
+        std::vector<uint32_t> expected(cells),actual(cells);
+        ck(hipMemsetAsync(y.p,0xa5,cells*4,stream));
+        if (!strata_pf_gemm_f16((uint16_t*)x.p,(uint16_t*)w.p,(float*)y.p,rows,n,k,ld,0,stream))
+            throw std::runtime_error("K320 reference dispatch");
+        ck(hipMemcpyAsync(expected.data(),y.p,cells*4,hipMemcpyDeviceToHost,stream));
+        ck(hipStreamSynchronize(stream));
+        auto launch = [&] {
+            if (!strata_pf_q8_k320_f16((uint16_t*)x.p,(int8_t*)q.p,(uint16_t*)scales.p,(float*)y.p,rows,n,k,ld,stream))
+                throw std::runtime_error("K320 Q8 dispatch");
+        };
+        for (bool graph : {false,true}) {
+            ck(hipMemsetAsync(y.p,0xa5,cells*4,stream));
+            if (graph) {
+                hipGraph_t g;hipGraphExec_t e;
+                ck(hipStreamBeginCapture(stream,hipStreamCaptureModeRelaxed));launch();
+                ck(hipStreamEndCapture(stream,&g));ck(hipGraphInstantiate(&e,g,nullptr,nullptr,0));
+                for(int i=0;i<3;++i)ck(hipGraphLaunch(e,stream));
+                ck(hipStreamSynchronize(stream));ck(hipGraphExecDestroy(e));ck(hipGraphDestroy(g));
+            } else launch();
+            ck(hipMemcpyAsync(actual.data(),y.p,cells*4,hipMemcpyDeviceToHost,stream));ck(hipStreamSynchronize(stream));
+            if(actual!=expected)throw std::runtime_error("K320 Q8 changed product bits or output guards");
+            ++checks;
+        }
+    }
+    for (int rows : {0,1,15,63,257,511,512}) {
+        ck(hipMemsetAsync(y.p,0xa5,64,stream));
+        if(strata_pf_q8_k320_f16((uint16_t*)x.p,(int8_t*)q.p,(uint16_t*)scales.p,(float*)y.p,rows,n,k,n,stream))
+            throw std::runtime_error("unsupported K320 rows accepted");
+        uint32_t actual[16];ck(hipMemcpyAsync(actual,y.p,64,hipMemcpyDeviceToHost,stream));ck(hipStreamSynchronize(stream));
+        for(unsigned v:actual)if(v!=0xa5a5a5a5u)throw std::runtime_error("K320 fallback wrote output");
+        ++checks;
+    }
+    return checks;
+}
+
 static void check_head_shard(int t, int full, int rows, int first, hipStream_t stream) {
     constexpr int k=2560, guard_rows=16;
     const int slice=std::min(full,(16*1024*1024/k/128)*128);
@@ -312,6 +366,10 @@ int main() {
             ck(hipSetDevice(dev));
             if(!strata_pf_padded_gemm_available()) throw std::runtime_error("gfx11 required");
             hipStream_t stream;ck(hipStreamCreate(&stream));hipblasHandle_t blas;cb(hipblasCreate(&blas));cb(hipblasSetStream(blas,stream));
+            if (const char* q8 = std::getenv("FNX_PF_Q8_K320"); q8 && !std::strcmp(q8,"1")) {
+                const int checks = check_q8_k320(2560,stream)+check_q8_k320(10240,stream);
+                std::printf("device=%d Q8 K320 exact/graph/fallback checks=%d\n",dev,checks);
+            }
             if (const char* exact = std::getenv("FNX_PF_HC_DOWN_GSU3"); exact && !std::strcmp(exact, "1"))
                 cases += check_gsu3(320, 10240, stream, blas);
             if (const char* wide = std::getenv("FNX_PF_WIDE_GSU3"); wide && !std::strcmp(wide, "1")) {

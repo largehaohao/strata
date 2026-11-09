@@ -4,6 +4,8 @@
 #include "engine.hpp"
 #include "engine_parts.hpp"
 #include "env.hpp"
+#include "qsa_query_split.hpp"
+#include "hc_row_split.hpp"
 #include "attn_head_split.hpp"
 #include "peer_probe.hpp"
 #include "prefill_scratch_plan.hpp"
@@ -581,6 +583,15 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         if (v < 1 || v >= (long long) TAG_END)
             throw std::runtime_error("FNX_RING_TAG_START: want 1.." + std::to_string(TAG_END - 1) + ", got " + std::to_string(v));
         tag_max_ = (unsigned) v;
+    }
+    // Keep the ordinary buffers' allocation order when query splitting is on.
+    for (int c = 0; c < NCARD; ++c) {
+        ck(cudaSetDevice(cb_[c]->dev), "QSA split init device");
+        qsa_query_split_prepare(c, peer_on, lanes, cb_[c]->ring.err);
+    }
+    for (int c = 0; c < NCARD; ++c) {
+        ck(cudaSetDevice(cb_[c]->dev), "HC split init device");
+        hc_row_split_prepare(c, peer_on, lanes, cb_[c]->ring.err);
     }
 }
 

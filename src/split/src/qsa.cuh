@@ -476,10 +476,13 @@ __device__ __forceinline__ QsaCutoff qsa_sample_cutoff(const unsigned* scores, i
 
 // Both position partitions select from the same global scores. Resolve the
 // cutoff and its ties once, then compact the two ordered lists independently.
-template<bool Sampled = false>
+template<bool Sampled = false, bool Coalesced = false, bool QuerySplit = false>
 __global__ void __launch_bounds__(QSA_SEL_THREADS) k_idx_select_pair(const float* __restrict__ scores, int* __restrict__ cells,
                                                                      int* __restrict__ n_cells, int max_pools, const int* pos0p,
-                                                                     int stride, LaneRows lr) {
+                                                                     int stride, LaneRows lr, int card = 0, int group = 4) {
+    if constexpr (QuerySplit) {
+        if ((blockIdx.x / group) % 2 != card) return;
+    }
     const int t = blockIdx.x, tid = threadIdx.x, p = row_pos(lr, pos0p, t), nv = (p + 1) / QSA_POOL;
     if (nv <= QSA_TOP) {
         if (tid == 0) n_cells[t] = n_cells[stride + t] = -1;
@@ -487,15 +490,45 @@ __global__ void __launch_bounds__(QSA_SEL_THREADS) k_idx_select_pair(const float
     }
     const unsigned* key = reinterpret_cast<const unsigned*>(scores + (size_t) t * max_pools);
     const QsaCutoff cut = Sampled ? qsa_sample_cutoff(key, nv) : qsa_cutoff(key, nv);
-    const int chunk = (nv + QSA_SEL_THREADS - 1) / QSA_SEL_THREADS;
-    const int first = tid * chunk, length = max(0, min(chunk, nv - first));
     using Mask = unsigned long long;
     Mask greater = 0, equal = 0;
-    for (int i = 0; i < length; ++i) {
-        const unsigned k = key[first + i];
-        const Mask bit = 1ull << i;
-        if (k > cut.bits) greater |= bit;
-        if (k == cut.bits) equal |= bit;
+    int first;
+    if constexpr (Coalesced) {
+        // Adjacent lanes read adjacent scores. Transpose just the predicates
+        // into chronological 64-key masks, keeping the cutoff and tie order.
+        __shared__ unsigned above_bits[QSA_PAIR_MAX_POOLS / 32];
+        __shared__ unsigned equal_bits[QSA_PAIR_MAX_POOLS / 32];
+        const int lane = tid & 31;
+        for (int base = 0; base < nv; base += QSA_SEL_THREADS) {
+            const int j = base + tid;
+            const unsigned k = j < nv ? key[j] : 0;
+            const unsigned above = __ballot_sync(0xffffffffu, j < nv && k > cut.bits);
+            const unsigned ties = __ballot_sync(0xffffffffu, j < nv && k == cut.bits);
+            if (lane == 0 && j < nv) {
+                above_bits[j / 32] = above;
+                equal_bits[j / 32] = ties;
+            }
+        }
+        __syncthreads();
+        first = tid * 64;
+        if (first < nv) {
+            greater = above_bits[2 * tid];
+            equal = equal_bits[2 * tid];
+        }
+        if (first + 32 < nv) {
+            greater |= (Mask) above_bits[2 * tid + 1] << 32;
+            equal |= (Mask) equal_bits[2 * tid + 1] << 32;
+        }
+    } else {
+        const int chunk = (nv + QSA_SEL_THREADS - 1) / QSA_SEL_THREADS;
+        first = tid * chunk;
+        const int length = max(0, min(chunk, nv - first));
+        for (int i = 0; i < length; ++i) {
+            const unsigned k = key[first + i];
+            const Mask bit = 1ull << i;
+            if (k > cut.bits) greater |= bit;
+            if (k == cut.bits) equal |= bit;
+        }
     }
     __shared__ unsigned tie_waves[32], selected_waves[32];
     const int ties = __popcll(equal);

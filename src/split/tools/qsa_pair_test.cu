@@ -49,16 +49,19 @@ void oracle(const float* scores, int pos, int row, int stride, std::vector<int>&
     for (int owner = 0; owner < 2; ++owner) counts[pad + owner * stride + row] = n[owner];
 }
 
-void run(int dev, bool prefill) {
+void run(int dev, bool prefill, bool long_prefill) {
     ck(cudaSetDevice(dev), "set device");
     Buffers mem;
-    const int max_t = prefill ? 512 : 16, capacity = 2 * (max_t + 3);
-    const std::vector<int> prompt_rows = {19, 27, 64, 113, 256, 512};
+    const int max_t = long_prefill ? 256 : prefill ? 512 : 16;
+    const int capacity = 2 * (long_prefill ? 4099 : max_t + 3);
+    const std::vector<int> prompt_rows = long_prefill ? std::vector<int>{256}
+                                                     : std::vector<int>{19, 27, 64, 113, 256, 512};
     std::vector<int> rows(max_t);
     std::iota(rows.begin(), rows.end(), 1);
     if (prefill) rows = prompt_rows;
     const auto patterns = prefill ? std::vector<int>{0, 2, 6} : std::vector<int>{0, 1, 2, 3, 4, 5, 6};
-    const auto starts = prefill ? std::vector<int>{74401, 200257, pools * QSA_POOL - max_t}
+    const auto starts = long_prefill ? std::vector<int>{32761, 65531, 131065, 204793, pools * QSA_POOL - max_t}
+                        : prefill ? std::vector<int>{74401, 200257, pools * QSA_POOL - max_t}
                                 : std::vector<int>{0, 2046, 2051, 74401, 200751, pools * QSA_POOL - max_t};
     const size_t cell_size = 2 * pad + (size_t) capacity * QSA_MAXSEL, count_size = 2 * pad + capacity;
     auto* scores = mem.get<float>((size_t) max_t * pools);
@@ -92,11 +95,14 @@ void run(int dev, bool prefill) {
         }
         ck(cudaMemcpy(scores, keys.data(), keys.size() * sizeof(float), cudaMemcpyHostToDevice), "scores");
         for (int T : rows) for (bool lanes : {false, true}) {
-            const int stride = T + 3;
+            const int stride = long_prefill ? 4096 : T + 3;
             LaneRows lr{};
             lr.pos = lanes ? lane_pos : nullptr;
             auto launch = [&](int mode) {
-                if (mode == 2) {
+                if (mode == 3) {
+                    k_idx_select_pair<true, true><<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells + pad, counts + pad, pools,
+                        lanes ? nullptr : pos, stride, lr);
+                } else if (mode == 2) {
                     k_idx_select_pair<true><<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells + pad, counts + pad, pools,
                         lanes ? nullptr : pos, stride, lr);
                 } else if (mode == 1) {
@@ -108,12 +114,14 @@ void run(int dev, bool prefill) {
                         lanes ? nullptr : pos, c, lr);
                 }
             };
-            cudaGraph_t graph;
-            cudaGraphExec_t exec;
-            ck(cudaStreamBeginCapture(s, cudaStreamCaptureModeRelaxed), "capture");
-            launch(2);
-            ck(cudaStreamEndCapture(s, &graph), "end capture");
-            ck(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0), "instantiate");
+            cudaGraph_t graph[2];
+            cudaGraphExec_t exec[2];
+            for (int i = 0; i < 2; ++i) {
+                ck(cudaStreamBeginCapture(s, cudaStreamCaptureModeRelaxed), "capture");
+                launch(2 + i);
+                ck(cudaStreamEndCapture(s, &graph[i]), "end capture");
+                ck(cudaGraphInstantiate(&exec[i], graph[i], nullptr, nullptr, 0), "instantiate");
+            }
             for (int start : starts) {
                 std::vector<int> positions(T);
                 std::vector<int> expected_cells(cell_size, guard), expected_counts(count_size, guard);
@@ -122,10 +130,10 @@ void run(int dev, bool prefill) {
                     oracle(keys.data() + (size_t) t * pools, positions[t], t, stride, expected_cells, expected_counts);
                 }
                 ck(cudaMemcpy(pos, positions.data(), T * sizeof(int), cudaMemcpyHostToDevice), "positions");
-                for (int mode = 0; mode < 4; ++mode) {
+                for (int mode = 0; mode < 6; ++mode) {
                     ck(cudaMemsetAsync(cells, 0x5a, cell_size * sizeof(int), s), "guard cells");
                     ck(cudaMemsetAsync(counts, 0x5a, count_size * sizeof(int), s), "guard counts");
-                    if (mode == 3) ck(cudaGraphLaunch(exec, s), "replay");
+                    if (mode >= 4) ck(cudaGraphLaunch(exec[mode - 4], s), "replay");
                     else launch(mode);
                     ck(cudaStreamSynchronize(s), "select");
                     std::vector<int> got_cells(cell_size), got_counts(count_size);
@@ -139,23 +147,29 @@ void run(int dev, bool prefill) {
                     ++checks;
                 }
             }
-            ck(cudaGraphExecDestroy(exec), "destroy graph exec");
-            ck(cudaGraphDestroy(graph), "destroy graph");
+            for (int i = 0; i < 2; ++i) {
+                ck(cudaGraphExecDestroy(exec[i]), "destroy graph exec");
+                ck(cudaGraphDestroy(graph[i]), "destroy graph");
+            }
         }
     }
     std::printf("device=%d exact checks=%d\n", dev, checks);
     const auto timed_rows = prefill ? prompt_rows : std::vector<int>{1, 4, 6, 12, 16};
-    for (int p : {74401, 200257}) for (int T : timed_rows) {
+    const auto timed_positions = long_prefill ? std::vector<int>{32761, 65531, 131065, 204793}
+                                              : std::vector<int>{74401, 200257};
+    for (int p : timed_positions) for (int T : timed_rows) {
         ck(cudaMemcpy(pos, &p, sizeof(p), cudaMemcpyHostToDevice), "timed position");
+        const int stride = long_prefill ? 4096 : T;
         auto timed = [&](int mode) {
             ck(cudaEventRecord(begin, s), "begin");
             constexpr int repetitions = 40;
             for (int i = 0; i < repetitions; ++i) {
-                if (mode == 2) k_idx_select_pair<true><<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, counts, pools, pos, T, {});
-                else if (mode == 1) k_idx_select_pair<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, counts, pools, pos, T, {});
+                if (mode == 3) k_idx_select_pair<true, true><<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, counts, pools, pos, stride, {});
+                else if (mode == 2) k_idx_select_pair<true><<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, counts, pools, pos, stride, {});
+                else if (mode == 1) k_idx_select_pair<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells, counts, pools, pos, stride, {});
                 else for (int c = 0; c < 2; ++c)
-                    k_idx_select<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells + (size_t) c * T * QSA_MAXSEL,
-                        counts + c * T, pools, pos, c, {});
+                    k_idx_select<<<T, QSA_SEL_THREADS, 0, s>>>(scores, cells + (size_t) c * stride * QSA_MAXSEL,
+                        counts + c * stride, pools, pos, c, {});
             }
             ck(cudaEventRecord(end, s), "end");
             ck(cudaEventSynchronize(end), "wait");
@@ -163,13 +177,13 @@ void run(int dev, bool prefill) {
             ck(cudaEventElapsedTime(&ms, begin, end), "time");
             return ms * 1000.f / repetitions;
         };
-        for (int mode = 0; mode < 3; ++mode) timed(mode);
-        std::array<std::array<float, 5>, 3> sample;
+        for (int mode = 0; mode < 4; ++mode) timed(mode);
+        std::array<std::array<float, 5>, 4> sample;
         for (int rep = 0; rep < 5; ++rep)
-            for (int pass = 0; pass < 3; ++pass) { int mode = (rep + pass) % 3; sample[mode][rep] = timed(mode); }
+            for (int pass = 0; pass < 4; ++pass) { int mode = (rep + pass) % 4; sample[mode][rep] = timed(mode); }
         for (auto& values : sample) std::sort(values.begin(), values.end());
-        std::printf("device=%d pos=%d T=%d separate_us=%.2f paired_us=%.2f sampled_us=%.2f\n",
-                    dev, p, T, sample[0][2], sample[1][2], sample[2][2]);
+        std::printf("device=%d pos=%d T=%d stride=%d separate_us=%.2f paired_us=%.2f sampled_us=%.2f coalesced_us=%.2f\n",
+                    dev, p, T, stride, sample[0][2], sample[1][2], sample[2][2], sample[3][2]);
     }
     ck(cudaEventDestroy(begin), "destroy event");
     ck(cudaEventDestroy(end), "destroy event");
@@ -179,13 +193,14 @@ void run(int dev, bool prefill) {
 }  // namespace fnx
 
 int main(int argc, char** argv) {
-    const bool prefill = argc == 2 && std::string_view(argv[1]) == "--prefill";
+    const bool long_prefill = argc == 2 && std::string_view(argv[1]) == "--long-prefill";
+    const bool prefill = long_prefill || (argc == 2 && std::string_view(argv[1]) == "--prefill");
     if (argc != 1 && !prefill) {
-        std::fprintf(stderr, "usage: split_qsa_pair_test [--prefill]\n");
+        std::fprintf(stderr, "usage: split_qsa_pair_test [--prefill|--long-prefill]\n");
         return 2;
     }
     try {
-        for (int device = 0; device < 2; ++device) fnx::run(device, prefill);
+        for (int device = 0; device < 2; ++device) fnx::run(device, prefill, long_prefill);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "%s\n", e.what());
         return 1;
