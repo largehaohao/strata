@@ -5,6 +5,15 @@
 #include "../src/static_kv_cache.hpp"
 
 namespace fnx {
+// kernels_p0 also contains the top-k launch wrapper. Its optional stream
+// scratch uses the engine's owner hook, supplied locally in this standalone test.
+namespace { std::vector<std::function<void()>> cache_test_owned; }
+void own(std::function<void()> release) { cache_test_owned.push_back(std::move(release)); }
+std::vector<std::function<void()>> take_owned() {
+    auto releases = std::move(cache_test_owned);
+    cache_test_owned.clear();
+    return releases;
+}
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
 }
@@ -264,5 +273,7 @@ int main() {
         for (int pattern : {0, 1, 2}) for (bool coherent : {false, true})
             fnx::run_cache(dev, 352, pattern, coherent, 2, true, 1, max_age);
     }
+    auto releases = fnx::take_owned();
+    for (auto it = releases.rbegin(); it != releases.rend(); ++it) (*it)();
     std::cout << "Static decode cache: 18432 exact direct/graph/policy checks passed (6912 with K/V lending)\n";
 }

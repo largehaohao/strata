@@ -402,16 +402,26 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
     // The MTP chain's length follows acceptance: per chain position, how often a draft that got there stood (decayed,
     // so it follows the text), and each round the length 1..K with the most tokens expected per ms. A round costs about
     // ROUND_MS, a verify row DRAFT_ROW_MS more and a draft call after d1 DRAFT_CALL_MS (Q4, lab, 2026-10-25, prose with
-    // K fixed at 1 / 2 / 3 / 4: 12.47 / 14.76 / 16.60 / 18.34 ms a round). FNX_DRAFT_ADAPT=0: always K
+    // K fixed at 1 / 2 / 3 / 4: 12.47 / 14.76 / 16.60 / 18.34 ms a round). FNX_DRAFT_ADAPT=0: always K.
+    // FNX_DRAFT_ROUND_MS / FNX_DRAFT_ROW_MS / FNX_DRAFT_CALL_MS / FNX_DRAFT_PRIOR replace that curve and the 70% prior.
+    // Unset, the numbers below stay, so a process that does not set them keeps the same chain lengths.
     const bool adapt = env_int("FNX_DRAFT_ADAPT", 1) != 0;
-    constexpr double ROUND_MS = 11.2, DRAFT_ROW_MS = 1.3, DRAFT_CALL_MS = 0.65, DECAY = 0.97;
-    std::vector<double> tried(MAXT, 1.0), stood(MAXT, 0.7);   // a prior of 70% at every position
+    const double round_ms = env_num("FNX_DRAFT_ROUND_MS", 11.2);
+    const double row_ms = env_num("FNX_DRAFT_ROW_MS", 1.3);
+    const double call_ms = env_num("FNX_DRAFT_CALL_MS", 0.65);
+    const double prior = env_num("FNX_DRAFT_PRIOR", 0.7);
+    if (!(round_ms > 0.0 && row_ms > 0.0 && call_ms >= 0.0 && prior > 0.0 && prior < 1.0))
+        throw std::runtime_error("FNX_DRAFT_ROUND_MS, FNX_DRAFT_ROW_MS, FNX_DRAFT_CALL_MS and FNX_DRAFT_PRIOR: a positive round and row, a non-negative call, and a prior in (0, 1)");
+    const double decay = env_num("FNX_DRAFT_DECAY", 0.97);
+    if (!(decay > 0.0 && decay < 1.0))
+        throw std::runtime_error("FNX_DRAFT_DECAY: expected a number in (0, 1)");
+    std::vector<double> tried(MAXT, 1.0), stood(MAXT, prior);
     auto chain_len = [&](double call_ms) {
         int best = K_;
         double best_rate = -1.0, expect = 1.0, reach = 1.0;
         for (int k = 1; k <= K_; ++k) {   // at least d1: its acceptance stays measured (it pays above ~8% anyway)
             reach *= stood[(size_t) k - 1] / tried[(size_t) k - 1], expect += reach;
-            const double rate = expect / (ROUND_MS + k * DRAFT_ROW_MS + std::max(0, k - 1) * call_ms);
+            const double rate = expect / (round_ms + k * row_ms + std::max(0, k - 1) * call_ms);
             if (rate > best_rate) best_rate = rate, best = k;
         }
         return best;
@@ -519,8 +529,8 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
         if (mtp_round) {   // chain position j was reached if every draft before it stood
             const int acc = n - 1;
             for (int j = 0; j < (int) drafts.size() && j <= acc; ++j) {
-                tried[(size_t) j] = tried[(size_t) j] * DECAY + 1.0;
-                stood[(size_t) j] = stood[(size_t) j] * DECAY + (j < acc ? 1.0 : 0.0);
+                tried[(size_t) j] = tried[(size_t) j] * decay + 1.0;
+                stood[(size_t) j] = stood[(size_t) j] * decay + (j < acc ? 1.0 : 0.0);
             }
         }
         // emit the accepted drafts' successors in order until a stop: the window keeps the rows before the last emitted
@@ -598,7 +608,7 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
         // the MTP chain: each draft from the draft layer's own row for the one before
         // every 4th chain one draft longer, so the position past the chosen length stays measured (the full K every 4th
         // chain cost prose ~0.9 ms a round)
-        const int k = !adapt ? K_ : std::min(K_, chain_len(DRAFT_CALL_MS) + (++mtp_chains % 4 ? 0 : 1));   // every 16th: code stuck at ~3
+        const int k = !adapt ? K_ : std::min(K_, chain_len(call_ms) + (++mtp_chains % 4 ? 0 : 1));   // every 16th: code stuck at ~3
         mtp_round = true;
         drafts = {d1}, qs = {std::move(q1)};
         for (int j = 1; j < k; ++j) {

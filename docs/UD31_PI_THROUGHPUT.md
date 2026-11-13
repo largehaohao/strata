@@ -8,6 +8,22 @@ an **8.91% reduction**, with all 16 task acceptances passing. This meets the
 further 5% task-time target for the declared representative panel. The final section records all six pairs,
 including the slower pair and changes in generated length.
 
+On November 12 the `main-tp-opt` HIP build, SHA-256
+`71df156b4fb1707857b50bafdf570c4dfb4bb8b4df305fa5e8ea88623f26d720`,
+loaded Unsloth UD-IQ2_XS on the same two RX 7900 XTX cards. The only change
+between arms is the MTP draft-length curve: round 10.72 ms, row 1.08 ms,
+call 0.67 ms, and a prior acceptance of 0.88
+(`FNX_DRAFT_ROUND_MS`, `FNX_DRAFT_ROW_MS`, `FNX_DRAFT_CALL_MS`,
+`FNX_DRAFT_PRIOR`). Unset, those four keep the previous 11.2 / 1.3 / 0.65 / 0.70
+curve. Seeds 101 and 202, with the second pair running the new curve first,
+completed in **262.53 seconds versus 285.78 seconds**, an **8.13% reduction**.
+Seed 101 fell from 175.63 s to 160.07 s (8.86%). Seed 202 fell from 110.15 s
+to 102.47 s (6.98%). All 16 task acceptances passed, with zero HTTP errors.
+Generated text differs: seed 101 produced 30251 tokens against 28140, and its
+decode rate rose from 202.5 to 233.5 tok/s; seed 202 produced 15114 tokens
+against 17928, and its decode rate fell from 216.9 to 199.8 tok/s. The task-time
+reduction is therefore not a same-token kernel speedup.
+
 On November 9, the daily service also received a Pi response-recovery fix.
 Its forced greedy sampling defaults were removed, and a repeated token inside
 thinking can trigger one bounded continuation when `reasoning_close_retry` is
@@ -313,3 +329,69 @@ protocol and results. `formal-pi-model-checks.json`, `formal-pi-qualification.js
 and `formal-pi-deployment.json` record the build comparison, recovery checks
 and applied selection. Full requests, responses, tool traces and acceptance
 logs are retained locally, including unsuccessful earlier experiments.
+
+## Further Pi task comparison on November 12
+
+This step starts from the complete daily Unsloth UD-IQ2_XS configuration,
+including the existing cost curve, 8 GiB conversation cache, 10.25 GiB expert RAM
+budget and earlier optimizations. The baseline executable SHA-256 is
+`71df156b4fb1707857b50bafdf570c4dfb4bb8b4df305fa5e8ea88623f26d720`. The selected HIP executable is
+`9835b9f121e5bd0d9c569c7afaa567883a192e8a2f2e63eeb73afe887f49cd91`. Measurements use two RX 7900 XTX cards,
+a Ryzen 7 7700 with 62.0 GiB system RAM, Pi 1.5.2 and Node v26.13.0.
+
+`FNX_DRAFT_DECAY` makes draft-chain acceptance retention configurable.
+Unset, it keeps the previous 0.97. The selected value is 0.90, giving recent
+observations more weight when choosing the next draft length. Its range is
+strictly between zero and one. The target sampler and speculative rejection
+calculation are unchanged. Both arms retain medium thinking, a 32768-token
+output ceiling, 262144-token capacity, six drafts, lookup 15 and model-card
+sampling (temperature 1.0, top-p 0.95, top-k 20). No model or precision is changed.
+
+Each arm starts a fresh engine, with no model warmup before the four live Pi
+tasks. Server startup is outside the timer. All attempts, tools, independent
+tests and retries count toward accepted completion. Paired first-request bytes,
+sampling and cold-prefix state match. No builds or other GPU work overlap timing.
+
+After screening seeds 1101/1102, the candidate was frozen. Four primary pairs
+must reduce pooled time by at least 5%, with at least three pairs improving.
+Only then may two previously unused held-out pairs run; their pooled time and
+the complete six-pair total must also improve by at least 5%. All gates pass.
+
+| Seed and stage | Baseline | Candidate | Time reduction |
+| --- | ---: | ---: | ---: |
+| 1201, primary | 134.025 s | 175.641 s | -31.05% |
+| 1202, primary | 142.862 s | 87.757 s | 38.57% |
+| 1203, primary | 131.869 s | 94.915 s | 28.02% |
+| 1204, primary | 117.198 s | 113.053 s | 3.54% |
+| 1301, heldout | 178.407 s | 145.257 s | 18.58% |
+| 1302, heldout | 154.612 s | 120.535 s | 22.04% |
+| Four primary pairs | 525.954 s | 471.367 s | 10.38% |
+| Two held-out pairs | 333.019 s | 265.793 s | 20.19% |
+| All six pairs | 858.973 s | 737.159 s | 14.18% |
+
+Five pairs improve; seed 1201 becomes 31.05% slower. All 48 final task acceptances
+pass. Baseline and candidate require 25 and 26 attempts. Three extra Python attempts
+fail the allowed-file scope check; their time is included. All 1152 independent
+tests pass without skips, and 427 HTTP calls have no errors. Python's pooled
+improvement is only 4.50%; this is not a guarantee of 5% for every task.
+
+Generated output changes from 142358 to 119767 tokens, and requests from 232 to 195.
+Weighted decode is 210.02 versus 212.22 tok/s. The main result is time to accepted
+completion with changed trajectories and text length, not 14.18% faster execution
+of the same tokens. Target sampling remains the same; changing draft scheduling
+changes RNG consumption and can change fixed-seed text.
+
+Five ordered requests match the baseline's outputs and native counters with the
+new option unset. With 0.90 enabled, a 261888-token cold input and sampled cached
+continuation return 1517 and 1683, reusing 261892 tokens. Explicit cancellation,
+same-process recovery, seven installed-Pi provider cases and 17 matched incremental
+follow-ups pass. The 71 split Python checks also pass. CUDA and other models or
+hardware were not tested for this option.
+
+The daily UD-IQ2 config now selects the qualified immutable executable and sets
+`FNX_DRAFT_DECAY=0.90`; its other settings are retained. The service stays stopped
+until its normal next start. Evidence and the credential-bearing rollback config
+are under `local-tuning/2026-11-12/ud-iq2-pi-goal-5pct/`; do not publish that
+directory wholesale. `RESULTS.md`, `formal-results.json`, `plan.json`,
+`candidate-selection.json`, `qualification/summary.json` and `deployment.json`
+record the protocol, all results and the applied selection.
