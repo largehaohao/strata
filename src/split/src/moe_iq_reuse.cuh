@@ -9,8 +9,7 @@ struct IqDot32 {
     int scale0, scale1;
 };
 
-// The ggml HIP header supplies byte-by-byte implementations after kernels.cu
-// removes the compatibility macros. Use the tree's packed operations here.
+// Use the HIP compatibility layer's packed byte operations here.
 // IQ grid magnitudes fit positive signed bytes; applying their signs cannot
 // saturate, so wrapping and signed-saturating subtraction give the same values.
 __device__ __forceinline__ int iq_sign_mask(int bits) {
@@ -36,10 +35,10 @@ __device__ __forceinline__ int iq_signed_nibble(int grid, unsigned nibble) {
     return (int) (((unsigned) grid ^ (ones * 255u)) + ones);
 }
 
-template <ggml_type TA, bool PACKED_SIGNS = false>
+template <GgmlType TA, bool PACKED_SIGNS = false>
 __device__ __forceinline__ IqDot32 iq_decode32(const char* row, int kbx, int iqs) {
     IqDot32 r;
-    if constexpr (TA == GGML_TYPE_IQ2_XXS) {
+    if constexpr (TA == T_IQ2_XXS) {
         const block_iq2_xxs* b = reinterpret_cast<const block_iq2_xxs*>(row) + kbx;
         const int packed = get_int_b2(b->qs, iqs);
         const uint8_t* qs = reinterpret_cast<const uint8_t*>(&packed);
@@ -54,7 +53,7 @@ __device__ __forceinline__ IqDot32 iq_decode32(const char* row, int kbx, int iqs
         r.d = __half2float(b->d);
         r.scale0 = (aux >> 27) | 1;
         r.scale1 = 0;
-    } else if constexpr (TA == GGML_TYPE_IQ2_S) {
+    } else if constexpr (TA == T_IQ2_S) {
         const block_iq2_s* b = reinterpret_cast<const block_iq2_s*>(row) + kbx;
         const int packed = get_int_b2(b->qs, iqs / 2);
         const uint8_t* qs = reinterpret_cast<const uint8_t*>(&packed);
@@ -77,7 +76,7 @@ __device__ __forceinline__ IqDot32 iq_decode32(const char* row, int kbx, int iqs
         r.d = __half2float(b->d);
         r.scale0 = b->scales[iqs / 2] & 15;
         r.scale1 = b->scales[iqs / 2] >> 4;
-    } else if constexpr (TA == GGML_TYPE_IQ3_XXS) {
+    } else if constexpr (TA == T_IQ3_XXS) {
         const block_iq3_xxs* b = reinterpret_cast<const block_iq3_xxs*>(row) + kbx;
         const int2 packed = make_int2(get_int_b2(b->qs, iqs), get_int_b2(b->qs, iqs + 1));
         const uint8_t* qs = reinterpret_cast<const uint8_t*>(&packed);
@@ -100,7 +99,7 @@ __device__ __forceinline__ IqDot32 iq_decode32(const char* row, int kbx, int iqs
         r.scale0 = aux >> 28;
         r.scale1 = 0;
     } else {
-        static_assert(TA == GGML_TYPE_IQ3_S, "IQ reuse type");
+        static_assert(TA == T_IQ3_S, "IQ reuse type");
         const block_iq3_s* b = reinterpret_cast<const block_iq3_s*>(row) + kbx;
         const int2 packed = make_int2(get_int_b2(b->qs, iqs), get_int_b2(b->qs, iqs + 1));
         const uint8_t* qs = reinterpret_cast<const uint8_t*>(&packed);
@@ -128,30 +127,30 @@ __device__ __forceinline__ IqDot32 iq_decode32(const char* row, int kbx, int iqs
     return r;
 }
 
-template <ggml_type TA>
+template <GgmlType TA>
 __device__ __forceinline__ float iq_dot32(const IqDot32& w, const block_q8_1& x) {
     int sum = 0;
-    if constexpr (TA == GGML_TYPE_IQ2_S) {
+    if constexpr (TA == T_IQ2_S) {
         int a = 0, b = 0;
 #pragma unroll
         for (int k = 0; k < 8; ++k) {
             const int q = get_int_b4(x.qs, k);
-            if (k < 4) a = ggml_cuda_dp4a(w.grid[k], q, a);
-            else b = ggml_cuda_dp4a(w.grid[k], q, b);
+            if (k < 4) a = qd_dp4a(w.grid[k], q, a);
+            else b = qd_dp4a(w.grid[k], q, b);
         }
         sum = (a * w.scale0 + b * w.scale1 + (a + b) / 2) / 4;
     } else {
 #pragma unroll
-        for (int k = 0; k < 8; ++k) sum = ggml_cuda_dp4a(w.grid[k], get_int_b4(x.qs, k), sum);
-        if constexpr (TA == GGML_TYPE_IQ2_XXS) sum = (sum * w.scale0) / 8;
-        else if constexpr (TA == GGML_TYPE_IQ3_XXS) sum = (w.scale0 * sum + sum / 2) / 2;
+        for (int k = 0; k < 8; ++k) sum = qd_dp4a(w.grid[k], get_int_b4(x.qs, k), sum);
+        if constexpr (TA == T_IQ2_XXS) sum = (sum * w.scale0) / 8;
+        else if constexpr (TA == T_IQ3_XXS) sum = (w.scale0 * sum + sum / 2) / 2;
         else sum *= w.scale0;
     }
     const float d = w.d * __low2float(x.ds);
     return d * sum;
 }
 
-template <ggml_type TA, int TT, int G = 32, bool COPY = false>
+template <GgmlType TA, int TT, int G = 32, bool COPY = false>
 __global__ void __launch_bounds__(MMVQ_THREADS) k_moe_gu_iq(
     MoeW w, const Job* __restrict__ jobs, const int* __restrict__ njobs,
     const block_q8_1* __restrict__ y, float* __restrict__ out, CacheDownCopy copy = {}) {
@@ -187,9 +186,9 @@ __global__ void __launch_bounds__(MMVQ_THREADS) k_moe_gu_iq(
     // Join them before the remaining shuffles to preserve the reduction order.
     constexpr int PARTS = 32 / G;
     float tmp[PARTS][TT] = {};
-    if constexpr (TA == GGML_TYPE_IQ2_XXS || TA == GGML_TYPE_IQ2_S || TA == GGML_TYPE_IQ3_XXS || TA == GGML_TYPE_IQ3_S) {
-        constexpr int qk = ggml_cuda_type_traits<TA>::qk, vdr = vdr_of<TA>();
-        constexpr int per_block = ggml_cuda_type_traits<TA>::qi / vdr;
+    if constexpr (TA == T_IQ2_XXS || TA == T_IQ2_S || TA == T_IQ3_XXS || TA == T_IQ3_S) {
+        constexpr int qk = qtraits<TA>::qk, vdr = vdr_of<TA>();
+        constexpr int per_block = qtraits<TA>::qi / vdr;
         static_assert(G >= per_block && G % per_block == 0, "lanes per weight block");
         const int gl = threadIdx.x % G, kqs = vdr * (gl % per_block);
         if (live)

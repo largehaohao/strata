@@ -33,14 +33,14 @@ bool moe_gate_up_swiglu_mma(const DW& a, size_t stride, const BigJob* jobs, cons
     if(!moe_gate_up_swiglu_supported(a)) return false;
     const MoeW w{(const char*)a.p,stride,a.row_bytes,a.n_out,a.n_in,a.ep};
     switch(a.type) {
-        case T_IQ3_S: fused_gate_launch<GGML_TYPE_IQ3_S>(w,jobs,count,capacity,x,h,stream); break;
-        case T_IQ3_XXS: fused_gate_launch<GGML_TYPE_IQ3_XXS>(w,jobs,count,capacity,x,h,stream); break;
-        case T_IQ2_S: fused_gate_launch<GGML_TYPE_IQ2_S>(w,jobs,count,capacity,x,h,stream); break;
-        case T_IQ2_XXS: fused_gate_launch<GGML_TYPE_IQ2_XXS>(w,jobs,count,capacity,x,h,stream); break;
-        case T_IQ4_XS: fused_gate_launch<GGML_TYPE_IQ4_XS>(w,jobs,count,capacity,x,h,stream); break;
-        case T_IQ4_NL: fused_gate_launch<GGML_TYPE_IQ4_NL>(w,jobs,count,capacity,x,h,stream); break;
-        case T_Q4_0: fused_gate_launch<GGML_TYPE_Q4_0>(w,jobs,count,capacity,x,h,stream); break;
-        case T_Q2_0:fused_gate_launch<GGML_TYPE_Q2_0>(w,jobs,count,capacity,x,h,stream); break;
+        case T_IQ3_S: fused_gate_launch<T_IQ3_S>(w,jobs,count,capacity,x,h,stream); break;
+        case T_IQ3_XXS: fused_gate_launch<T_IQ3_XXS>(w,jobs,count,capacity,x,h,stream); break;
+        case T_IQ2_S: fused_gate_launch<T_IQ2_S>(w,jobs,count,capacity,x,h,stream); break;
+        case T_IQ2_XXS: fused_gate_launch<T_IQ2_XXS>(w,jobs,count,capacity,x,h,stream); break;
+        case T_IQ4_XS: fused_gate_launch<T_IQ4_XS>(w,jobs,count,capacity,x,h,stream); break;
+        case T_IQ4_NL: fused_gate_launch<T_IQ4_NL>(w,jobs,count,capacity,x,h,stream); break;
+        case T_Q4_0: fused_gate_launch<T_Q4_0>(w,jobs,count,capacity,x,h,stream); break;
+        case T_Q2_0:fused_gate_launch<T_Q2_0>(w,jobs,count,capacity,x,h,stream); break;
         default:return false;
     }
     ck_launch("fused gate/up SwiGLU");

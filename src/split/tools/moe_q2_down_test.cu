@@ -41,7 +41,7 @@ __global__ void check_q2_dot(unsigned* errors, int cases) {
         y[h].ds = make_half2(__float2half(scale), __float2half(sum * scale + .0002f));
     }
     for (int h = 0; h < 2; ++h) {
-        const float old = unit_dot<GGML_TYPE_Q4_0, 32>((const char*) expanded, h, y);
+        const float old = unit_dot<T_Q4_0, 32>((const char*) expanded, h, y);
         const float now = unit_dot_q2_exact((const char*) packed, h, y);
         if (__float_as_uint(old) != __float_as_uint(now)) atomicAdd(errors, 1u);
     }
@@ -97,11 +97,11 @@ int run(int dev, int cols, int rows, bool timing) {
         const size_t smem = sizeof(float) * T * DN_THREADS;
         if (pre) k_moe_h<<<(T * TOPK * nb + 7) / 8, 256, 0, st>>>(gu, cols, T * TOPK);
         if (packed) {
-            if (pre) k_moe_down<GGML_TYPE_Q4_0, true, true><<<grid, DN_THREADS, smem, st>>>(w2, jobs, count, gu, output);
-            else k_moe_down<GGML_TYPE_Q4_0, false, true><<<grid, DN_THREADS, smem, st>>>(w2, jobs, count, gu, output);
+            if (pre) k_moe_down<T_Q4_0, true, true><<<grid, DN_THREADS, smem, st>>>(w2, jobs, count, gu, output);
+            else k_moe_down<T_Q4_0, false, true><<<grid, DN_THREADS, smem, st>>>(w2, jobs, count, gu, output);
         } else {
-            if (pre) k_moe_down<GGML_TYPE_Q4_0, true><<<grid, DN_THREADS, smem, st>>>(w4, jobs, count, gu, output);
-            else k_moe_down<GGML_TYPE_Q4_0, false><<<grid, DN_THREADS, smem, st>>>(w4, jobs, count, gu, output);
+            if (pre) k_moe_down<T_Q4_0, true><<<grid, DN_THREADS, smem, st>>>(w4, jobs, count, gu, output);
+            else k_moe_down<T_Q4_0, false><<<grid, DN_THREADS, smem, st>>>(w4, jobs, count, gu, output);
         }
         ck(cudaGetLastError(), "down launch");
     };
@@ -214,8 +214,8 @@ int run_big(int dev, int cols, int rows) {
     auto launch = [&](bool packed) {
         const int rpb = DN_THREADS / (cols / 32);
         const dim3 grid((rows + rpb - 1) / rpb, experts);
-        if (packed) k_moe_down_big<GGML_TYPE_Q4_0, true><<<grid, DN_THREADS, 0, st>>>(w2, jobs, count, gu, output);
-        else k_moe_down_big<GGML_TYPE_Q4_0><<<grid, DN_THREADS, 0, st>>>(w4, jobs, count, gu, output);
+        if (packed) k_moe_down_big<T_Q4_0, true><<<grid, DN_THREADS, 0, st>>>(w2, jobs, count, gu, output);
+        else k_moe_down_big<T_Q4_0><<<grid, DN_THREADS, 0, st>>>(w4, jobs, count, gu, output);
         ck(cudaGetLastError(), "big launch");
     };
     int checks = 0;

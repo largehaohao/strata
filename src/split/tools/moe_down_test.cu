@@ -9,13 +9,13 @@ void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
 }
 
-template <ggml_type TA>
+template <GgmlType TA>
 void run_type(int dev) {
     constexpr int experts = 48, rows = 2560, cols = 320, pairs = MAXT * TOPK;
-    constexpr size_t row_bytes = cols / ggml_cuda_type_traits<TA>::qk * ggml_cuda_type_traits<TA>::bs;
+    constexpr size_t row_bytes = cols / qtraits<TA>::qk * qtraits<TA>::bs;
     std::vector<unsigned char> weights(experts * rows * row_bytes);
     for (size_t i = 0; i < weights.size(); ++i) weights[i] = (i * 13 + i / 71) % 256;
-    for (size_t i = 0; i < weights.size(); i += ggml_cuda_type_traits<TA>::bs) {
+    for (size_t i = 0; i < weights.size(); i += qtraits<TA>::bs) {
         const uint16_t scale = 0x2400;
         std::memcpy(weights.data() + i, &scale, sizeof scale);
     }
@@ -96,8 +96,8 @@ int main() {
     if (count < 2) throw std::runtime_error("two physical devices required");
     for (int dev = 0; dev < 2; ++dev) {
         fnx::ck(cudaSetDevice(dev), "device");
-        fnx::run_type<GGML_TYPE_IQ4_NL>(dev);
-        fnx::run_type<GGML_TYPE_Q4_0>(dev);
+        fnx::run_type<fnx::T_IQ4_NL>(dev);
+        fnx::run_type<fnx::T_Q4_0>(dev);
     }
     std::cout << "MoE down prequant: 512 exact direct/graph comparisons passed\n";
 }

@@ -51,8 +51,8 @@ int run_mma(int dev, int cols, int rows) {
     auto launch = [&](bool packed) {
         const dim3 grid((rows + MM_BM - 1) / MM_BM, experts);
         constexpr size_t smem = mm_smem<MM_BM>();
-        if (packed) k_moe_mma<GGML_TYPE_Q2_0, MM_BM><<<grid, MM_THREADS, smem, st>>>(w2, jobs, count, gu, cols, output);
-        else k_moe_mma<GGML_TYPE_Q4_0, MM_BM><<<grid, MM_THREADS, smem, st>>>(w4, jobs, count, gu, cols, output);
+        if (packed) k_moe_mma<T_Q2_0, MM_BM><<<grid, MM_THREADS, smem, st>>>(w2, jobs, count, gu, cols, output);
+        else k_moe_mma<T_Q4_0, MM_BM><<<grid, MM_THREADS, smem, st>>>(w4, jobs, count, gu, cols, output);
         ck(cudaGetLastError(), "big launch");
     };
     int checks = 0;

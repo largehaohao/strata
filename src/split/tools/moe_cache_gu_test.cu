@@ -18,7 +18,7 @@ __global__ void gu_copy_reference(const char* const* host,const char* const* ep,
         for(size_t i=per*16+threadIdx.x;i<bytes;i+=blockDim.x) const_cast<char*>(ep[g-base])[i]=host[g][i];
     }
 }
-template <ggml_type TA,int T>
+template <GgmlType TA,int T>
 void launch(bool fused,const MoeW& w,const Job* jobs,const int* nj,const block_q8_1* x,float* out,CacheGateUpCopy cache,CacheDownCopy down,int maxjobs,cudaStream_t st) {
     const dim3 grid(((w.nrows+7)/8)*maxjobs+down.blocks);
     if(fused) moe_launch<TA>(false,w,jobs,nj,maxjobs,x,out,st,T,&down,&cache);
@@ -28,9 +28,9 @@ void launch(bool fused,const MoeW& w,const Job* jobs,const int* nj,const block_q
     }
 }
 
-template <ggml_type TA> int run(int dev,int rows,bool coherent) {
+template <GgmlType TA> int run(int dev,int rows,bool coherent) {
     constexpr int experts=48,cols=N,base=3*NEXP,guard=256;
-    constexpr size_t row_bytes=cols/ggml_cuda_type_traits<TA>::qk*ggml_cuda_type_traits<TA>::bs;
+    constexpr size_t row_bytes=cols/qtraits<TA>::qk*qtraits<TA>::bs;
     const size_t raw_bytes=rows*row_bytes,host_stride=(raw_bytes+15)/16*16,slot_stride=host_stride+guard;
     const size_t pool_bytes=experts*slot_stride+guard*2,output_bytes=(size_t)experts*MAXT*rows*4+guard;
     std::vector<void*> mem;auto alloc=[&](size_t n){void*p;ck(cudaMalloc(&p,n),"alloc");mem.push_back(p);return p;};
@@ -44,7 +44,7 @@ template <ggml_type TA> int run(int dev,int rows,bool coherent) {
     ck(cudaMemcpy(ep,hep.data(),hep.size()*sizeof(char*),cudaMemcpyHostToDevice),"expert pointers");
     ck(cudaMemcpy(ht,hht.data(),hht.size()*sizeof(char*),cudaMemcpyHostToDevice),"host pointers");
     MoeW w{nullptr,raw_bytes,row_bytes,rows,cols,ep};CacheGateUpCopy cache{ht,list,3};
-    const size_t dn_bytes=TA==GGML_TYPE_IQ3_XXS&&rows==640&&!coherent?460800:4112;
+    const size_t dn_bytes=TA==T_IQ3_XXS&&rows==640&&!coherent?460800:4112;
     const size_t dn_stride=dn_bytes+256,dn_pool_bytes=experts*dn_stride+guard*2;
     char* dn_host=nullptr;ck(hipHostMalloc((void**)&dn_host,experts*dn_bytes,coherent?hipHostMallocCoherent:hipHostMallocNonCoherent),"down host");
     auto* dn_pool=(char*)alloc(dn_pool_bytes);auto* dn_ht=(const char**)alloc((base+experts)*sizeof(char*));
@@ -69,7 +69,7 @@ template <ggml_type TA> int run(int dev,int rows,bool coherent) {
         for(int e=0;e<experts;++e){
             auto* at=(unsigned char*)host+e*host_stride;
             for(size_t i=0;i<raw_bytes;++i)at[i]=(i*13+(i>>7)*17+e*31+seed*11)&255;
-            for(size_t i=0;i<raw_bytes;i+=ggml_cuda_type_traits<TA>::bs){uint16_t d=0x2400+seed*17;std::memcpy(at+i,&d,2);}
+            for(size_t i=0;i<raw_bytes;i+=qtraits<TA>::bs){uint16_t d=0x2400+seed*17;std::memcpy(at+i,&d,2);}
             hj[e].w=(e*7+seed*11)%experts;hj[e].n=1+(e+seed)%T;
             for(int t=0;t<hj[e].n;++t){hj[e].y[t]=(t+seed)%T;hj[e].out[t]=e*MAXT+t;}
         }
@@ -108,4 +108,4 @@ template <ggml_type TA> int run(int dev,int rows,bool coherent) {
     cudaStreamDestroy(st);cudaFreeHost(host);cudaFreeHost(dn_host);for(void*p:mem)cudaFree(p);return checks;
 }
 } // namespace fnx
-int main(){try{setenv("FNX_IQ_REUSE","1",1);setenv("FNX_IQ2_XXS_REUSE","1",1);setenv("FNX_IQ_GROUP","16",1);int n=0;for(int dev=0;dev<2;++dev){fnx::ck(cudaSetDevice(dev),"device");for(bool coherent:{false,true})for(int rows:{640,641}){n+=fnx::run<GGML_TYPE_IQ2_XXS>(dev,rows,coherent);n+=fnx::run<GGML_TYPE_IQ2_S>(dev,rows,coherent);n+=fnx::run<GGML_TYPE_IQ3_XXS>(dev,rows,coherent);n+=fnx::run<GGML_TYPE_IQ3_S>(dev,rows,coherent);}}std::cout<<"PASS "<<n<<" exact fused GU/cache + down-copy checks\n";}catch(const std::exception&e){std::cerr<<e.what()<<'\n';return 1;}}
+int main(){try{setenv("FNX_IQ_REUSE","1",1);setenv("FNX_IQ2_XXS_REUSE","1",1);setenv("FNX_IQ_GROUP","16",1);int n=0;for(int dev=0;dev<2;++dev){fnx::ck(cudaSetDevice(dev),"device");for(bool coherent:{false,true})for(int rows:{640,641}){n+=fnx::run<fnx::T_IQ2_XXS>(dev,rows,coherent);n+=fnx::run<fnx::T_IQ2_S>(dev,rows,coherent);n+=fnx::run<fnx::T_IQ3_XXS>(dev,rows,coherent);n+=fnx::run<fnx::T_IQ3_S>(dev,rows,coherent);}}std::cout<<"PASS "<<n<<" exact fused GU/cache + down-copy checks\n";}catch(const std::exception&e){std::cerr<<e.what()<<'\n';return 1;}}

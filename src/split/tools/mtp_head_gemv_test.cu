@@ -34,7 +34,7 @@ int run(int dev, int rows, int cols, bool bench) {
         const char* weights=dw+(weight_copy++%3)*wb;
         const dim3 grid((rows+15)/16);
         switch(mode) {
-        case 0: k_mmvq<GGML_TYPE_Q4_0,8><<<grid,128,0,st>>>(weights,0,rb,rows,cols,dj,nullptr,1,dy,nb,out+pad,rows); break;
+        case 0: k_mmvq<T_Q4_0,8><<<grid,128,0,st>>>(weights,0,rb,rows,cols,dj,nullptr,1,dy,nb,out+pad,rows); break;
         case 1: k_draft_head_prune<2,2><<<grid,128,0,st>>>(weights,rb,rows,cols,dy,out+pad); break;
         case 2: k_draft_head_prune<4,2><<<grid,128,0,st>>>(weights,rb,rows,cols,dy,out+pad); break;
         case 3: k_draft_head_prune<4,1><<<grid,128,0,st>>>(weights,rb,rows,cols,dy,out+pad); break;

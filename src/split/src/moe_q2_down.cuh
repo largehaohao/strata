@@ -24,9 +24,9 @@ __device__ __forceinline__ Q2Half q2_load_half(const char* row, int half_block) 
 __device__ __forceinline__ float q2_half_dot(const Q2Half& decoded, const block_q8_1* y) {
     float sum = 0.f;
 #pragma unroll
-    for (int part = 0; part < QI4_0 / VDR_Q4_0_Q8_1_MMVQ; ++part) {
-        int u[2 * VDR_Q4_0_Q8_1_MMVQ];
-        constexpr int width = VDR_Q4_0_Q8_1_MMVQ;
+    for (int part = 0; part < QI4_0 / VDR_Q4_0; ++part) {
+        int u[2 * VDR_Q4_0];
+        constexpr int width = VDR_Q4_0;
 #pragma unroll
         for (int i = 0; i < width; ++i) {
             u[2 * i] = get_int_b4(y->qs, part * width + i);

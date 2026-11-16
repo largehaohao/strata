@@ -17,26 +17,8 @@
 #include <string>
 #include <vector>
 
-#if FNX_HIP
-#undef __vsubss4
-#undef __vsub4
-#undef __vcmpne4
-#undef __shfl_sync
-#undef __shfl_up_sync
-#undef __shfl_xor_sync
-#endif
-#include "common.cuh"
-#if FNX_HIP
-#undef __shfl_sync
-#undef __shfl_up_sync
-#undef __shfl_xor_sync
-#define __shfl_xor_sync(...) (::strata::hip_compat::shfl_xor_sync(__VA_ARGS__))
-#define __shfl_up_sync(...) (::strata::hip_compat::shfl_up_sync(__VA_ARGS__))
-#define __shfl_sync(...) (::strata::hip_compat::shfl_sync(__VA_ARGS__))
-#undef cudaFuncSetAttribute
-#endif
-#include "ggml.h"
 #include "gguf.hpp"
+#include "qdot.cuh"   // block layouts and codebook tables
 
 namespace fnx {
 namespace {
@@ -119,18 +101,18 @@ int main(int argc, char** argv) {
                 cudaMemcpy(d_we, we, row_a * nrows, cudaMemcpyHostToDevice);
                 cudaMemset(d_out, 0xFF, (size_t) nrows * ncols * 2);
                 switch (t.type) {
-                    case T_Q4_0: run<GGML_TYPE_Q4_0>(d_we, row_a, nrows, ncols, d_out); break;
-                    case T_IQ4_NL: run<GGML_TYPE_IQ4_NL>(d_we, row_a, nrows, ncols, d_out); break;
-                    case T_IQ4_XS: run<GGML_TYPE_IQ4_XS>(d_we, row_a, nrows, ncols, d_out); break;
-                    case T_IQ3_S: run<GGML_TYPE_IQ3_S>(d_we, row_a, nrows, ncols, d_out); break;
-                    case T_IQ3_XXS: run<GGML_TYPE_IQ3_XXS>(d_we, row_a, nrows, ncols, d_out); break;
-                    case T_IQ2_S: run<GGML_TYPE_IQ2_S>(d_we, row_a, nrows, ncols, d_out); break;
-                    case T_IQ2_XXS: run<GGML_TYPE_IQ2_XXS>(d_we, row_a, nrows, ncols, d_out); break;
-                    case T_Q4_K: run<GGML_TYPE_Q4_K>(d_we, row_a, nrows, ncols, d_out); break;
-                    case T_Q5_K: run<GGML_TYPE_Q5_K>(d_we, row_a, nrows, ncols, d_out); break;
-                    case T_Q5_1: run<GGML_TYPE_Q5_1>(d_we, row_a, nrows, ncols, d_out); break;
-                    case T_Q5_0: run<GGML_TYPE_Q5_0>(d_we, row_a, nrows, ncols, d_out); break;
-                    case T_Q8_0: run<GGML_TYPE_Q8_0>(d_we, row_a, nrows, ncols, d_out); break;
+                    case fnx::T_Q4_0: run<fnx::T_Q4_0>(d_we, row_a, nrows, ncols, d_out); break;
+                    case fnx::T_IQ4_NL: run<fnx::T_IQ4_NL>(d_we, row_a, nrows, ncols, d_out); break;
+                    case fnx::T_IQ4_XS: run<fnx::T_IQ4_XS>(d_we, row_a, nrows, ncols, d_out); break;
+                    case fnx::T_IQ3_S: run<fnx::T_IQ3_S>(d_we, row_a, nrows, ncols, d_out); break;
+                    case fnx::T_IQ3_XXS: run<fnx::T_IQ3_XXS>(d_we, row_a, nrows, ncols, d_out); break;
+                    case fnx::T_IQ2_S: run<fnx::T_IQ2_S>(d_we, row_a, nrows, ncols, d_out); break;
+                    case fnx::T_IQ2_XXS: run<fnx::T_IQ2_XXS>(d_we, row_a, nrows, ncols, d_out); break;
+                    case fnx::T_Q4_K: run<fnx::T_Q4_K>(d_we, row_a, nrows, ncols, d_out); break;
+                    case fnx::T_Q5_K: run<fnx::T_Q5_K>(d_we, row_a, nrows, ncols, d_out); break;
+                    case fnx::T_Q5_1: run<fnx::T_Q5_1>(d_we, row_a, nrows, ncols, d_out); break;
+                    case fnx::T_Q5_0: run<fnx::T_Q5_0>(d_we, row_a, nrows, ncols, d_out); break;
+                    case fnx::T_Q8_0: run<fnx::T_Q8_0>(d_we, row_a, nrows, ncols, d_out); break;
                     default: std::printf("skip %s type %u\n", t.name.c_str(), t.type); cudaFree(d_we); cudaFree(d_out); continue;
                 }
                 if (cudaDeviceSynchronize() != cudaSuccess) throw std::runtime_error(std::string("kernel: ") + cudaGetErrorString(cudaGetLastError()));

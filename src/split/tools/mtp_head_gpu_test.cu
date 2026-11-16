@@ -52,7 +52,7 @@ int run(int rows, int cols) {
             }
             ck(cudaMemcpyAsync(x,input.data(),input.size()*sizeof(block_q8_1),cudaMemcpyHostToDevice,st),"inputs");
             ck(cudaMemsetAsync(ref,0xA5,count*4,st),"ref guard");
-            k_mmvq<GGML_TYPE_Q4_0,32><<<(rows+3)/4,128,0,st>>>((const char*)w,0,nb*18,rows,cols,jobs,nullptr,1,x,nb,ref+pad,stride);
+            k_mmvq<T_Q4_0,32><<<(rows+3)/4,128,0,st>>>((const char*)w,0,nb*18,rows,cols,jobs,nullptr,1,x,nb,ref+pad,stride);
             for(bool replay:{false,true}){
                 ck(cudaMemsetAsync(out,0xA5,count*4,st),"out guard");if(replay)ck(cudaGraphLaunch(exec,st),"replay");else launch();
                 ck(cudaStreamSynchronize(st),"wait");

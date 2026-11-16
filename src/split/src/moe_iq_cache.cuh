@@ -2,7 +2,7 @@
 // compute immediately while cold jobs read RAM. Kernel completion publishes all
 // copied gate/up and down bytes for subsequent layers/windows. Keep the IQ dot
 // and reduction order identical to k_moe_gu_iq; moe_cache_gu_test checks both.
-template <ggml_type TA, int TT, int G = 32, bool COPY = false, bool PACKED_SIGNS = false>
+template <GgmlType TA, int TT, int G = 32, bool COPY = false, bool PACKED_SIGNS = false>
 __global__ void __launch_bounds__(MMVQ_THREADS) k_moe_gu_iq_cache(
     MoeW w, const Job* __restrict__ jobs, const int* __restrict__ njobs,
     const block_q8_1* __restrict__ y, float* __restrict__ out, CacheDownCopy copy = {}, CacheGateUpCopy cache = {}) {
@@ -38,7 +38,7 @@ __global__ void __launch_bounds__(MMVQ_THREADS) k_moe_gu_iq_cache(
     }
     __syncthreads();
     constexpr int group_rows = MMVQ_THREADS / G;
-    constexpr size_t packed_row = N / ggml_cuda_type_traits<TA>::qk * ggml_cuda_type_traits<TA>::bs;
+    constexpr size_t packed_row = N / qtraits<TA>::qk * qtraits<TA>::bs;
     static_assert(G == 16 && group_rows * packed_row % 16 == 0, "aligned raw row groups");
     __shared__ __align__(16) unsigned char staged[group_rows * packed_row];
     if (missing) {
@@ -66,9 +66,9 @@ __global__ void __launch_bounds__(MMVQ_THREADS) k_moe_gu_iq_cache(
     // Join them before the remaining shuffles to preserve the reduction order.
     constexpr int PARTS = 32 / G;
     float tmp[PARTS][TT] = {};
-    if constexpr (TA == GGML_TYPE_IQ2_XXS || TA == GGML_TYPE_IQ2_S || TA == GGML_TYPE_IQ3_XXS || TA == GGML_TYPE_IQ3_S) {
-        constexpr int qk = ggml_cuda_type_traits<TA>::qk, vdr = vdr_of<TA>();
-        constexpr int per_block = ggml_cuda_type_traits<TA>::qi / vdr;
+    if constexpr (TA == T_IQ2_XXS || TA == T_IQ2_S || TA == T_IQ3_XXS || TA == T_IQ3_S) {
+        constexpr int qk = qtraits<TA>::qk, vdr = vdr_of<TA>();
+        constexpr int per_block = qtraits<TA>::qi / vdr;
         static_assert(G >= per_block && G % per_block == 0, "lanes per weight block");
         const int gl = threadIdx.x % G, kqs = vdr * (gl % per_block);
         if (live)

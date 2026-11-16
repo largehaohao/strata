@@ -11,12 +11,12 @@ void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
 }
 
-template <ggml_type TA>
+template <GgmlType TA>
 void launch_test(int T, int cap, const MoeW& w, const Job* jobs, const int* njobs,
                  const block_q8_1* x, float* out, cudaStream_t stream, const CacheDownCopy* copy = nullptr) {
     const dim3 grid((w.nrows + 3) / 4, 48);
     if (cap >= 2) {
-        if constexpr (TA == GGML_TYPE_IQ2_XXS || TA == GGML_TYPE_IQ2_S || TA == GGML_TYPE_IQ3_XXS || TA == GGML_TYPE_IQ3_S) {
+        if constexpr (TA == T_IQ2_XXS || TA == T_IQ2_S || TA == T_IQ3_XXS || TA == T_IQ3_S) {
             const dim3 grid16((w.nrows + 7) / 8, 48);
             const dim3 fused_grid(grid16.x * grid16.y + (copy ? copy->blocks : 0));
 #define GU16_CASE(t) case t: \
@@ -105,14 +105,14 @@ struct DownCopyTest {
     }
 };
 
-template <ggml_type TA>
+template <GgmlType TA>
 void run_type(int dev) {
     constexpr int experts = 48, cols = 2560, rows = 641;
-    constexpr size_t row_bytes = cols / ggml_cuda_type_traits<TA>::qk * ggml_cuda_type_traits<TA>::bs;
+    constexpr size_t row_bytes = cols / qtraits<TA>::qk * qtraits<TA>::bs;
     const size_t weight_bytes = experts * rows * row_bytes;
     std::vector<unsigned char> weights(weight_bytes);
     for (size_t i = 0; i < weight_bytes; ++i) weights[i] = (i * 13 + (i >> 7) * 17) & 255;
-    for (size_t i = 0; i < weight_bytes; i += ggml_cuda_type_traits<TA>::bs) {
+    for (size_t i = 0; i < weight_bytes; i += qtraits<TA>::bs) {
         const uint16_t scale = 0x2400; // finite half: all four formats put d first
         std::memcpy(weights.data() + i, &scale, sizeof scale);
     }
@@ -142,7 +142,7 @@ void run_type(int dev) {
     std::vector<unsigned char> ref(output_bytes), got(output_bytes);
     for (int T = 1; T <= MAXT; ++T) {
         for (int cap : {1, 2, 3, 4}) {
-            if (cap >= 3 && TA != GGML_TYPE_IQ2_XXS && TA != GGML_TYPE_IQ2_S && TA != GGML_TYPE_IQ3_XXS && TA != GGML_TYPE_IQ3_S) continue;
+            if (cap >= 3 && TA != T_IQ2_XXS && TA != T_IQ2_S && TA != T_IQ3_XXS && TA != T_IQ3_S) continue;
             std::unique_ptr<DownCopyTest> dc;
             if (cap >= 3) dc = std::make_unique<DownCopyTest>(T, cap == 3);
             const CacheDownCopy* copy = dc ? &dc->view : nullptr;
@@ -218,11 +218,11 @@ int main() {
     if (count < 2) throw std::runtime_error("two physical devices required");
     for (int dev = 0; dev < 2; ++dev) {
         fnx::ck(cudaSetDevice(dev), "device");
-        fnx::run_type<GGML_TYPE_IQ2_XXS>(dev);
-        fnx::run_type<GGML_TYPE_IQ2_S>(dev);
-        fnx::run_type<GGML_TYPE_IQ3_XXS>(dev);
-        fnx::run_type<GGML_TYPE_IQ3_S>(dev);
-        fnx::run_type<GGML_TYPE_IQ4_XS>(dev);
+        fnx::run_type<fnx::T_IQ2_XXS>(dev);
+        fnx::run_type<fnx::T_IQ2_S>(dev);
+        fnx::run_type<fnx::T_IQ3_XXS>(dev);
+        fnx::run_type<fnx::T_IQ3_S>(dev);
+        fnx::run_type<fnx::T_IQ4_XS>(dev);
     }
     std::cout << "MoE gate/up: 4608 exact direct/graph checks passed (2048 with down copies and guards)\n";
 }
