@@ -107,6 +107,7 @@ struct ExpertCache {
     const char* const* host_dn = nullptr;
     int* slot_of = nullptr;              // [NL * NEXP]: its slot, -1 in host memory, -2 fixed VRAM (decode-only cache)
     int* owner = nullptr;                // [n_slots]: the expert in it (layer * NEXP + expert)
+    unsigned* miss_bits = nullptr;       // current layer, one bit per expert for fused GU
     unsigned char* ref = nullptr;        // [n_slots]: used since the hand passed (2: by the layer being planned, 3: lent)
     unsigned char* age = nullptr;        // optional CLOCK hit credit; null preserves the original policy
     int max_age = 1;                     // saturating hit credit, only used when age is allocated

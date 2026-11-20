@@ -12,6 +12,8 @@
 namespace fnx {
 
 void own(std::function<void()> release);
+size_t owned_mark();
+void release_owned_from(size_t mark);
 // the releases, for ~Engine to run once no other thread can register (the cards are idle)
 std::vector<std::function<void()>> take_owned();
 // the current card, for a release that has to run on it; and the releases of what is made most often

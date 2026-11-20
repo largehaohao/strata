@@ -4699,9 +4699,11 @@ class ReasoningCloseRetry(unittest.TestCase):
         self.svc.repeat_stop_tokens = 8
         self.svc.reasoning_close_retry = True
         with mock.patch.object(self.engine, "generate", wraps=self.engine.generate) as generate:
-            c = self.chat(temperature=0, top_k=1, top_p=0.1)
+            c = self.chat(temperature=0, top_k=1, top_p=0.1, min_p=0.99)
         first, retry = [call.args[2] for call in generate.call_args_list]
         self.assertEqual((first["temperature"], first["top_k"], first["top_p"]), (0, 1, 0.1))
+        self.assertEqual(first["min_p"], 0.99)
+        self.assertLessEqual(retry["min_p"], 0.05)
         self.assertGreater(retry["temperature"], 0)
         self.assertGreater(retry["top_k"], 1)
         self.assertGreater(retry["presence_penalty"], 0)

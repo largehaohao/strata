@@ -80,6 +80,20 @@ int main() {
                 previous=r;++checks;
             }
         }
+        for (int budget : {0, 1, 8, 32, 64}) {
+            fnx::LookupIndex index;
+            std::vector<int> history;
+            for (int i = 0; i < 4096; ++i) {
+                history.push_back(i % 37 == 0 ? image_token : (int)(rng() % 6));
+                if (i % 3) continue;   // grow by more than one token between lookups
+                for (int d1 : {-1, 3}) {
+                    const auto expected = fnx::lookup_drafts(history, 15, d1, budget, image_token);
+                    require(fnx::lookup_drafts(history, 15, d1, budget, image_token, &index) == expected,
+                            "indexed proposal differs after growth or resize");
+                    ++checks;
+                }
+            }
+        }
         for (int bad:{-1,65}) {
             bool threw=false;
             try {(void)fnx::lookup_drafts(mismatch,15,4,bad,image_token);}

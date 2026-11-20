@@ -30,8 +30,8 @@ PROMPTS = (
 )
 
 
-def long_prompt(words: int) -> str:
-    rng = random.Random(7)
+def long_prompt(words: int, seed: int = 7) -> str:
+    rng = random.Random(seed)
     vocab = ("river stone market lantern copper winter garden signal harbor needle orbit velvet canyon ember "
              "ledger quartz meadow anchor violet thunder").split()
     body = " ".join(rng.choice(vocab) for _ in range(words))

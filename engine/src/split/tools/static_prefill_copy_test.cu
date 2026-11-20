@@ -48,7 +48,7 @@ int main() {
                 for (auto p : {&sg, &sd, &dg, &dd}) ck(cudaMalloc(p, E * sizeof(char*)), "table");
                 ck(cudaMalloc(&counts, E * sizeof(int)), "counts");
                 ck(cudaMalloc(&ready, E), "ready");
-                ck(cudaMalloc(&moved, sizeof(*moved)), "moved");
+                ck(cudaMalloc(&moved, 2 * sizeof(*moved)), "moved");
                 for (auto pair : {std::make_pair(sg, srcg.data()), std::make_pair(sd, srcd.data()),
                                   std::make_pair(dg, dstg.data()), std::make_pair(dd, dstd.data())})
                     ck(cudaMemcpy(pair.first, pair.second, E * sizeof(char*), cudaMemcpyHostToDevice), "table upload");
@@ -111,6 +111,63 @@ int main() {
                         ++checks;
                     }
                 }
+                // Rebuild the consumer table after a slot is lent or repopulated between passes.
+                const char **active_gu, **active_dn;
+                int* current_slots;
+                ck(cudaMalloc(&active_gu, E * sizeof(char*)), "active GU");
+                ck(cudaMalloc(&active_dn, E * sizeof(char*)), "active down");
+                ck(cudaMalloc(&current_slots, E * sizeof(int)), "slot map");
+                for (int pass = 0; pass < 2; ++pass) {
+                    std::vector<int> slots(E);
+                    for (int e = 0; e < E; ++e) slots[e] = (e + pass) % 4 - 2;
+                    ck(cudaMemcpy(current_slots, slots.data(), E * sizeof(int), cudaMemcpyHostToDevice), "current slots");
+                    fnx::k_static_prefill_tables<<<(E + 255) / 256, 256, 0, stream>>>(current_slots, sg, sd, dg, dd,
+                        active_gu, active_dn, E);
+                    ck(cudaStreamSynchronize(stream), "resolve active tables");
+                    std::vector<const char*> gu(E), dn(E);
+                    ck(cudaMemcpy(gu.data(), active_gu, E * sizeof(char*), cudaMemcpyDeviceToHost), "active GU result");
+                    ck(cudaMemcpy(dn.data(), active_dn, E * sizeof(char*), cudaMemcpyDeviceToHost), "active down result");
+                    std::vector<char> expected(bytes + 2 * guard, char(0x5a)), actual(expected.size());
+                    unsigned long long copied_bytes = 0, direct_bytes = 0;
+                    for (int e = 0; e < E; ++e) {
+                        check(gu[e] == (slots[e] >= 0 ? srcg[e] : dstg[e]));
+                        check(dn[e] == (slots[e] >= 0 ? srcd[e] : dstd[e]));
+                        if (slots[e] >= 0) {
+                            direct_bytes += gs + ds;
+                        } else if (srcg[e] != dstg[e]) {
+                            std::memcpy(expected.data() + guard + e * gs, source + e * gs, gs);
+                            std::memcpy(expected.data() + guard + E * gs + e * ds, source + E * gs + e * ds, ds);
+                            copied_bytes += gs + ds;
+                        }
+                    }
+                    ck(cudaMemsetAsync(stage, 0x5a, expected.size(), stream), "clear stage");
+                    ck(cudaMemsetAsync(counts, 1, E * sizeof(int), stream), "route every expert");
+                    ck(cudaMemsetAsync(ready, 0, E, stream), "reset readiness");
+                    ck(cudaMemsetAsync(moved, 0, 2 * sizeof(*moved), stream), "reset counters");
+                    for (int chunk = 0; chunk < 2; ++chunk)
+                        fnx::static_prefill_copy(sg, sd, active_gu, active_dn, counts, ready, gs, ds, E, moved,
+                                                 stream, 1, current_slots);
+                    ck(cudaStreamSynchronize(stream), "direct reads and staged copies");
+                    unsigned long long counters[2];
+                    ck(cudaMemcpy(counters, moved, sizeof(counters), cudaMemcpyDeviceToHost), "pass counters");
+                    ck(cudaMemcpy(actual.data(), stage, actual.size(), cudaMemcpyDeviceToHost), "stage and guards");
+                    check(actual == expected && counters[0] == copied_bytes && counters[1] == direct_bytes);
+                    ++checks;
+                }
+                // A cache hit outside the stage must never copy its bytes back into the immutable model.
+                const std::vector<char> original(source, source + bytes);
+                ck(cudaMemsetAsync(ready, 0, E, stream), "reset overflow readiness");
+                ck(cudaMemsetAsync(moved, 0, 2 * sizeof(*moved), stream), "reset overflow counter");
+                fnx::static_prefill_copy(dg, dd, sg, sd, counts, ready, gs, ds, E, moved, stream, 1,
+                                         nullptr, sg, sd);
+                ck(cudaStreamSynchronize(stream), "overflow guard");
+                unsigned long long overflow_bytes;
+                ck(cudaMemcpy(&overflow_bytes, moved, sizeof(overflow_bytes), cudaMemcpyDeviceToHost), "overflow bytes");
+                check(overflow_bytes == 0 && std::equal(original.begin(), original.end(), source));
+                ++checks;
+                ck(cudaFree(current_slots), "free slot map");
+                ck(cudaFree(active_gu), "free active GU");
+                ck(cudaFree(active_dn), "free active down");
                 for (auto p : {sg, sd, dg, dd}) ck(cudaFree(p), "free table");
                 ck(cudaFree(counts), "free counts"); ck(cudaFree(ready), "free ready"); ck(cudaFree(moved), "free counter");
                 ck(cudaFree(stage), "free stage"); ck(cudaFreeHost(source), "free source");

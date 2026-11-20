@@ -19,6 +19,7 @@ constexpr size_t ROOT_MIN = 1024;   // a first message (system prompt and tools)
 // ... when it is a system or developer message (the role token after <|im_start|>): what other conversations share. A
 // first user message stays with its conversation (copying it on its own cost 2 s of a 114k read)
 constexpr int ROLE_SYSTEM = 8678, ROLE_DEVELOPER = 33259;
+constexpr int ROLE_USER = 846, ROLE_TOOL = 13766;
 // a parked first message carries checkpoints this far apart inside it: a prompt whose first message changes near its
 // end (pi's system prompt ends with the AGENTS.md files) starts from the last one before the change
 constexpr size_t ROOT_STEP = 4096;
@@ -159,6 +160,12 @@ void Session::read(const std::vector<int>& prompt, GenStats& st, const std::func
     const int n = (int) prompt.size();
     const size_t body = (size_t) n - 1;   // the tokens the engine is to hold before generate()
     const bool caching = cache_->budget > 0 && hints.cache;
+    // Opt-in cache experiments. Zero keeps the released parking and checkpoint schedule.
+    const long long rewind_keep = env_int("FNX_REWIND_KEEP", 0);
+    const long long checkpoint_every = env_int("FNX_PROMPT_CHECKPOINT_EVERY", 0);
+    if (rewind_keep < 0) throw std::runtime_error("FNX_REWIND_KEEP: must be >= 0");
+    if (checkpoint_every < 0 || (checkpoint_every > 0 && checkpoint_every < 1024))
+        throw std::runtime_error("FNX_PROMPT_CHECKPOINT_EVERY: must be 0 or >= 1024");
     // how much of a conversation the prompt can start from: all of it when the prompt extends it, else its longest
     // checkpoint inside the shared prefix (ck: that checkpoint, -1 for all)
     auto usable = [&](const std::vector<int>& toks, const std::vector<State>& ckpts, int& ck) -> size_t {
@@ -209,7 +216,16 @@ void Session::read(const std::vector<int>& prompt, GenStats& st, const std::func
         std::fprintf(stderr, "conversation cache: restored %zu tokens in %.0f ms, parked=%zu bytes=%zu\n", from_parked, ms_since(t_load),
                      cache_->parked.size(), bytes_held());
     } else if (from_live < hist.size()) {
-        if (from_live * 2 < hist.size() || hist.size() - from_live >= DROP_PARK_MIN) park_live();
+        const size_t dropped = hist.size() - from_live;
+        const bool would_park = from_live * 2 < hist.size() || dropped >= DROP_PARK_MIN;
+        // Keep the K/V already on the lane for a short rewind of the same conversation. A usable checkpoint and
+        // at least half the old prefix must remain; switching conversations and resetting still park as before.
+        const bool keep_rewind = rewind_keep > 0 && ck_live >= 0 && from_live > 0 &&
+                                 from_live * 2 >= hist.size() && dropped <= (size_t) rewind_keep;
+        if (would_park && !keep_rewind) park_live();
+        else if (caching && would_park && keep_rewind)
+            std::fprintf(stderr, "conversation cache: skipped rewind park, kept=%zu dropped=%zu threshold=%lld (checkpoint, at least half retained)\n",
+                         from_live, dropped, rewind_keep);
         if (ck_live >= 0) {
             e_.load_state(*live_.ckpts[(size_t) ck_live]);
         } else {
@@ -248,13 +264,55 @@ void Session::read(const std::vector<int>& prompt, GenStats& st, const std::func
             }
     std::sort(cps.begin(), cps.end());
     cps.erase(std::unique(cps.begin(), cps.end()), cps.end());
+    // Snapshots must not split a GEMM or a prefill pass: changing the shape can change greedy output.
+    // Record eligible message ranges and take at most one snapshot per interval, at a committed pass end.
+    std::vector<std::pair<size_t, size_t>> messages;
+    if (caching && checkpoint_every && hints.images.empty()) {
+        for (size_t start = 0; start + 1 < body;) {
+            if (prompt[start] != turn_) { ++start; continue; }
+            size_t end = start + 1;
+            while (end < body && prompt[end] != turn_) ++end;
+            if (end > at && (prompt[start + 1] == ROLE_USER || prompt[start + 1] == ROLE_TOOL))
+                messages.emplace_back(start + 1, end);
+            start = end;
+        }
+        if (messages.empty() && std::find(prompt.begin(), prompt.begin() + body, turn_) == prompt.begin() + body)
+            messages.emplace_back(0, body);  // raw completion with no chat template
+    }
+    const size_t required_count = cps.size();
     cps.push_back(body);
-    size_t pos = at;
-    for (size_t end : cps) {
+    size_t pos = at, message = 0, last_checkpoint = at, periodic_added = 0;
+    for (size_t ci = 0; ci < cps.size(); ++ci) {
+        const size_t end = cps[ci];
         if (end > pos) {
             std::vector<int> seg(prompt.begin() + pos, prompt.begin() + end);
             e_.on_prefill_chunk = [&, pos](int done) {
-                if (progress) progress((int) pos + done, n);
+                const size_t row = pos + done;
+                // Callbacks also report intermediate chunks after a whole pass has finished. Only the
+                // final callback's row identifies the actual device state. Required endpoints are saved below.
+                if (row < end && message < messages.size() && row == (size_t)e_.pos()) {
+                    while (message < messages.size() && row >= messages[message].second) ++message;
+                    if (message < messages.size() && row > messages[message].first &&
+                        row / checkpoint_every > std::max(last_checkpoint, messages[message].first) / checkpoint_every) {
+                        const size_t required = required_count - ci;
+                        const size_t quote = live_.ckpts.empty() ? e_.checkpoint_bytes() : live_.ckpts.back()->total();
+                        // The oldest live checkpoints can rotate. A parked root keeps its own references.
+                        const size_t drop = live_.ckpts.size() + required + 1 > MAX_CKPTS
+                            ? live_.ckpts.size() + required + 1 - MAX_CKPTS : 0;
+                        size_t held = bytes_held();
+                        if (drop <= live_.ckpts.size()) {
+                            for (size_t i = 0; i < drop; ++i) held -= live_.ckpts[i]->total();
+                        }
+                        if (drop <= live_.ckpts.size() && held <= cache_->budget && quote &&
+                            quote <= (cache_->budget - held) / (required + 1)) {
+                            live_.ckpts.erase(live_.ckpts.begin(), live_.ckpts.begin() + drop);
+                            checkpoint(live_);
+                            last_checkpoint = row;
+                            ++periodic_added;
+                        }
+                    }
+                }
+                if (progress) progress((int)row, n);
             };
             try {   // progress may end the read at a chunk boundary (by throwing): the engine holds what was read
                 e_.prefill(seg, prompt[end]);
@@ -283,9 +341,12 @@ void Session::read(const std::vector<int>& prompt, GenStats& st, const std::func
             }
         }
         checkpoint(live_);
+        last_checkpoint = end;
     }
     live_.len = body;
     evict(0);
+    if (periodic_added)
+        std::fprintf(stderr, "conversation cache: saved %zu periodic checkpoints at completed prefill passes\n", periodic_added);
     prompt_ = prompt;
     st.prompt_ms = ms_since(t0);
 }
@@ -370,19 +431,18 @@ CacheStats Session::cache_stats() const {
     return s;
 }
 
-// lookup_drafts with this session's LK, after the draft layer's d1
-std::vector<int> Session::lookup(const std::vector<int>& ctx, int d1) const { return lookup_drafts(ctx, LK_, d1); }
-
-// A window's cost grows with its rows (Q4: 8 rows ~20 ms, 16 ~34): in a run being copied (a code edit) the match is long
-// and the drafts are kept, a short match (new code) is mostly a coincidence
-std::vector<int> lookup_drafts(const std::vector<int>& ctx, int lk, int d1) {
-    if (lk == 0 || ctx.size() <= 3) return {};
+static int lookup_search() {
     static const int search = [] {
         const auto n = env_int("FNX_LOOKUP_SEARCH", 0);
         if (n < 0 || n > 64) throw std::runtime_error("FNX_LOOKUP_SEARCH: expected0..64");
         return (int)n;
     }();
-    return lookup_drafts(ctx, lk, d1, search, Engine::IMAGE_TOK);
+    return search;
+}
+
+std::vector<int> lookup_drafts(const std::vector<int>& ctx, int lk, int d1) {
+    if (!lk || ctx.size() <= 3) return {};
+    return lookup_drafts(ctx, lk, d1, lookup_search(), Engine::IMAGE_TOK);
 }
 
 Finish Session::generate(int max_new, const Sampling& s, const std::function<void(int)>& emit, const std::atomic<bool>* stop,
@@ -391,6 +451,7 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
     e_.use_lane(lane_);
     if (max_new < 1) throw std::runtime_error("session: max_new must be at least 1");
     const bool sample = s.temperature > 0.f;
+    const bool fused_sample = sample && env_flag("FNX_VERIFY_SAMPLE") && !std::getenv("FNX_DUMP_FIRST_LOGITS");
     int produced = 0;   // this call's tokens (st may carry an earlier call's)
     check_sampling(s);
     const bool penalize = penalizes(s);
@@ -431,6 +492,12 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
     const auto t0 = std::chrono::steady_clock::now();
     timing_ = &st;
     std::vector<int> ctx(prompt_);   // every token so far, the next window's first row last
+    LookupIndex index;
+    const bool indexed = env_flag("FNX_LOOKUP_INDEX");
+    auto lookup = [&](int first) {
+        if (!LK_ || ctx.size() <= 3) return std::vector<int>{};
+        return lookup_drafts(ctx, LK_, first, lookup_search(), Engine::IMAGE_TOK, indexed ? &index : nullptr);
+    };
     int x = prompt_.back();
     std::vector<int> drafts;
     std::vector<Dist> qs;   // per draft, the distribution it was drawn from; empty: a fixed draft (lookup, argmax)
@@ -468,7 +535,22 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
         rows.insert(rows.end(), drafts.begin(), drafts.end());
         const int p = e_.pos();
         const auto tv = std::chrono::steady_clock::now();
-        std::vector<int> o = e_.verify(rows);
+        Engine::Penalties pen;
+        if (penalize) {
+            std::vector<int> seq(ctx.size() > (size_t) s.pen_last_n ? ctx.end() - s.pen_last_n : ctx.begin(), ctx.end());
+            for (int j = 0; j < (int)rows.size(); ++j) {
+                if (j > 0) seq.push_back(rows[j]);
+                pen.rows.push_back(penalty_row(seq, s));
+            }
+        }
+        Engine::Candidates cand;
+        std::vector<int> o;
+        if (fused_sample) {
+            cand = e_.verify_sampled(rows, pen);
+            o.resize(rows.size());
+        } else {
+            o = e_.verify(rows);
+        }
         if (produced == 0) {   // FNX_DUMP_FIRST_LOGITS=PATH (diagnostics): the full-vocabulary logits of each request's first token to PATH.<n> (float32)
             static const char* dump = std::getenv("FNX_DUMP_FIRST_LOGITS");
             static int dump_n = 0;
@@ -491,15 +573,7 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
             // probability min(1, p_j / q_j); else row j's token is drawn from max(0, p_j - q_j) normalized, and the window
             // ends there. All standing: one more from the last row
             const int T = (int) rows.size();
-            Engine::Penalties pen;
-            if (penalize) {
-                std::vector<int> seq(ctx.size() > (size_t) s.pen_last_n ? ctx.end() - s.pen_last_n : ctx.begin(), ctx.end());
-                for (int j = 0; j < T; ++j) {
-                    if (j > 0) seq.push_back(rows[j]);
-                    pen.rows.push_back(penalty_row(seq, s));
-                }
-            }
-            const auto cand = e_.top_tokens(T, pen);
+            if (!fused_sample) cand = e_.top_tokens(T, pen);
             for (n = 0; n < T; ++n) {
                 Dist d = make_dist(cand[n], s);
                 if (n + 1 < T) {
@@ -572,7 +646,7 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
             e_.df2_draft(rq);
             st.draft_ms += e_.last_df2_ms, ++st.draft_calls;
             const int d1 = rq[0].tokens[0];
-            drafts = lookup(ctx, d1);   // a lookup that begins with the drafter's first draft goes on from there, as it does behind the draft layer's
+            drafts = lookup(d1);   // a lookup that begins with the drafter's first draft goes on from there, as it does behind the draft layer's
             if (!drafts.empty()) {
                 ++st.lookup_rounds;
                 qs.assign(drafts.size(), Dist{});
@@ -592,13 +666,27 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
             qs.assign(drafts.size(), Dist{});
             continue;
         }
+        // Opt-in, greedy only: arbitrary fixed context copies are checked by the main model's argmax above.
+        // Sampling keeps the original d1 proposal and its q; penalties and DFlash2 also keep their existing path.
+        static const bool lookup_first = env_flag("FNX_LOOKUP_BEFORE_DRAFT");
+        if (lookup_first && speculate && !sample && !penalize) {
+            drafts = lookup(-1);
+            if (!drafts.empty()) {
+                // Skipping the whole draft layer would leave holes in its K/V when a later lookup misses.
+                e_.draft_catch_up(used, 0, std::vector<int>(o.begin(), o.begin() + used), p);
+                st.draft_ms += e_.last_draft_ms, st.draft_gpu_ms += e_.last_draft_gpu_ms, ++st.draft_calls;
+                qs.assign(drafts.size(), Dist{});
+                ++st.lookup_rounds;
+                continue;
+            }
+        }
         Dist q1;
         const int d1 = draft_one(used, true, 0, std::vector<int>(o.begin(), o.begin() + used), p, pen_seq, q1);
         if (!speculate) {
             drafts.clear(), qs.clear();
             continue;
         }
-        drafts = lookup(ctx, d1);
+        drafts = lookup(d1);
         qs.assign(drafts.size(), Dist{});
         if (!drafts.empty()) {   // the tokens after d1 follow from it and the context: fixed
             ++st.lookup_rounds;
@@ -611,7 +699,12 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
         const int k = !adapt ? K_ : std::min(K_, chain_len(call_ms) + (++mtp_chains % 4 ? 0 : 1));   // every 16th: code stuck at ~3
         mtp_round = true;
         drafts = {d1}, qs = {std::move(q1)};
-        for (int j = 1; j < k; ++j) {
+        // d1 also catches up committed MTP cells. Additional drafts need positions in the next verify window.
+        // At the context edge only, shorten the chain to the remaining output as well. Else retain the
+        // original RNG draws and verify shape for seeded requests.
+        const int next_room = e_.max_ctx() - e_.pos() - 1;
+        const int chain = k > next_room ? std::min(next_room, max_new - produced - 1) : k;
+        for (int j = 1; j < chain; ++j) {
             if (pen_drafts) pen_seq.push_back(drafts.back());
             Dist q;
             drafts.push_back(draft_one(1, false, j == 1 ? used - 1 : 0, {drafts.back()}, p + used - 1 + j, pen_seq, q));

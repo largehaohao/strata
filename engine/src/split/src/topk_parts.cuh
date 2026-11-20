@@ -1,6 +1,17 @@
 // Included after topk.cuh inside fnx. Host standard headers come from kernels.cu.
 #pragma once
 namespace {
+inline int topk_exact_fast_mode() {
+    static const int mode = [] {
+        const auto n = env_int("FNX_TOPK_EXACT_FAST", 0);
+        if (n < 0 || n > 2) throw std::runtime_error("FNX_TOPK_EXACT_FAST: expected 0, 1 or 2");
+#if !FNX_HIP || FNX_NCARD != 2 || FNX_27B
+        if (n) throw std::runtime_error("FNX_TOPK_EXACT_FAST requires two-card HIP Flash-Next");
+#endif
+        return (int)n;
+    }();
+    return mode;
+}
 inline int topk_parts_mode() {
     static const int parts = [] {
         const auto p = env_int("FNX_TOPK_PARTS", 0);
@@ -184,6 +195,18 @@ __global__ void __launch_bounds__(256) k_topk_merge_parts(const float* values, c
         out_i[row * TOPK_N + tid] = (int) (0xffffffffu - (unsigned) key);
     }
 }
+#include "topk_parts_exact_fast.cuh"
+inline void topk_partition_launch(float* logits,int n,int T,int v0,int parts,const int* pt,const int* pc,const int* pn,int stride,
+                                  const float* par,float* ov,int* oi,unsigned* err,cudaStream_t stream,int mode) {
+    if (mode == 1) k_topk_parts_exact_fast<false><<<dim3(T,parts),PART_THREADS,0,stream>>>(logits,n,v0,parts,pt,pc,pn,stride,par,ov,oi,err);
+    else if (mode == 2) k_topk_parts_exact_fast<true><<<dim3(T,parts),PART_THREADS,0,stream>>>(logits,n,v0,parts,pt,pc,pn,stride,par,ov,oi,err);
+    else k_topk_parts<<<dim3(T,parts),PART_THREADS,0,stream>>>(logits,n,v0,parts,pt,pc,pn,stride,par,ov,oi,err);
+}
+template<int PARTS>
+inline void topk_merge_launch(int T,const float* v,const int* i,float* ov,int* oi,cudaStream_t stream,int mode) {
+    if (mode) k_topk_merge_tree<PARTS><<<T,256,0,stream>>>(v,i,ov,oi);
+    else k_topk_merge_parts<PARTS><<<T,256,0,stream>>>(v,i,ov,oi);
+}
 }  // namespace
 namespace {
 inline void topk_parts_check(cudaError_t e, const char* where) {
@@ -233,14 +256,14 @@ inline bool topk_parts(float* logits, int n, int T, int v0, const int* pen_tok, 
     if (!parts || T < 1 || T > MAXT || n - (parts - 1) * ((n + parts - 1) / parts) < TOPK_N) return false;
     auto scratch = topk_parts_scratch((cudaStream_t)stream, parts);
     if (!scratch) return false;
-    k_topk_parts<<<dim3(T, parts), PART_THREADS, 0, (cudaStream_t)stream>>>(logits, n, v0, parts, pen_tok, pen_cnt,
-        pen_n, pen_stride, pen_par, scratch->values, scratch->ids, err);
+    const int fast = topk_exact_fast_mode();
+    topk_partition_launch(logits,n,T,v0,parts,pen_tok,pen_cnt,pen_n,pen_stride,pen_par,scratch->values,scratch->ids,err,(cudaStream_t)stream,fast);
     switch (parts) {
-        case 2: k_topk_merge_parts<2><<<T, 256, 0, (cudaStream_t)stream>>>(scratch->values, scratch->ids, out_v, out_i); break;
-        case 4: k_topk_merge_parts<4><<<T, 256, 0, (cudaStream_t)stream>>>(scratch->values, scratch->ids, out_v, out_i); break;
-        case 8: k_topk_merge_parts<8><<<T, 256, 0, (cudaStream_t)stream>>>(scratch->values, scratch->ids, out_v, out_i); break;
-        case 16: k_topk_merge_parts<16><<<T, 256, 0, (cudaStream_t)stream>>>(scratch->values, scratch->ids, out_v, out_i); break;
-        case 32: k_topk_merge_parts<32><<<T, 256, 0, (cudaStream_t)stream>>>(scratch->values, scratch->ids, out_v, out_i); break;
+        case 2: topk_merge_launch<2>(T,scratch->values,scratch->ids,out_v,out_i,(cudaStream_t)stream,fast); break;
+        case 4: topk_merge_launch<4>(T,scratch->values,scratch->ids,out_v,out_i,(cudaStream_t)stream,fast); break;
+        case 8: topk_merge_launch<8>(T,scratch->values,scratch->ids,out_v,out_i,(cudaStream_t)stream,fast); break;
+        case 16: topk_merge_launch<16>(T,scratch->values,scratch->ids,out_v,out_i,(cudaStream_t)stream,fast); break;
+        case 32: topk_merge_launch<32>(T,scratch->values,scratch->ids,out_v,out_i,(cudaStream_t)stream,fast); break;
     }
     return true;
 }

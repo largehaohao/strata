@@ -41,6 +41,33 @@ __global__ void __launch_bounds__(128) k_draft_head_prune(
     for (int i = 0; i < R; ++i)
         rank += partial[i] > mine || (partial[i] == mine && i < local);
     const bool keep = row < rows && rank < KEEP;
+    if constexpr (KEEP == 4) {
+        // Preserve the eight independent accumulators for each surviving row.
+        // With unordered scores the original rank rule can create duplicate ranks.
+        if (!__syncthreads_or(row < rows && !isfinite(score))) {
+            __shared__ float sums[KEEP][G];
+            __shared__ int selected[KEEP];
+            if (keep) {
+                sums[rank][lane] = sum;
+                if (!lane) selected[rank] = row;
+            } else if (!lane && row < rows) {
+                out[row] = -3.4028234663852886e38f;
+            }
+            __syncthreads();
+            if (threadIdx.x >= KEEP * G) return;
+            const int group = threadIdx.x / G;
+            const bool valid = group < rows - (int)blockIdx.x * R;
+            const int target = valid ? selected[group] : 0;
+            sum = valid ? sums[group][lane] : 0.f;
+            if (valid)
+                for (int b = stop + lane / per; b < nb; b += step)
+                    sum += vdot<T_Q4_0>(w + (size_t)target * row_bytes, y + b, b, vdr_of<T_Q4_0>() * (lane % per));
+#pragma unroll
+            for (int d = G / 2; d; d >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, d);
+            if (!lane && valid) out[target] = sum;
+            return;
+        }
+    }
     if (keep)
         for (int b = stop + lane / per; b < nb; b += step)
             sum += vdot<T_Q4_0>(wr, y + b, b, vdr_of<T_Q4_0>() * (lane % per));

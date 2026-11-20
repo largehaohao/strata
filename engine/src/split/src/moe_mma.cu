@@ -24,7 +24,7 @@ static bool moe_wide_requested(int type) {
         return v && v[0] == '1' && v[1] == 0;
     }();
     return on && (type == T_IQ3_S || type == T_IQ3_XXS || type == T_IQ2_S || type == T_IQ2_XXS ||
-                  type == T_IQ4_NL || type == T_Q2_0 || type == T_Q4_0);
+                  type == T_IQ4_NL || type == T_IQ4_XS || type == T_Q5_0 || type == T_Q2_0 || type == T_Q4_0);
 }
 #endif
 

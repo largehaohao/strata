@@ -41,11 +41,11 @@ struct Memory {
 };
 void merge(int parts, int T, float* v, int* i, float* out_v, int* out_i, cudaStream_t st) {
     switch (parts) {
-        case 2: k_topk_merge_parts<2><<<T, 256, 0, st>>>(v, i, out_v, out_i); break;
-        case 4: k_topk_merge_parts<4><<<T, 256, 0, st>>>(v, i, out_v, out_i); break;
-        case 8: k_topk_merge_parts<8><<<T, 256, 0, st>>>(v, i, out_v, out_i); break;
-        case 16: k_topk_merge_parts<16><<<T, 256, 0, st>>>(v, i, out_v, out_i); break;
-        case 32: k_topk_merge_parts<32><<<T, 256, 0, st>>>(v, i, out_v, out_i); break;
+        case 2: topk_merge_launch<2>(T,v,i,out_v,out_i,st,topk_exact_fast_mode()); break;
+        case 4: topk_merge_launch<4>(T,v,i,out_v,out_i,st,topk_exact_fast_mode()); break;
+        case 8: topk_merge_launch<8>(T,v,i,out_v,out_i,st,topk_exact_fast_mode()); break;
+        case 16: topk_merge_launch<16>(T,v,i,out_v,out_i,st,topk_exact_fast_mode()); break;
+        case 32: topk_merge_launch<32>(T,v,i,out_v,out_i,st,topk_exact_fast_mode()); break;
         default: throw std::runtime_error("invalid partition count");
     }
 }
@@ -109,7 +109,7 @@ int exact(int device) {
                 check(cudaMemsetAsync(ea, 0, 4, st), "reference error"); check(cudaMemsetAsync(eb, 0, 4, st), "candidate error");
                 k_topk_rows<<<T, TOPK_THREADS, 0, st>>>(a + pad, n, v0, pt, pc, pn, stride, par, av + pad, ai + pad, ea);
                 auto launch = [&] {
-                    k_topk_parts<<<dim3(T, parts), PART_THREADS, 0, st>>>(b + pad, n, v0, parts, pt, pc, pn, stride, par, tmpv + pad, tmpi + pad, eb);
+                    topk_partition_launch(b+pad,n,T,v0,parts,pt,pc,pn,stride,par,tmpv+pad,tmpi+pad,eb,st,topk_exact_fast_mode());
                     merge(parts, T, tmpv + pad, tmpi + pad, bv + pad, bi + pad, st);
                 };
                 if (pattern == 3) {

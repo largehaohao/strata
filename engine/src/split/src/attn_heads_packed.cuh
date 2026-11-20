@@ -76,15 +76,13 @@ __global__ void __launch_bounds__(256) k_pf_attn_head_packed(const float* __rest
             F dot = {};
             size_t at = 0;
             float kd = 0.f;
-            if (p < np) {
-                if constexpr (Mode & 2) {
-                    at=__shfl_sync(0xffffffffu,lane_at,p);
-                    kd=__shfl_sync(0xffffffffu,lane_kd,p);
-                } else {
-                    const int pos = list ? list[c0 + p] : c0 + p;
-                    at = kvq_row(g, pos) + card * HD + wave * 32;
-                    kd = __half2float(kc[kvq_scale(g, pos) + card * (HD / KV8_GROUP) + wave]);
-                }
+            if constexpr (Mode & 2) {
+                at = __shfl_sync(0xffffffffu, lane_at, p);
+                kd = __shfl_sync(0xffffffffu, lane_kd, p);
+            } else if (p < np) {
+                const int pos = list ? list[c0 + p] : c0 + p;
+                at = kvq_row(g, pos) + card * HD + wave * 32;
+                kd = __half2float(kc[kvq_scale(g, pos) + card * (HD / KV8_GROUP) + wave]);
             }
 #pragma unroll
             for (int k = 0; k < 2; ++k) {

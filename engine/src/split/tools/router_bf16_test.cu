@@ -5,10 +5,10 @@
 namespace fnx {
 std::vector<Q8Twin>& q8_twins(){static std::vector<Q8Twin>x;return x;}
 void ck(cudaError_t e,const char*s){if(e!=cudaSuccess)throw std::runtime_error(std::string(s)+cudaGetErrorString(e));}
-template<int T> void launch(bool packed,const void*w,const float*x,float*l,int*i,float*p,Job*g,Job*d,int*n,unsigned*c,cudaStream_t st){
+template<int T> void launch(bool packed,const void*w,const float*x,float*l,int*i,float*p,Job*g,Job*d,int*n,unsigned*c,cudaStream_t st,unsigned* error){
     const dim3 grid((NEXP+1+RR_ROWS-1)/RR_ROWS);
-    if(packed)k_router_route<T,true><<<grid,RR_THREADS,0,st>>>((const uint16_t*)w,x,l,i,p,g,d,n,c,ExpertCache{},0,nullptr,ShexpUp{});
-    else k_router_route<T><<<grid,RR_THREADS,0,st>>>((const float*)w,x,l,i,p,g,d,n,c,ExpertCache{},0,nullptr,ShexpUp{});
+    if(packed)k_router_route<T,true><<<grid,RR_THREADS,0,st>>>((const uint16_t*)w,x,l,i,p,g,d,n,c,ExpertCache{},0,nullptr,ShexpUp{},error);
+    else k_router_route<T><<<grid,RR_THREADS,0,st>>>((const float*)w,x,l,i,p,g,d,n,c,ExpertCache{},0,nullptr,ShexpUp{},error);
 }
 int run(int dev,bool bench){
     constexpr int pad=64,cap=MAXT*TOPK,copies=64,L=NEXP+1;
@@ -20,21 +20,22 @@ int run(int dev,bool bench){
     auto*wf=(float*)alloc(copies*wn*4);auto*wb=(uint16_t*)alloc(copies*wn*2);
     for(int i=0;i<copies;++i){ck(cudaMemcpy(wf+i*wn,fw.data(),wn*4,cudaMemcpyHostToDevice),"float weights");ck(cudaMemcpy(wb+i*wn,hw.data(),wn*2,cudaMemcpyHostToDevice),"BF16 weights");}
     auto*x=(float*)alloc(hx.size()*4);auto*logits=(float*)alloc(lb);auto*indices=(int*)alloc(pb);auto*prob=(float*)alloc(pb);
-    auto*gu=(Job*)alloc(jb);auto*dn=(Job*)alloc(jb);auto*nj=(int*)alloc(4);auto*counter=(unsigned*)alloc(4);
+    auto*gu=(Job*)alloc(jb);auto*dn=(Job*)alloc(jb);auto*nj=(int*)alloc(4);auto*counter=(unsigned*)alloc(4);auto*error=(unsigned*)alloc(4);
     cudaStream_t st;ck(cudaStreamCreateWithFlags(&st,cudaStreamNonBlocking),"stream");ck(cudaMemset(counter,0,4),"counter");
     cudaEvent_t a,b;ck(cudaEventCreate(&a),"event");ck(cudaEventCreate(&b),"event");int checks=0,copy=0;
     auto reset=[&](){for(auto v:{std::pair<void*,size_t>{logits,lb},{indices,pb},{prob,pb},{gu,jb},{dn,jb}})ck(cudaMemsetAsync(v.first,0xa5,v.second,st),"guard");};
     for(int T=1;T<=MAXT;++T){
         auto call=[&](bool packed){int k=copy++%copies;const void*w=packed?(const void*)(wb+k*wn):(const void*)(wf+k*wn);switch(T){
-#define DO(t) case t:launch<t>(packed,w,x,logits+pad,indices+pad,prob+pad,gu+1,dn+1,nj,counter,st);break
+#define DO(t) case t:launch<t>(packed,w,x,logits+pad,indices+pad,prob+pad,gu+1,dn+1,nj,counter,st,error);break
             DO(1);DO(2);DO(3);DO(4);DO(5);DO(6);DO(7);DO(8);DO(9);DO(10);DO(11);DO(12);DO(13);DO(14);DO(15);DO(16);
 #undef DO
         }};
-        for(int rep=0;rep<3;++rep){
-            for(auto&v:hx)v=rep==2?0.f:(int(rng()%2049)-1024)/2048.f;
+        for(int rep=0;rep<4;++rep){
+            for(auto&v:hx)v=rep==3?NAN:rep==2?0.f:(int(rng()%2049)-1024)/2048.f;
             ck(cudaMemcpyAsync(x,hx.data(),hx.size()*4,cudaMemcpyHostToDevice,st),"activation");
             std::vector<unsigned char>rl(lb),ri(pb),rp(pb),gl(lb),gi(pb),gp(pb);
             std::vector<Job>rg(cap+2),rd(cap+2),gg(cap+2),gd(cap+2);int rn,gn;
+            ck(cudaMemsetAsync(error,0,4,st),"reset router error");
             reset();call(false);ck(cudaStreamSynchronize(st),"reference wait");
             ck(cudaMemcpy(rl.data(),logits,lb,cudaMemcpyDeviceToHost),"ref logits");ck(cudaMemcpy(ri.data(),indices,pb,cudaMemcpyDeviceToHost),"ref ids");ck(cudaMemcpy(rp.data(),prob,pb,cudaMemcpyDeviceToHost),"ref probs");
             ck(cudaMemcpy(rg.data(),gu,jb,cudaMemcpyDeviceToHost),"ref jobs");ck(cudaMemcpy(rd.data(),dn,jb,cudaMemcpyDeviceToHost),"ref jobs");ck(cudaMemcpy(&rn,nj,4,cudaMemcpyDeviceToHost),"ref count");
@@ -43,6 +44,12 @@ int run(int dev,bool bench){
                 reset();if(replay)ck(cudaGraphLaunch(ex,st),"replay");else call(true);ck(cudaStreamSynchronize(st),"wait");
                 ck(cudaMemcpy(gl.data(),logits,lb,cudaMemcpyDeviceToHost),"logits");ck(cudaMemcpy(gi.data(),indices,pb,cudaMemcpyDeviceToHost),"ids");ck(cudaMemcpy(gp.data(),prob,pb,cudaMemcpyDeviceToHost),"probs");
                 ck(cudaMemcpy(gg.data(),gu,jb,cudaMemcpyDeviceToHost),"jobs");ck(cudaMemcpy(gd.data(),dn,jb,cudaMemcpyDeviceToHost),"jobs");ck(cudaMemcpy(&gn,nj,4,cudaMemcpyDeviceToHost),"count");
+                unsigned flags;
+                ck(cudaMemcpy(&flags,error,4,cudaMemcpyDeviceToHost),"router error");
+                if (flags != (rep == 3 ? 32u : 0u)) throw std::runtime_error("invalid router error bit");
+                if (rep == 3)
+                    for (int j = 1; j <= gn; ++j)
+                        if (gg[j].w < 0 || gg[j].w >= NEXP || gg[j].n > T) throw std::runtime_error("invalid fallback job");
                 if(rl!=gl||ri!=gi||rp!=gp||rn!=gn)throw std::runtime_error("router logits/prob/ids/count mismatch");
                 for(auto pair:{std::make_pair(&rg,&gg),std::make_pair(&rd,&gd)}){
                     auto&ref=*pair.first;auto&got=*pair.second;
@@ -69,7 +76,13 @@ int run(int dev,bool bench){
                 for(bool replay:{false,true}){
                     ck(cudaMemsetAsync(logits,0xa5,lb,st),"probe guard");if(replay)ck(cudaGraphLaunch(ex,st),"probe replay");else probe(true);
                     ck(cudaStreamSynchronize(st),"probe wait");ck(cudaMemcpy(gl.data(),logits,lb,cudaMemcpyDeviceToHost),"probe output");
-                    if(rl!=gl)throw std::runtime_error("probe GEMV or guard mismatch");++checks;
+                    unsigned flags;
+                ck(cudaMemcpy(&flags,error,4,cudaMemcpyDeviceToHost),"router error");
+                if (flags != (rep == 3 ? 32u : 0u)) throw std::runtime_error("invalid router error bit");
+                if (rep == 3)
+                    for (int j = 1; j <= gn; ++j)
+                        if (gg[j].w < 0 || gg[j].w >= NEXP || gg[j].n > T) throw std::runtime_error("invalid fallback job");
+                if(rl!=gl)throw std::runtime_error("probe GEMV or guard mismatch");++checks;
                 }
                 cudaGraphExecDestroy(ex);cudaGraphDestroy(graph);
             }

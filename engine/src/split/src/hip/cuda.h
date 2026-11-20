@@ -3,6 +3,7 @@
 #pragma once
 #include <hip/hip_runtime.h>
 #include <cstdint>
+#include "../ring_wait.cuh"
 
 typedef hipError_t CUresult;
 typedef hipStream_t CUstream;
@@ -19,7 +20,7 @@ inline CUresult cuGetErrorString(CUresult e, const char** s) {
 //                     two R9700 (phaseA-tests/sfnx/RESULTS-HIP.md), repeatable in the engine.
 //   native (FNX_HIP_MEMOP=native): hipStreamWriteValue32 / hipStreamWaitValue32, the runtime's own stream memory operations: 13 us, but not reliable
 //                     in the engine's multi-stream use (answers varied from start to start).
-// A wait that does not see its value within ~4 s sets bit 1 of nothing and returns (the engine's ring error check then catches the sum).
+// A timed-out software wait marks the pass failed before the stream continues.
 #include <cstdlib>
 #include <cstring>
 static __global__ void fnx_memop_write(volatile unsigned* p, unsigned v) {
@@ -27,11 +28,10 @@ static __global__ void fnx_memop_write(volatile unsigned* p, unsigned v) {
     *p = v;
     __threadfence_system();
 }
-static __global__ void fnx_memop_wait(volatile unsigned* p, unsigned v) {
-    const long long t0 = clock64();
+static __global__ void fnx_memop_wait(volatile unsigned* p, unsigned v, unsigned* err, unsigned long long limit) {
+    const auto t0 = fnx::ring_clock();
     while ((int) (*p - v) < 0) {   // wrapping >=
-        __builtin_amdgcn_s_sleep(1);
-        if (clock64() - t0 > 8000000000LL) break;
+        if (fnx::ring_expired(t0, limit)) { atomicOr(err, 1u); break; }
     }
     __threadfence_system();
 }
@@ -46,9 +46,9 @@ inline CUresult cuStreamWriteValue32(CUstream s, CUdeviceptr p, uint32_t v, unsi
     fnx_memop_write<<<1, 1, 0, s>>>(reinterpret_cast<volatile unsigned*>(p), v);
     return hipGetLastError();
 }
-inline CUresult cuStreamWaitValue32(CUstream s, CUdeviceptr p, uint32_t v, unsigned flags) {
-    if (fnx_native_memops()) return hipStreamWaitValue32(s, reinterpret_cast<void*>(p), static_cast<int32_t>(v), flags, 0xffffffffu);
-    fnx_memop_wait<<<1, 1, 0, s>>>(reinterpret_cast<volatile unsigned*>(p), v);
+inline CUresult fnx_stream_wait(CUstream s, CUdeviceptr p, uint32_t v, unsigned* err, unsigned long long limit) {
+    if (fnx_native_memops()) return hipStreamWaitValue32(s, reinterpret_cast<void*>(p), static_cast<int32_t>(v), CU_STREAM_WAIT_VALUE_GEQ, 0xffffffffu);
+    fnx_memop_wait<<<1, 1, 0, s>>>(reinterpret_cast<volatile unsigned*>(p), v, err, limit);
     return hipGetLastError();
 }
 inline CUresult cuInit(unsigned) { return hipInit(0); }

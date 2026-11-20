@@ -1094,7 +1094,7 @@ void load_dflash2(fnx::df2::Bridge& br, const fnx::Model& m, const Args& a) {
 // destructors: freeing the conversation cache's pinned memory takes minutes, and the stdin reader thread keeps the
 // process up, while the front end waits for the ERR line or EOF
 [[noreturn]] void fail(const std::exception& ex) {
-    say(std::string("ERR ") + ex.what());
+    say(std::string("ERR FATAL: ") + ex.what());
     std::fprintf(stderr, "sfnx: failed: %s\n", ex.what());
     std::fflush(stdout);
     std::fflush(stderr);

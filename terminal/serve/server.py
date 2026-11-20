@@ -997,7 +997,7 @@ class StrataEngine:
                 # release_gpu_waits invalidates the verifier, even if the native
                 # process stays alive and prints DONE afterwards.
                 if self.proc is proc:
-                    self.silent_note = "Unrecoverable native verification failure: " + line[4:].strip()
+                    self.silent_note = "Unrecoverable engine failure: " + line[4:].strip()
                     self.ended = True
                 try:
                     proc.terminate()
@@ -5607,8 +5607,9 @@ class Service:
                             # #1053: stopping inside thinking, including the single-token repeat guard, leaves
                             # no answer. Close the thinking once, within the same output cap, and let it answer.
                             close_retried = True
-                            extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
+                            extra = self.tok.encode(REASONING_CLOSE + (force or ""), parse_special=True)
                             if max_new - n - len(extra) >= 1:
+                                force = None
                                 cause = "repeated one token inside its thinking" if repeated else "ended inside its thinking"
                                 if repeated:
                                     # The opt-in recovery must not resume the same greedy loop. Only this
@@ -5617,6 +5618,7 @@ class Service:
                                     sampling = {**(sampling or {}),
                                         "temperature": max(1.0, float((sampling or {}).get("temperature") or 0)),
                                         "top_p": max(0.95, float((sampling or {}).get("top_p") or 0)),
+                                        "min_p": min(0.05, float((sampling or {}).get("min_p") or 0)),
                                         "top_k": 0 if top_k == 0 else max(20, int(top_k or 20)),
                                         "presence_penalty": max(1.5, float((sampling or {}).get("presence_penalty") or 0)),
                                         "frequency_penalty": max(0.25, float((sampling or {}).get("frequency_penalty") or 0)),
@@ -5634,6 +5636,9 @@ class Service:
                                     self._note(n, evs, st, rate)
                                     for ev in evs:
                                         yield "event", ev
+                                if stops is not None and stops.hit is not None:
+                                    finish = "stop"
+                                    break
                                 prompt = prompt + seg + extra
                                 finish = "length"
                                 continue
@@ -7784,19 +7789,12 @@ def make_handler(svc: Service):
                 self._note(outcome="disconnected")
                 svc.note_client_disconnect(cancel)
                 events.close()
-            except EngineDied as e:                          # mid-stream: Anthropic's error event
-                err = {"type": "error", "error": {"type": "api_error", "message": died_note(e)}}
-                self._note(error=err["error"])
-                self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+            except EngineDied as e:
+                self._anthropic_failed(died_note(e), "api_error")
             except QueueWaitExpired as e:
-                err = {"type": "error", "error": {"type": "rate_limit_error", "code": "queue_wait_timeout",
-                                                   "message": str(e)}}
-                self._note(error=err["error"])
-                self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
-            except ValueError as e:                          # the engine's ERR after the stream started
-                err = {"type": "error", "error": {"type": "api_error", "message": str(e)}}
-                self._note(error=err["error"])
-                self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+                self._anthropic_failed(str(e), "rate_limit_error", code="queue_wait_timeout")
+            except ValueError as e:
+                self._anthropic_failed(str(e), "api_error")
             except (GpuBusy, EngineStarting, EngineStuck, ModelBusy) as e:   # _post would write HTTP into the stream's body
                 self._anthropic_failed(str(e), "overloaded_error" if isinstance(e, GpuBusy) else "api_error")
             except ClientGone:
@@ -7804,11 +7802,12 @@ def make_handler(svc: Service):
             except Exception:                                # no silent end: the client would take it for a whole answer
                 self._anthropic_failed(self._stream_crashed(), "api_error")
 
-        def _anthropic_failed(self, message, kind):
-            err = {"type": "error", "error": {"type": kind, "message": message}}
+        def _anthropic_failed(self, message, kind, **details):
+            err = {"type": "error", "error": {"type": kind, "message": message, **details}}
             self._note(error=err["error"])
             try:
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+                self.wfile.flush()
             except OSError:
                 self._note(outcome="disconnected")
 

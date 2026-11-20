@@ -24,6 +24,8 @@ struct Refused : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+struct DraftSamplePacket;
+struct DraftSampleInput;
 struct CardBuf;
 struct CardPool;
 
@@ -63,7 +65,9 @@ public:
     static constexpr int PEN_CAP = 4096;   // penalized tokens per row, at most
     // after a verify of T rows: each row's TOPK_N highest logits over the whole vocabulary with the row's penalties
     // applied, as (logit, token), logit descending and token ascending on ties. Changes the head's logits in place
-    std::vector<std::vector<std::pair<float, int>>> top_tokens(int T, const Penalties& pen);
+    using Candidates = std::vector<std::vector<std::pair<float, int>>>;
+    Candidates verify_sampled(const std::vector<int>& tokens, const Penalties& pen);
+    Candidates top_tokens(int T, const Penalties& pen);
     // prompt rows through the batched path (prefill.cu, chunks of PF_C): the state a run of windows over them leaves (no
     // logits); the caller puts the prompt's last token through a window for its next token. With the draft layer
     // attached it reads the rows too, each paired with the token after it (`after`: the one after the last row)
@@ -96,6 +100,9 @@ public:
     // the draft head's TOPK_N highest (penalized) logits for that token into last_draft_cands as top_tokens() gives them
     int draft(int T, bool from_main, int src_row, const std::vector<int>& tokens, int pos0, const Penalties::Row* pen = nullptr,
               bool cands = false);
+    // Keep the draft layer's K/V current from accepted main-window rows, without its vocabulary head or a proposal.
+    // Updates last_draft_ms / last_draft_gpu_ms as draft() does. Used only by FNX_LOOKUP_BEFORE_DRAFT.
+    void draft_catch_up(int T, int src_row, const std::vector<int>& tokens, int pos0);
     // FNX_BATCH_DRAFT: draft() for several lanes in one draft-layer window (greedy, no penalties): lane reqs[i].lane's reqs[i].T rows (source rows as draft() takes them,
     // tokens and cells from pos0), the rows of the lanes one after the other (at most MAXT in all). Returns each lane's draft (for the token after its last row).
     // The window runs eagerly. A chained step (from_main false) takes its source row from the batch before: src_row is the row's index in THAT window. The engine's
@@ -207,6 +214,7 @@ public:
         SeqState& operator=(const SeqState&) = delete;
         ~SeqState();
     };
+    size_t checkpoint_bytes() const;
     std::shared_ptr<SeqState> save_state(bool kv);
     // the engine at the state's end: a kv state replaces everything; a checkpoint needs the engine's own K/V to hold
     // the state's tokens already (its history must start with them)
@@ -257,9 +265,9 @@ private:
     void pf_clear_ring(int c);   // card c's prompt ring (prefill.cu), when it has buffers of its own
     // the prompt path's copy-engine ring and attention exchange wait for flags >= their sum's number (Pf::seq, the same
     // on every card), which would read every old flag as done once the u32 wrapped: every card idle, the flags zeroed,
-    // the numbers start again from `start` (prefill() does it between reads once they pass PF_SEQ_RESET; a read takes
+    // the numbers start again from `start` (prefill() checks between passes once they reach PF_SEQ_RESET; one pass takes
     // well under 2^20 of them). FNX_PF_SEQ_START sets the first start (a test)
-    static constexpr unsigned PF_SEQ_RESET = 1u << 31;
+    static constexpr unsigned PF_SEQ_RESET = (1u << 31) - (1u << 20);
     void pf_seq_reset(unsigned start);
     struct LaneHost {
         int pos = 0;
@@ -305,6 +313,8 @@ private:
         float* R0;
         float* mtp_emb;
         int* mtp_ctl;
+        DraftSamplePacket* mtp_sample_packet;
+        DraftSampleInput* mtp_sample_input;
         int* mtp_lctl;
         int* mtp_row_pos;
         int* mtp_pen_l;          // per lane, per card: penalize_row's pen
@@ -361,7 +371,11 @@ private:
     bool warming_ = false;
     std::map<std::vector<int>, int> seen_;
     int last_kind_ = 0;
-    void enqueue(int T, bool dumps);
+    int prepare_top_tokens(int T, const Penalties& pen);
+    void enqueue_top_tokens(int c, int T, int stride);
+    Candidates collect_top_tokens(int T) const;
+    std::vector<int> verify_impl(const std::vector<int>& tokens, int sampling_stride);
+    void enqueue(int T, bool dumps, bool greedy);
     void enqueue_batch(const std::vector<int>& lanes);   // step()'s window: one row per lane
     void enqueue_rows(const std::vector<int>& lanes, const std::vector<int>& counts);   // verify_rows()'s
     struct RowsWindow {          // verify_rows()'s window until its commit_rows()
@@ -382,7 +396,7 @@ private:
     void df2_forget(int lane);       // the lane's sequence changed: drafter ring and host ring empty
     void df2_prompt_tap(int slot, int pos_first, int row, int n, CardBuf& b, const float* R, const float* bo, const float* inj);
     int mtp_head_mode_ = 0;  // per-call draft mode; zero for penalties and sampled candidates
-    void mtp_enqueue(int T);
+    void mtp_enqueue(int T, bool head = true);
     void mtp_enqueue_lanes(const std::vector<DraftReq>& reqs, int T);
     const Mtp* mtp_ = nullptr;
     std::vector<Pf*> pf_;
@@ -411,7 +425,7 @@ private:
         std::vector<int> tokens;
         int after, set;
     };
-    void prefill_pass(const std::vector<PfChunk>& chunks, bool staging, const std::function<void()>& between);
+    void prefill_pass(const std::vector<PfChunk>& chunks, bool staging, bool& pass_in_flight, const std::function<void()>& between);
     float* pf_emb_[PF_SETS] = {};   // pinned, a set per chunk of two passes: its token embeddings and PLE rows (PF_C rows of N), (position, tag)s
     float* pf_ple_[PF_SETS] = {};
     int* pf_ctl_[PF_SETS] = {};
@@ -419,12 +433,12 @@ private:
     void prefill_draft(int C, int set);
     // draft(), from per-card source rows (T rows of D on each card)
     int draft_rows(const std::vector<const float*>& src, int T, const std::vector<int>& tokens, int pos0,
-                   const Penalties::Row* pen = nullptr, bool cands = false);
+                   const Penalties::Row* pen = nullptr, bool cands = false, bool head = true);
     std::vector<int> draft_index_;   // token -> its index in the draft vocabulary, -1 if not in it (mtp_attach)
     // pieces of a layer, for the main layers and the draft layer
     void dense(const DW& W, const void* y, float* out, CardBuf& b, int T);
     void attention(int T, CardBuf& b, const CardW& w, const LayerW& L, uint16_t* kc, uint16_t* vc, const int* ctl,
-                   uint16_t* qsa_ring, uint16_t* qsa_pooled, int call);
+                   uint16_t* qsa_ring, uint16_t* qsa_pooled, int call, bool cache_only = false);
     void ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW& L, float* R, const int* ctl, int lyr);
 #if FNX_27B
     // the 27B's window (s27_engine.cu): the layers and head over T rows, one sequence's or a batched window's (lanes),

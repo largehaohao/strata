@@ -12,13 +12,7 @@ __global__ void __launch_bounds__(MMVQ_THREADS) k_moe_gu_iq_cache(
         // compute GU rows. Kernel completion orders every copied byte before
         // the subsequent down launch; no grid barrier is needed.
         if ((int) blockIdx.x < copy.blocks) {
-            const size_t per = copy.bytes / 16;
-            for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
-                 i < (size_t) copy.list[0] * per; i += (size_t) copy.blocks * blockDim.x) {
-                const int g = copy.list[1 + i / per];
-                char* dst = copy.pool + (size_t) (copy.slots[g] - copy.slot0) * copy.slot_bytes + copy.offset;
-                reinterpret_cast<uint4*>(dst)[i % per] = reinterpret_cast<const uint4*>(copy.host[g])[i % per];
-            }
+            copy_down_experts(copy);
             return;
         }
         const int rows = (w.nrows + MMVQ_THREADS / G - 1) / (MMVQ_THREADS / G);
@@ -33,7 +27,8 @@ __global__ void __launch_bounds__(MMVQ_THREADS) k_moe_gu_iq_cache(
         jb = jobs[ji];
         missing = false;
         const int g = cache.layer * NEXP + jb.w;
-        for (int i = 0, n = cache.list[0]; i < n; ++i)
+        if (cache.miss_bits) missing = (cache.miss_bits[jb.w / 32] >> (jb.w % 32)) & 1u;
+        else for (int i = 0, n = cache.list[0]; i < n; ++i)
             if (cache.list[1 + i] == g) { missing = true; break; }
     }
     __syncthreads();

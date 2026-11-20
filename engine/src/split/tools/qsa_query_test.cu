@@ -211,24 +211,44 @@ void run(){
         // Model one missing row from the other card; use logical card zero
         // on either physical device so row four is always the receive row.
         k_qsx_pull<<<5,256,0,a.st>>>(a.cells,a.counts,5,max_rows,0,4,a.mail);
-        expect(1u);
+        expect(128u);
         reset();
         int bad=-2;ck(cudaMemcpy(a.counts,&bad,4,cudaMemcpyHostToDevice),"negative count");
         k_qsx_push<<<1,256,0,a.st>>>(a.cells,a.counts,1,max_rows,0,4,a.mail,s[1-c]->mail);
-        expect(2u);
+        expect(64u);
+        // The other card must receive the same protocol error, without timing out.
+        auto& peer = *s[1-c];
+        ck(cudaSetDevice(1-c),"negative peer");
+        ck(cudaMemset(peer.mail.errors,0,4),"clear peer error");
+        ck(cudaMemcpy(peer.mail.generation,&generation,4,cudaMemcpyHostToDevice),"peer generation");
+        k_qsx_pull<<<1,256,0,peer.st>>>(peer.cells,peer.counts,1,max_rows,1,4,peer.mail);
+        ck(cudaStreamSynchronize(peer.st),"peer observed publication");
+        unsigned peer_error=0;
+        ck(cudaMemcpy(&peer_error,peer.mail.errors,4,cudaMemcpyDeviceToHost),"read peer error");
+        if(peer_error!=64u)throw std::runtime_error("peer lost producer error");
+        ++error_checks;
+        ck(cudaSetDevice(c),"negative producer");
         reset();
         int count=4,unaligned=3;
         ck(cudaMemcpy(a.counts,&count,4,cudaMemcpyHostToDevice),"negative size");
         ck(cudaMemcpy(a.cells,&unaligned,4,cudaMemcpyHostToDevice),"negative block");
         k_qsx_push<<<1,256,0,a.st>>>(a.cells,a.counts,1,max_rows,0,4,a.mail,s[1-c]->mail);
-        expect(8u);
+        expect(64u);
         reset();
         const size_t slot=(generation&1u)*max_rows+4;
         unsigned oversized=QSA_MAXSEL+1;
         ck(cudaMemcpy(a.mail.data+slot*QSX_WORDS,&oversized,4,cudaMemcpyHostToDevice),"negative payload");
         ck(cudaMemcpy(a.mail.ready+slot,&generation,4,cudaMemcpyHostToDevice),"negative publication");
         k_qsx_pull<<<5,256,0,a.st>>>(a.cells,a.counts,5,max_rows,0,4,a.mail);
-        expect(4u);
+        expect(64u);
+        // Consume a valid row, leave it untouched, then reuse the same generation without a producer.
+        reset();
+        ck(cudaMemset(a.mail.data + slot * QSX_WORDS, 0, 4), "empty payload");
+        ck(cudaMemcpy(a.mail.ready + slot, &generation, 4, cudaMemcpyHostToDevice), "publish once");
+        k_qsx_pull<<<5,256,0,a.st>>>(a.cells,a.counts,5,max_rows,0,4,a.mail);
+        expect(0u);
+        k_qsx_pull<<<5,256,0,a.st>>>(a.cells,a.counts,5,max_rows,0,4,a.mail);
+        expect(128u);
     }
     std::printf("QSA_QUERY_SPLIT passed %d bounded timeout/malformed payload checks\n",error_checks);
     for(auto& a:s)a->mem.guards();

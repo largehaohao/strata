@@ -51,8 +51,9 @@ __global__ void hcs_pull(__half* lo, int words, HcsMail own) {
         failed = 0;
         const auto begin = wall_clock64();
         while (reinterpret_cast<volatile const unsigned*>(own.ready)[bank * own.capacity_blocks + blockIdx.x] != generation) {
-            if (*reinterpret_cast<volatile const unsigned*>(own.errors) || wall_clock64() - begin > own.timeout_ticks) {
-                atomicOr(own.errors, 1u); failed = 1; break;
+            if (*reinterpret_cast<volatile const unsigned*>(own.errors)) { failed = 1; break; }
+            if (wall_clock64() - begin > own.timeout_ticks) {
+                atomicOr(own.errors, 256u); failed = 1; break;
             }
             __nanosleep(64);
         }

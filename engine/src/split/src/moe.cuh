@@ -18,8 +18,10 @@ constexpr int RR_THREADS = 256, RR_WPR = 2, RR_ROWS = RR_THREADS / 32 / RR_WPR; 
 // then their ids
 __device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache& ec, int* list) {
     const int lane = threadIdx.x & 31, base = layer * NEXP, p = ec.pool_of[layer], lent = ec.lent[p];
+    unsigned missed = 0;
     // an arena's pools hold every expert until it lends, and then only its own pool's experts can be missing
     if (ec.arena_full && (p != ec.arena_pool || lent == 0)) {
+        if (ec.miss_bits && lane < (NEXP + 31) / 32) ec.miss_bits[lane] = 0;
         if (lane == 0) list[0] = 0;
         return;
     }
@@ -37,6 +39,7 @@ __device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache
         unsigned miss = __ballot_sync(0xffffffffu, j0 + lane < nj && ec.slot_of[base + jobs[j0 + lane].w] == -1);
         while (miss) {
             const int g = base + jobs[j0 + __ffs(miss) - 1].w;
+            if (ec.miss_bits && lane == (g - base) / 32) missed |= 1u << ((g - base) % 32);
             miss &= miss - 1;
             int victim = -1;
             while (victim < 0) {
@@ -51,6 +54,7 @@ __device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache
                         if (ec.age) ec.age[idx] = 0;
                     }
                 }
+                __syncwarp();  // the next scan can wrap to another lane's ref/age update
                 if (free) victim = s0 + (hand + f) % n;
                 hand = (hand + (free ? f + 1 : 32)) % n;
             }
@@ -75,6 +79,7 @@ __device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache
     }
     for (int j = lane; j < nj; j += 32)
         if (const int s = ec.slot_of[base + jobs[j].w]; s >= 0) ec.ref[s] = 1;
+    if (ec.miss_bits && lane < (NEXP + 31) / 32) ec.miss_bits[lane] = missed;
     if (lane == 0) {
         ec.hand[p] = s0 + hand;
         list[0] = k;
@@ -86,7 +91,7 @@ __global__ void __launch_bounds__(RR_THREADS) k_router_route(const void* __restr
                                                             float* __restrict__ logits, int* __restrict__ topi,
                                                             float* __restrict__ topw, Job* __restrict__ gu, Job* __restrict__ dn,
                                                             int* __restrict__ njobs, unsigned* __restrict__ counter,
-                                                            const ExpertCache ec, int layer, int* list, const ShexpUp su) {
+                                                            const ExpertCache ec, int layer, int* list, const ShexpUp su, unsigned* errors) {
     static_assert(RR_THREADS == Q8S_THREADS, "the shared expert's q8s blocks in the router's launch");
     constexpr int NC = N / 4 / 32 / RR_WPR, L = NEXP + 1;   // float4 chunks per lane
     const int nrr = (int) gridDim.x - su.blocks;              // the router's own blocks; the shared expert's after them
@@ -158,6 +163,11 @@ __global__ void __launch_bounds__(RR_THREADS) k_router_route(const void* __restr
                 const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
                 const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
                 if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+            }
+            if (bi == NEXP) {
+                // No ordered logit remains. Lane zero has more candidates than TOPK.
+                bi = 32 * __shfl_sync(0xffffffffu, __ffs(~taken) - 1, 0);
+                if (lane == 0 && errors) atomicOr(errors, 32u);
             }
             if ((bi & 31) == lane) taken |= 1u << (bi >> 5);
             if (k == 0) top0 = bv;
@@ -604,8 +614,11 @@ void moe_launch(bool down, const MoeW& w, const Job* jobs, const int* njobs, int
 #define FNX_IQR(t) case t: \
     if (gu_copy && fast_signs) k_moe_gu_iq_cache<TA, t, 16, true, true><<<fused_grid, MMVQ_THREADS, 0, s>>>(w, jobs, njobs, (const block_q8_1*) in, out, *copy, *gu_copy); \
     else if (gu_copy) k_moe_gu_iq_cache<TA, t, 16, true><<<fused_grid, MMVQ_THREADS, 0, s>>>(w, jobs, njobs, (const block_q8_1*) in, out, *copy, *gu_copy); \
+    else if (copy && fast_signs) k_moe_gu_iq<TA, t, 16, true, true><<<fused_grid, MMVQ_THREADS, 0, s>>>(w, jobs, njobs, (const block_q8_1*) in, out, *copy); \
     else if (copy) k_moe_gu_iq<TA, t, 16, true><<<fused_grid, MMVQ_THREADS, 0, s>>>(w, jobs, njobs, (const block_q8_1*) in, out, *copy); \
+    else if (group == 16 && fast_signs) k_moe_gu_iq<TA, t, 16, false, true><<<grid16, MMVQ_THREADS, 0, s>>>(w, jobs, njobs, (const block_q8_1*) in, out); \
     else if (group == 16) k_moe_gu_iq<TA, t, 16><<<grid16, MMVQ_THREADS, 0, s>>>(w, jobs, njobs, (const block_q8_1*) in, out); \
+    else if (fast_signs) k_moe_gu_iq<TA, t, 32, false, true><<<grid, MMVQ_THREADS, 0, s>>>(w, jobs, njobs, (const block_q8_1*) in, out); \
     else k_moe_gu_iq<TA, t><<<grid, MMVQ_THREADS, 0, s>>>(w, jobs, njobs, (const block_q8_1*) in, out); \
     break
                 switch (T) {

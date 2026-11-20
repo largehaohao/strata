@@ -33,9 +33,7 @@ void qsa_query_split_prepare(int card, bool peer_on, int lanes, unsigned* errors
     if (qsx_mail[card].data) throw std::runtime_error("QSA split mailbox already active");
     QsxMail mail{};
     mail.capacity = 512;
-    int clock = 0;
-    qsx_check(hipDeviceGetAttribute(&clock, hipDeviceAttributeWallClockRate, dev), "QSA split clock");
-    mail.timeout_ticks = (unsigned long long)clock * 1000;
+    mail.timeout_ticks = ring_wait_ticks(dev);
     mail.errors = errors;
     auto fine = [](size_t bytes) -> void* {
         void* data = nullptr;
@@ -49,8 +47,8 @@ void qsa_query_split_prepare(int card, bool peer_on, int lanes, unsigned* errors
     qsx_check(cudaMalloc(reinterpret_cast<void**>(&mail.generation), sizeof(unsigned)), "QSA split generation");
     own_dev(mail.generation);
     qsx_check(cudaMemset(mail.generation, 0, sizeof(unsigned)), "QSA split generation clear");
-    qsx_mail[card] = mail;
     own([card] { qsx_mail[card] = {}; });
+    qsx_mail[card] = mail;
     std::fprintf(stderr, "fnx: QSA query split card %d: %zu KiB, rows 256..512, prefix >=24576, chunk >512\n",
                  card, ((size_t)2 * mail.capacity * (QSX_WORDS * sizeof(int) + sizeof(unsigned)) + sizeof(unsigned)) >> 10);
 }

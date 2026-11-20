@@ -2,6 +2,7 @@
 // (src/models/qwen4exp.cpp) operation by operation.
 #include "kernels.hpp"
 #include "env.hpp"
+#include "ring_wait.cuh"
 #include "owned.hpp"
 #include "qsa_query_split.hpp"
 #include "attn_head_split.hpp"
@@ -674,12 +675,12 @@ __global__ void __launch_bounds__(HD) k_att_merge(AttRing r, const float* qg, co
         *(volatile unsigned long long*) p = (unsigned long long) __float_as_uint(v) | ((unsigned long long) tag << 32);
     };
     auto take = [&](const unsigned long long* p) {
-        const long long t0 = clock64();
+        const auto t0 = ring_clock();
         unsigned long long w;
         for (;;) {
             w = *(const volatile unsigned long long*) p;
             if ((unsigned) (w >> 32) == tag) break;
-            if (clock64() - t0 > 4000000000LL) { atomicOr(r.err, 1u); break; }
+            if (ring_expired(t0, r.timeout_ticks)) { atomicOr(r.err, 1u); break; }
         }
         return __uint_as_float((unsigned) w);
     };
@@ -729,12 +730,12 @@ __global__ void __launch_bounds__(HD) k_att_merge_a2a(AttRing r, const float* qg
         *(volatile unsigned long long*) p = (unsigned long long) __float_as_uint(v) | ((unsigned long long) tag << 32);
     };
     auto take = [&](const unsigned long long* p) {
-        const long long t0 = clock64();
+        const auto t0 = ring_clock();
         unsigned long long w;
         for (;;) {
             w = *(const volatile unsigned long long*) p;
             if ((unsigned) (w >> 32) == tag) break;
-            if (clock64() - t0 > 4000000000LL) { atomicOr(r.err, 1u); break; }
+            if (ring_expired(t0, r.timeout_ticks)) { atomicOr(r.err, 1u); break; }
         }
         return __uint_as_float((unsigned) w);
     };
@@ -864,13 +865,13 @@ __device__ __forceinline__ void rput32(unsigned long long* p, float2 v, unsigned
     *(volatile unsigned long long*) p = (unsigned long long) __float_as_uint(v.x) | t;
     *(volatile unsigned long long*) (p + 1) = (unsigned long long) __float_as_uint(v.y) | t;
 }
-__device__ __forceinline__ float rtake1(const unsigned long long* p, unsigned tag, unsigned* err) {
-    const long long t0 = clock64();
+__device__ __forceinline__ float rtake1(const unsigned long long* p, unsigned tag, unsigned* err, unsigned long long limit) {
+    const auto t0 = ring_clock();
     unsigned long long w;
     for (;;) {
         w = *(const volatile unsigned long long*) p;
         if ((unsigned) (w >> 32) == tag) break;
-        if (clock64() - t0 > 4000000000LL) { atomicOr(err, 1u); break; }
+        if (ring_expired(t0, limit)) { atomicOr(err, 1u); break; }
     }
     return __uint_as_float((unsigned) w);
 }
@@ -879,13 +880,13 @@ __device__ __forceinline__ void rput(unsigned long long* p, float2 v, unsigned t
     const __half2 h = __floats2half2_rn(v.x, v.y);
     *(volatile unsigned long long*) p = (unsigned long long) *reinterpret_cast<const unsigned*>(&h) | ((unsigned long long) tag << 32);
 }
-__device__ __forceinline__ float2 rtake(const unsigned long long* p, unsigned tag, unsigned* err) {
-    const long long t0 = clock64();
+__device__ __forceinline__ float2 rtake(const unsigned long long* p, unsigned tag, unsigned* err, unsigned long long limit) {
+    const auto t0 = ring_clock();
     unsigned long long w;
     for (;;) {
         w = *(const volatile unsigned long long*) p;
         if ((unsigned) (w >> 32) == tag) break;
-        if (clock64() - t0 > 4000000000LL) { atomicOr(err, 1u); break; }
+        if (ring_expired(t0, limit)) { atomicOr(err, 1u); break; }
     }
     const unsigned lo = (unsigned) w;
     return __half22float2(*reinterpret_cast<const __half2*>(&lo));
@@ -914,8 +915,8 @@ __global__ void k_ring(Ring r, float* x, int T, const unsigned* tagp, int call, 
         else rput(p, v, tg, r.err);
     };
     auto take = [&](const unsigned long long* p, unsigned tg) {
-        if constexpr (F32) return make_float2(rtake1(p, tg, r.err), rtake1(p + 1, tg, r.err));
-        else return rtake(p, tg, r.err);
+        if constexpr (F32) return make_float2(rtake1(p, tg, r.err, r.timeout_ticks), rtake1(p + 1, tg, r.err, r.timeout_ticks));
+        else return rtake(p, tg, r.err, r.timeout_ticks);
     };
     const unsigned tag = *tagp * 256u + (unsigned) call + 1u;
     const int n = gridDim.x * blockDim.x, tid = blockIdx.x * blockDim.x + threadIdx.x, g = r.card;
@@ -989,7 +990,7 @@ __global__ void k_ring_a2a(Ring r, float* x, int T, const unsigned* tagp, int ca
         float2 sum = make_float2(0.f, 0.f);
 #pragma unroll
         for (int src = 0; src < NCARD; ++src) {
-            const float2 w = src == g ? __half22float2(h) : rtake((const unsigned long long*) r.peer_in[src] + (tag & 1) * set_sz + e, tag, r.err);
+            const float2 w = src == g ? __half22float2(h) : rtake((const unsigned long long*) r.peer_in[src] + (tag & 1) * set_sz + e, tag, r.err, r.timeout_ticks);
             sum = src == 0 ? w : add2(sum, w);
         }
         x[2 * e] = sum.x;
@@ -1020,7 +1021,7 @@ __global__ void k_ring_a2a_push(Ring r, float* x, int T, const unsigned* tagp, i
         float2 sum = make_float2(0.f, 0.f);
 #pragma unroll
         for (int src = 0; src < NCARD; ++src) {
-            const float2 w = src == g ? __half22float2(h) : rtake(mine + (size_t) src * slot + e, tag, r.err);
+            const float2 w = src == g ? __half22float2(h) : rtake(mine + (size_t) src * slot + e, tag, r.err, r.timeout_ticks);
             sum = src == 0 ? w : add2(sum, w);
         }
         x[2 * e] = sum.x;
@@ -1062,7 +1063,7 @@ __global__ void k_ring_a2a_push_pair(Ring r, float* x, int T, const unsigned* ta
                 float2 sum = make_float2(0.f, 0.f);
 #pragma unroll
                 for (int src = 0; src < NCARD; ++src) {
-                    const float2 v = src == card ? __half22float2(sent[j]) : rtake(mine + (size_t) src * slot + e, tag, r.err);
+                    const float2 v = src == card ? __half22float2(sent[j]) : rtake(mine + (size_t) src * slot + e, tag, r.err, r.timeout_ticks);
                     sum = src == 0 ? v : add2(sum, v);
                 }
                 x[2 * e] = sum.x;
@@ -1555,13 +1556,14 @@ void qsa_proj(const uint16_t* wq, const uint16_t* wk, const float* x, float* y, 
 
 void qsa(const uint16_t* wq, const uint16_t* wk, const float* x, float* y, const float* qn, const float* kn, uint16_t* ring,
          uint16_t* pooled, const KvPages& g, float* q, float* scores, int* cells, int* n_cells, int max_pools, const int* pos0, int T, float eps,
-         Rope base, int card, void* st) {
+         Rope base, int card, void* st, bool select) {
     cudaStream_t s = (cudaStream_t) st;
     if (wq) qsa_proj(wq, wk, x, y, T, st);
     __half* r = reinterpret_cast<__half*>(ring);
     __half* pl = reinterpret_cast<__half*>(pooled);
     if (T + QSA_POOL > qsa_ring) throw std::runtime_error("qsa: the ring is shorter than a window and a block");
     k_idx_prep_pool<<<dim3(T, QSA_HEADS + 2), QSA_DIM, 0, s>>>(y, qn, kn, r, qsa_ring, q, pl, g, pos0, eps, base);
+    if (!select) { ck_launch("QSA cache update"); return; }
     // FNX_QSA_DENSE=1 (for comparisons): no selection, every row attends every position
     static const bool dense_only = env_flag("FNX_QSA_DENSE");
     if (dense_only) {
@@ -1698,10 +1700,16 @@ void attn_prompt_heads(const float* qg, const uint16_t* kc, const uint16_t* vc, 
 #if FNX_HIP
     static const bool direct = env_flag("FNX_PF_ATTN_DIRECT");
     if (direct && g.q8) {
-        int dev = 0; hipDeviceProp_t prop{};
-        if (hipGetDevice(&dev) != hipSuccess || hipGetDeviceProperties(&prop, dev) != hipSuccess ||
-            std::string(prop.gcnArchName).rfind("gfx1100", 0) != 0)
-            throw std::runtime_error("FNX_PF_ATTN_DIRECT requires gfx1100");
+        int dev = -1;
+        static thread_local std::vector<bool> checked;
+        if (hipGetDevice(&dev) != hipSuccess || dev < 0) throw std::runtime_error("prompt attention: unknown device");
+        if ((size_t)dev >= checked.size()) checked.resize(dev + 1);
+        if (!checked[dev]) {
+            hipDeviceProp_t prop{};
+            if (hipGetDeviceProperties(&prop, dev) != hipSuccess || std::strncmp(prop.gcnArchName, "gfx1100", 7))
+                throw std::runtime_error("FNX_PF_ATTN_DIRECT requires gfx1100");
+            checked[dev] = true;
+        }
 #if FNX_NCARD == 2 && !FNX_27B
         static const bool packed=env_flag("FNX_PF_ATTN_Q8_PACKED");
         if (packed && C>=32)
@@ -1761,11 +1769,11 @@ __device__ __forceinline__ void rb_signal(unsigned* flag, unsigned tag) {
         *(volatile unsigned*) flag = tag;
     }
 }
-__device__ __forceinline__ void rb_wait(const unsigned* flag, unsigned tag, unsigned* err) {
+__device__ __forceinline__ void rb_wait(const unsigned* flag, unsigned tag, unsigned* err, unsigned long long limit) {
     if (threadIdx.x == 0) {
-        const long long t0 = clock64();
+        const auto t0 = ring_clock();
         while (*(const volatile unsigned*) flag != tag)
-            if (clock64() - t0 > 4000000000LL) { atomicOr(err, 1u); break; }
+            if (ring_expired(t0, limit)) { atomicOr(err, 1u); break; }
         __threadfence_system();
     }
     __syncthreads();
@@ -1797,7 +1805,7 @@ __global__ void k_ring_big(Ring r, float* x, int T, const unsigned* tagp, int ca
     }
     for (int s = 1; s < RSTEPS; ++s) {   // step s: chunk g-s arrived; add mine, on to g+1
         rb_seg(T, (g + NCARD - s) % NCARD, lo, len, s0, s1);
-        rb_wait(fl + (s - 1) * RB_BLOCKS + b, tag, r.err);
+        rb_wait(fl + (s - 1) * RB_BLOCKS + b, tag, r.err, r.timeout_ticks);
         for (int e = s0 + tid; e < s1; e += nt) {
             const int t = e / len, i = e % len;
             *slot(nin, s, t, i) = rb_pack(add2(rb_load(slot(in, s - 1, t, i)), ring_x2(x, m, T, t, lo + i)), r.err);
@@ -1806,7 +1814,7 @@ __global__ void k_ring_big(Ring r, float* x, int T, const unsigned* tagp, int ca
     }
     {   // step NCARD - 1: chunk g+1 with the other cards' parts; add mine: finished. Keep it, send it on
         rb_seg(T, (g + 1) % NCARD, lo, len, s0, s1);
-        rb_wait(fl + (RSTEPS - 1) * RB_BLOCKS + b, tag, r.err);
+        rb_wait(fl + (RSTEPS - 1) * RB_BLOCKS + b, tag, r.err, r.timeout_ticks);
         for (int e = s0 + tid; e < s1; e += nt) {
             const int t = e / len, i = e % len;
             const __half2 v = rb_pack(add2(rb_load(slot(in, RSTEPS - 1, t, i)), ring_x2(x, m, T, t, lo + i)), r.err);
@@ -1817,7 +1825,7 @@ __global__ void k_ring_big(Ring r, float* x, int T, const unsigned* tagp, int ca
     }
     for (int f = 1; f < RSTEPS; ++f) {   // step NCARD - 1 + f: chunk g-f+1 arrived finished from g-1: forward it
         rb_seg(T, (g + NCARD - f + 1) % NCARD, lo, len, s0, s1);
-        rb_wait(fl + (RSTEPS - 1 + f) * RB_BLOCKS + b, tag, r.err);
+        rb_wait(fl + (RSTEPS - 1 + f) * RB_BLOCKS + b, tag, r.err, r.timeout_ticks);
         for (int e = s0 + tid; e < s1; e += nt) {
             const int t = e / len, i = e % len;
             const unsigned w = *reinterpret_cast<const volatile unsigned*>(ag + (size_t) t * NP + lo + i);
@@ -1828,7 +1836,7 @@ __global__ void k_ring_big(Ring r, float* x, int T, const unsigned* tagp, int ca
     // the last chunk arrives (finished on two cards, forwarded on three: the previous card's last step); then
     // everything into x. Each block waits for its own segments: every block must see every chunk, so it waits on the
     // flags of the blocks that wrote them
-    rb_wait(fl + (RB_KINDS - 1) * RB_BLOCKS + b, tag, r.err);
+    rb_wait(fl + (RB_KINDS - 1) * RB_BLOCKS + b, tag, r.err, r.timeout_ticks);
     __syncthreads();
 }
 
@@ -2040,6 +2048,10 @@ __global__ void k_probe_guess(const float* logits, int T, int* guess) {
             const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
             if (ov > bv || (ov == bv && oi < bi)) bv = ov, bi = oi;
         }
+        if (bi == NEXP) {
+            // No ordered logit remains. Lane zero has more candidates than TOPK.
+            bi = 32 * __shfl_sync(0xffffffffu, __ffs(~taken) - 1, 0);
+        }
         if ((bi & 31) == lane) taken |= 1u << (bi >> 5);
         if (lane == 0) guess[t * TOPK + k] = bi;
     }
@@ -2140,7 +2152,7 @@ __global__ void k_arena_slots(ExpertCache ec, int from, int to) {
     }
     if (blockIdx.x == 0 && threadIdx.x == 0) {
         ec.lent[p] = to;
-        if (ec.hand[p] < s0 + to) ec.hand[p] = s0 + to;
+        if (!lend || ec.hand[p] < s0 + to) ec.hand[p] = s0 + to;
     }
 }
 }  // namespace
@@ -2442,7 +2454,7 @@ namespace fnx {
 #if FNX_KPART == 8
 void router_route(const float* W, const float* x, float* logits, int T, int* topi, float* topw, Job* jobs_gu, Job* jobs_dn,
                   int* njobs, void* st, const ExpertCache* ec, int layer, int* list, const Q8S* sh_gu, int sh_rows, const void* sh_y,
-                  float* sh_out, const uint16_t* packed) {
+                  float* sh_out, const uint16_t* packed, unsigned* errors) {
     cudaStream_t s = (cudaStream_t) st;
     ShexpUp su;
     if (sh_gu) {
@@ -2460,8 +2472,8 @@ void router_route(const float* W, const float* x, float* logits, int T, int* top
     const ExpertCache none{};
     if (ec && (layer < 0 || layer >= NL || !list)) throw std::runtime_error("router_route: a cache plan needs its layer and list");
 #define FNX_RR(t) do { \
-    if (packed) k_router_route<t, true><<<grid, RR_THREADS, 0, s>>>(packed, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su); \
-    else k_router_route<t, false><<<grid, RR_THREADS, 0, s>>>(W, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su); \
+    if (packed) k_router_route<t, true><<<grid, RR_THREADS, 0, s>>>(packed, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su, errors); \
+    else k_router_route<t, false><<<grid, RR_THREADS, 0, s>>>(W, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su, errors); \
 } while (0)
     switch (T) {
         case 1: FNX_RR(1); break;

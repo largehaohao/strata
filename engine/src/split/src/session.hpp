@@ -137,7 +137,6 @@ private:
     std::vector<int> prompt_;   // the prompt being answered (its last token not yet in the engine)
     GenStats* timing_ = nullptr;   // generate()'s stats while it runs
     bool is_eos(int t) const;
-    std::vector<int> lookup(const std::vector<int>& ctx, int d1) const;
 };
 
 }  // namespace fnx

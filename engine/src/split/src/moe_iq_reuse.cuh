@@ -150,7 +150,19 @@ __device__ __forceinline__ float iq_dot32(const IqDot32& w, const block_q8_1& x)
     return d * sum;
 }
 
-template <GgmlType TA, int TT, int G = 32, bool COPY = false>
+__device__ __forceinline__ void copy_down_experts(const CacheDownCopy& copy) {
+    // Blocks cooperate on one expert at a time. All offsets remain size_t but
+    // the hot copy loop no longer divides a flat offset by the expert size.
+    for (int j = 0; j < copy.list[0]; ++j) {
+        const int g = copy.list[j + 1];
+        auto* dst = reinterpret_cast<uint4*>(copy.pool + (size_t)(copy.slots[g] - copy.slot0) * copy.slot_bytes + copy.offset);
+        const auto* src = reinterpret_cast<const uint4*>(copy.host[g]);
+        for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < copy.bytes / 16; i += copy.blocks * blockDim.x)
+            dst[i] = src[i];
+    }
+}
+
+template <GgmlType TA, int TT, int G = 32, bool COPY = false, bool PACKED_SIGNS = false>
 __global__ void __launch_bounds__(MMVQ_THREADS) k_moe_gu_iq(
     MoeW w, const Job* __restrict__ jobs, const int* __restrict__ njobs,
     const block_q8_1* __restrict__ y, float* __restrict__ out, CacheDownCopy copy = {}) {
@@ -160,13 +172,7 @@ __global__ void __launch_bounds__(MMVQ_THREADS) k_moe_gu_iq(
         // already resident gate/up weights. No grid barrier: kernel completion
         // orders every copied down byte before the subsequent down launch.
         if ((int) blockIdx.x < copy.blocks) {
-            const size_t per = copy.bytes / 16;
-            for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
-                 i < (size_t) copy.list[0] * per; i += (size_t) copy.blocks * blockDim.x) {
-                const int g = copy.list[1 + i / per];
-                char* dst = copy.pool + (size_t) (copy.slots[g] - copy.slot0) * copy.slot_bytes + copy.offset;
-                reinterpret_cast<uint4*>(dst)[i % per] = reinterpret_cast<const uint4*>(copy.host[g])[i % per];
-            }
+            copy_down_experts(copy);
             return;
         }
         const int rows = (w.nrows + MMVQ_THREADS / G - 1) / (MMVQ_THREADS / G);
@@ -196,7 +202,7 @@ __global__ void __launch_bounds__(MMVQ_THREADS) k_moe_gu_iq(
             for (int p = 0; p < PARTS; ++p) {
 #pragma unroll 8
                 for (int kbx = (gl + p * G) / per_block; kbx < w.ncols / qk; kbx += 32 / per_block) {
-                    const IqDot32 decoded = iq_decode32<TA>(wr, kbx, kqs);
+                    const IqDot32 decoded = iq_decode32<TA, PACKED_SIGNS>(wr, kbx, kqs);
 #pragma unroll
                     for (int j = 0; j < TT; ++j)
                         if (j < jb.n) tmp[p][j] += iq_dot32<TA>(decoded, y[(size_t) jb.y[j] * (w.ncols / 32) + kbx * (qk / 32) + kqs / 2]);

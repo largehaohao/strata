@@ -1774,8 +1774,8 @@ void card_fields(CardW& c, F f) {
 }
 #if !FNX_27B   // the 27B has no holder (plain loads only)
 // ExpertCache is rebuilt by placement, after load_card; its optional static-cache
-// ages are allocated by the engine and add no holder-image weight fields.
-static_assert(sizeof(CardW) == 912, "CardW changed: put what load_card stores in card_fields, then update this size");
+// ages and per-layer miss bitmap are allocated by the engine and add no holder-image weight fields.
+static_assert(sizeof(CardW) == 920, "CardW changed: put what load_card stores in card_fields, then update this size");
 #endif
 // every address load_card stores, in a card and in a layer: a worker moves them to where it mapped the holder's memory
 template <typename F>

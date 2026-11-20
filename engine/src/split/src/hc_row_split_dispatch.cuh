@@ -18,12 +18,13 @@ void hc_row_split_prepare(int card, bool peer, int lanes, unsigned* errors) {
     hipDeviceProp_t prop{}; ckc(hipGetDeviceProperties(&prop, dev), "HC split properties");
     if (std::string(prop.gcnArchName).find("gfx1100") != 0)
         throw std::runtime_error("HC row split requires gfx1100");
+    if (!strata_pf_padded_gemm_available() || std::getenv("FNX_PF_HC_CHECK"))
+        throw std::runtime_error("HC row split requires native gfx11 GEMM and FNX_PF_HC_CHECK unset");
     if (hcs_states[card].mail.data) throw std::runtime_error("HC split already allocated");
     HcsMail m{};
     m.capacity_words = 2048 * LR / 2;
     m.capacity_blocks = (m.capacity_words + HCS_WORDS_PER_BLOCK - 1) / HCS_WORDS_PER_BLOCK;
-    int khz = 0; ckc(hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, dev), "HC split clock");
-    m.timeout_ticks = (unsigned long long)khz * 1000;
+    m.timeout_ticks = ring_wait_ticks(dev);
     m.errors = errors;
     auto fine = [](size_t bytes) -> unsigned* {
         void* data = nullptr;
@@ -34,8 +35,8 @@ void hc_row_split_prepare(int card, bool peer, int lanes, unsigned* errors) {
     m.ready = fine((size_t)2 * m.capacity_blocks * sizeof(unsigned));
     ckc(cudaMalloc(reinterpret_cast<void**>(&m.generation), sizeof(unsigned)), "HC split generation");
     own_dev(m.generation); ckc(cudaMemset(m.generation, 0, sizeof(unsigned)), "HC split generation clear");
-    hcs_states[card] = {dev, m};
     own([card] { hcs_states[card] = {}; });
+    hcs_states[card] = {dev, m};
     std::fprintf(stderr, "fnx: HC row split card %d: %zu KiB, main-model chunks 3072..4096\n", card,
         ((size_t)2 * (m.capacity_words + m.capacity_blocks) * sizeof(unsigned) + sizeof(unsigned)) >> 10);
 }

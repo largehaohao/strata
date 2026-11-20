@@ -407,9 +407,13 @@ def btrace(*a):
 # The engine's own words for a verifier that cannot go on (its GPU waits were released, or an earlier window never
 # finished, #267; a GPU wait on the host ran out and the window was discarded, #5160 - the Intel engine ends after it):
 # the process may stay alive and even print DONE, but it must not take another request.
-FATAL_PREFIXES = ("ERR verify: timed out at layer ", "ERR verify batch: timed out at layer ",
+# Split prefill also exits on a stalled pass, stream failure or failed collective. Admission errors are recoverable.
+FATAL_PREFIXES = ("ERR FATAL: ", "ERR window: ", "ERR draft: ", "ERR step: ", "ERR verify_rows: ",
+                  "ERR draft_lanes: ", "ERR prefill: ring error ", "ERR top_tokens: ",
+                  "ERR verify: timed out at layer ", "ERR verify batch: timed out at layer ",
                   "ERR verify: an earlier window never finished", "ERR verify batch: an earlier window never finished",
-                  "ERR verify: the GPU stopped waiting")
+                  "ERR verify: the GPU stopped waiting", "ERR prefill: a pass did not finish in ",
+                  "ERR prefill sync: ", "ERR prefill: ncclGroupStart: ", "ERR prefill: ncclGroupEnd: ")
 
 
 def parse_engine_stage_line(line: str) -> list[dict] | None:

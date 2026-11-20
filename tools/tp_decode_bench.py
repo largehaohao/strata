@@ -18,7 +18,7 @@ import threading
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "terminal"))
 from tools.strata_tokenizer import Tokenizer
 
 CASES = {
@@ -62,7 +62,7 @@ def source_info():
     def git(*args):
         return subprocess.check_output(['git', '-C', str(ROOT), *args])
     try:
-        new_files = git('ls-files', '--others', '--exclude-standard', 'src/split',
+        new_files = git('ls-files', '--others', '--exclude-standard', 'engine/src/split',
                         'tools/tp_decode_bench.py').decode().splitlines()
         return {'head': git('rev-parse', 'HEAD').decode().strip(),
                 'diff_sha256': sha(git('diff', 'HEAD', '--binary')),

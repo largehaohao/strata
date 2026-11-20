@@ -26,9 +26,9 @@ inline PrefillScratchPlan plan_prefill_scratch(int base, int cap, int needed_pag
         if (n > (size_t)(cap - base)) return {};
         count = std::max(count, n);
     }
-    const int first = cap - (int) count;
-    if (first < std::max({base, needed_pages, used_top})) return {};
-    return {first, cap};
+    const int first = std::max({base, needed_pages, used_top});
+    if (first > cap - (int)count) return {};
+    return {first, first + (int)count};
 }
 
 // All IDs must be free before any are removed. The Engine keeps this list in

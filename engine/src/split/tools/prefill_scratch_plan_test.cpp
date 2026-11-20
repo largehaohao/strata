@@ -14,8 +14,8 @@ int main() {
             for (size_t bytes:{size_t(1),size_t(255),size_t(256),size_t(257),size_t(1024),size_t(4097)}) {
                 const std::array<size_t,2> page_bytes{256,512};
                 const auto plan=fnx::plan_prefill_scratch(base,cap,need,used,bytes,page_bytes);
-                if (!plan) {++checked;continue;}
-                assert(plan.begin>=base && plan.end==cap);
+                if (!plan) {assert(std::max({base, need, used}) + (int)((bytes + 255) / 256) > cap); ++checked;continue;}
+                assert(plan.begin == std::max({base, need, used}) && plan.end <= cap);
                 for (size_t page:page_bytes) assert((size_t)plan.pages()*page>=bytes);
                 std::vector<int> free;
                 for(int pg=cap;pg-- >used;)free.push_back(pg);

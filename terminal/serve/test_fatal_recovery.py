@@ -24,6 +24,8 @@ for line in sys.stdin:
   if not state.exists():
    state.write_text('first request was attempted')
    if mode=='invalid':print('ERR prompt exceeds context',flush=True)
+   elif mode=='prefill':print("ERR prefill: a pass did not finish in 120 s (a ring step's flag never came?)",flush=True);sys.exit(1)
+   elif mode=='unknown-fatal':print("ERR FATAL: copy: simulated runtime failure",flush=True);sys.exit(1)
    elif mode=='expired':print("ERR verify: the GPU stopped waiting for the CPU experts' rows (flag M) of layer 17 (group 0, window 3 at position 4100, 1 tokens, device 0 layers [0,48)): the CPU took 412 ms, longer than the GPU's wait of 200 reads; the window was discarded",flush=True);print('DONE 0 1 0 1 error',flush=True)
    else:
     kind='verify batch' if mode=='batch' else 'verify'
@@ -116,19 +118,29 @@ class FatalRecovery(unittest.TestCase):
         self.feed(e,["ERR verify: the GPU stopped waiting for the CPU experts' rows (flag M) of layer 17 (group 0, window 3 at position 4100, 1 tokens, device 0 layers [0,48)): the CPU took 412 ms, longer than the GPU's wait of 200 reads; the window was discarded\n",'BDONE 0 1 0 1 error\n'],2)
         self.assertTrue(all(q.get_nowait() is None and q.empty() for q in e.slot_q))
     def test_wait_expired_http_is_the_503_restart(self):
-        old=self.engine('expired');svc=self.service(old);http=serve(svc,port=0)
+        self.check_http_restart('expired')
+    def test_split_prefill_timeout_http_restarts_on_the_next_request(self):
+        self.check_http_restart('prefill')
+    def test_split_fatal_marker_restarts_for_any_diagnostic(self):
+        self.check_http_restart('unknown-fatal')
+    def test_anthropic_split_fatal_marker_returns_service_unavailable(self):
+        self.check_http_restart('unknown-fatal', anthropic=True)
+    def check_http_restart(self,mode,anthropic=False):
+        old=self.engine(mode);svc=self.service(old);http=serve(svc,port=0)
         base=f'http://127.0.0.1:{http.server_address[1]}'
         body={'messages':[{'role':'user','content':'hi'}],'max_tokens':8,
               'chat_template_kwargs':{'enable_thinking':False},'stream':False}
         def post():
-            req=urllib.request.Request(base+'/v1/chat/completions',data=json.dumps(body).encode(),headers={'Content-Type':'application/json'})
+            endpoint='/v1/messages' if anthropic else '/v1/chat/completions'
+            if anthropic: body.update(model='strata',thinking={'type':'disabled'})
+            req=urllib.request.Request(base+endpoint,data=json.dumps(body).encode(),headers={'Content-Type':'application/json'})
             with urllib.request.urlopen(req,timeout=5) as r:return r.status,json.loads(r.read().decode())
         try:
             with self.assertRaises(urllib.error.HTTPError) as cm:post()
             self.assertEqual(cm.exception.code,503)
             self.assertIn('the next request restarts it',cm.exception.read().decode())
             status,reply=post()
-            self.assertEqual(status,200);self.assertEqual(reply['usage']['completion_tokens'],1)
+            self.assertEqual(status,200);self.assertEqual(reply['usage']['output_tokens' if anthropic else 'completion_tokens'],1)
         finally:
             http.shutdown();http.server_close();svc.engine.close()
     def test_generate_batched_refuses_a_dead_engine(self):

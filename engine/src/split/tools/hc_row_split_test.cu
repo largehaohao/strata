@@ -144,7 +144,7 @@ void negative_checks() {
     int checks = 0;
     for (int dev = 0; dev < 2; ++dev) {
         State state(dev);
-        // The production limit remains one second. Use 20 ms for negative
+        // Use 20 ms for negative
         // fixtures so all missing/stale-mailbox cases finish promptly.
         state.mail.timeout_ticks /= 50;
         for (int kind = 0; kind < 3; ++kind) {
@@ -154,7 +154,7 @@ void negative_checks() {
                 ck(cudaMemcpy(state.mail.ready, stale.data(), stale.size() * 4, cudaMemcpyHostToDevice), "stale flags");
             }
             if (kind == 2) {
-                const unsigned error = 1;
+                const unsigned error = 2;
                 ck(cudaMemcpy(state.mail.errors, &error, 4, cudaMemcpyHostToDevice), "existing error");
             }
             const auto start = std::chrono::steady_clock::now();
@@ -164,7 +164,7 @@ void negative_checks() {
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
             unsigned error = 0;
             ck(cudaMemcpy(&error, state.mail.errors, 4, cudaMemcpyDeviceToHost), "negative error");
-            if (error != 1 || ms > 3000) throw std::runtime_error("unbounded or unreported mailbox failure");
+            if (error != (kind == 2 ? 2u : 256u) || ms > 3000) throw std::runtime_error("unbounded or unreported mailbox failure");
             ck(cudaMemset(state.mail.errors, 0, 4), "clear checked error");
             const auto got = state.snapshot(false);
             if (std::any_of(got.begin(), got.end(), [](uint16_t v) { return v != 0xa5a5u; }))

@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "kernels.hpp"
+#include "draft_sample_packet.hpp"
 #include "model.hpp"
 #include "owned.hpp"
 
@@ -95,6 +96,10 @@ struct CardBuf {
     };
     std::vector<GraphSlot> win_graphs = std::vector<GraphSlot>(MAXT + 1), mtp_graphs = std::vector<GraphSlot>(MAXT + 1),
                            batch_graphs = std::vector<GraphSlot>(MAXT + 1);
+    // Captured only when lookup-first needs K/V catch-up. Keep these separate so a lookup miss can reuse the full head graph.
+    std::vector<GraphSlot> win_external_graphs = std::vector<GraphSlot>(MAXT + 1);
+    std::vector<GraphSlot> mtp_fast_graphs = std::vector<GraphSlot>(MAXT + 1);
+    std::vector<GraphSlot> mtp_catchup_graphs = std::vector<GraphSlot>(MAXT + 1);
     // FNX_PRECAP: batched-window graphs that were not evicted by a window of another layout. batch_graphs[T] stays the graph the next
     // window of T rows launches (and the tables enqueue_rows reads); a layout change puts the slot's graph and its tables here, and a
     // window of a layout held here swaps it back. Entries are the same on every card (same index = same layout)
@@ -144,6 +149,8 @@ struct CardBuf {
     float* mtp_tk_v = nullptr;     // the last row's TOPK_N candidates (draft(cands)); mtp_zero: no penalties for top_tokens
     int *mtp_tk_i = nullptr, *mtp_zero = nullptr;
     unsigned* mtp_tk_err = nullptr;
+    DraftSamplePacket* mtp_sample_packet = nullptr;
+    DraftSampleInput* mtp_sample_input = nullptr;
     CopyJob* commit_jobs = nullptr;   // commit()'s copies (copy_many)
     // recorded after each upload of commit()'s (commit_rows()'s) table from its one page-locked host copy: the next
     // commit waits on it before writing that copy again
@@ -186,6 +193,10 @@ inline const float* draft_src(const CardBuf& b, bool from_main) { return from_ma
 constexpr bool MTP_HEAD_EVERY_ROW = true;
 inline unsigned* err_word(CardBuf& b) { return b.ring.err; }
 inline const char* window_error(unsigned err, bool draft) {
+    if (err & 32u) return "the router has too few valid expert logits";
+    if (err & 64u) return "invalid QSA exchange payload";
+    if (err & 128u) return "QSA query exchange timed out";
+    if (err & 256u) return "HC row exchange timed out";
     if (err & 1u) return "a ring sum timed out";
     if (err & 2u) return "a ring sum met a NaN or inf (or, on the fp16 ring, a value past its range)";
     if (err & 4u) return "an hc read's grid barrier timed out";

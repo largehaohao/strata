@@ -6,6 +6,12 @@
 
 #include <cublas_v2.h>
 #include <cuda.h>
+#include "ring_wait.cuh"
+#if !FNX_HIP
+inline CUresult fnx_stream_wait(CUstream s, CUdeviceptr p, unsigned v, unsigned*, unsigned long long) {
+    return cuStreamWaitValue32(s, p, v, CU_STREAM_WAIT_VALUE_GEQ);
+}
+#endif
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -177,12 +183,11 @@ static __global__ void k_pfa_push(const float4* __restrict__ x, int n4, float4* 
     }
 }
 static __global__ void k_pfa_sum(float* __restrict__ x, int C, const float4* __restrict__ box, const unsigned* __restrict__ flag, int g, unsigned seq, size_t set_off4,
-                                 size_t slot4, unsigned* err) {
+                                 size_t slot4, unsigned* err, unsigned long long limit) {
     if (threadIdx.x < NCARD && (int) threadIdx.x != g) {
-        const long long t0 = clock64();
+        const auto t0 = ring_clock();
         while ((int) (*(volatile const unsigned*) (flag + threadIdx.x) - seq) < 0) {
-            __builtin_amdgcn_s_sleep(1);
-            if (clock64() - t0 > 4000000000LL) { atomicOr(err, 1u); break; }
+            if (ring_expired(t0, limit)) { atomicOr(err, 1u); break; }
         }
     }
     __syncthreads();
@@ -259,7 +264,7 @@ static __global__ void k_pfr_out_chk(const __half2* __restrict__ ag, float2* __r
 // gather half of the ring is skipped: no PASS, no gather flags, and OUT converts only the finished part into x. The part's values are the
 // ones the full OUT would give.
 template <typename Ring>
-inline void pf_ring_run(const Ring& r, int dev, int g, float* x, int C, unsigned seq, unsigned* err, cudaStream_t s, bool own_out = false) {
+inline void pf_ring_run(const Ring& r, int dev, int g, float* x, int C, unsigned seq, unsigned* err, cudaStream_t s, bool own_out = false, unsigned long long limit = 4000000000ULL) {
     if (r.plan.empty() || r.plan.front().part != g) throw std::runtime_error("prefill: the ring's plan is not card " + std::to_string(g) + "'s");
     const int set = (int) (seq & 1u), fin_part = (g + 1) % NCARD;   // the part this card finishes (pf_ring_plan)
     __half* const own_ag = r.dma ? r.dag[set] : r.ag[set];             // where this card's gathered rows are (device with DMA, host without)
@@ -270,7 +275,7 @@ inline void pf_ring_run(const Ring& r, int dev, int g, float* x, int C, unsigned
         cud(cuStreamWriteValue32(cs, (CUdeviceptr) (r.nflags + set * PF_RING_STEPS + step), seq, 0), "ring flag");
     };
     auto wait = [&](int step) {
-        cud(cuStreamWaitValue32(cs, (CUdeviceptr) (r.flags + set * PF_RING_STEPS + step), seq, CU_STREAM_WAIT_VALUE_GEQ), "ring wait");
+        cud(fnx_stream_wait(cs, (CUdeviceptr) (r.flags + set * PF_RING_STEPS + step), seq, err, limit), "ring wait");
     };
     auto copy = [&](__half* dst, const __half* src, int nrows) {
         if (r.send_kernel) {   // FNX_PF_SEND=kernel: the sender's device -> host copy by a kernel (its stores are done when the kernel is)
@@ -376,7 +381,7 @@ inline void pf_ring_run(const Ring& r, int dev, int g, float* x, int C, unsigned
                 break;
             case PfRingOp::WAITA:
                 for (int j = 0; j < NCARD - 1; ++j)
-                    cud(cuStreamWaitValue32(cs, (CUdeviceptr) (r.flags + set * PF_RING_STEPS + NCARD - 1 + j), seq, CU_STREAM_WAIT_VALUE_GEQ), "gather wait");
+                    cud(fnx_stream_wait(cs, (CUdeviceptr) (r.flags + set * PF_RING_STEPS + NCARD - 1 + j), seq, err, limit), "gather wait");
                 break;
             case PfRingOp::SIGNAL: signal(o.step); break;
             case PfRingOp::WAIT: wait(o.step); break;

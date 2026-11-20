@@ -235,7 +235,7 @@ void qsa_select_lanes(const float* q, const uint16_t* pooled, const KvPages& g, 
                       const LaneRows& lr, int T, int card, void* st);
 void qsa(const uint16_t* wq, const uint16_t* wk, const float* x, float* y, const float* qn, const float* kn, uint16_t* ring,
          uint16_t* pooled, const KvPages& g, float* q, float* scores, int* cells, int* n_cells, int max_pools, const int* pos0, int T, float eps,
-         Rope base, int card, void* st);
+         Rope base, int card, void* st, bool select = true);
 // the merge of the cards' attention partials: this card's receive slots ([2 sets][NCARD - 1 steps][ATT_ROWS][ATT_OWN heads][HD + 2] fp32
 // words) and the next card's
 struct AttRing {
@@ -245,6 +245,7 @@ struct AttRing {
     void* peer_in[NCARD] = {};   // every card's `in` (the one-hop merge pushes each owner its partials: set when the engine links the cards)
     bool onehop = false;         // NCARD > 2: the partials go to their owners in one hop instead of NCARD - 1
     unsigned* err = nullptr;
+    unsigned long long timeout_ticks = 4000000000ULL;
 };
 size_t att_ring_words();
 int attn_rows();   // the most rows one attn call takes
@@ -302,7 +303,7 @@ void ple_post(float* R, const float* key, const float* value, const float* nk, c
 // sh_gu (rows sh_rows < 4096): the shared expert's gate|up over the q8_1 rows sh_y into sh_out, in the same launch
 void router_route(const float* W, const float* x, float* logits, int T, int* topi, float* topw, Job* jobs_gu, Job* jobs_dn,
                   int* njobs, void* st, const ExpertCache* ec = nullptr, int layer = -1, int* list = nullptr, const Q8S* sh_gu = nullptr,
-                  int sh_rows = 0, const void* sh_y = nullptr, float* sh_out = nullptr, const uint16_t* packed = nullptr);
+                  int sh_rows = 0, const void* sh_y = nullptr, float* sh_out = nullptr, const uint16_t* packed = nullptr, unsigned* errors = nullptr);
 // Down weights to fill beside IQ gate/up arithmetic. The preceding cache plan
 // must complete first; GU is already resident or filled by CacheGateUpCopy below.
 // The list/slots stay fixed until this launch finishes. Bytes and offsets are
@@ -323,6 +324,7 @@ struct CacheGateUpCopy {
     const char* const* host = nullptr;
     const int* list = nullptr;
     int layer = -1;
+    const unsigned* miss_bits = nullptr;
 };
 // gu rows of 2*ffs: [gate | up] (A: per-expert stacked rows, stride sa). sh_down (Q4_K experts only): the shared
 // expert's swiglu of sh_gu ([T][2 * sh_ffs]) and down (N rows) into sh_out (row stride N), in the same launch
@@ -387,6 +389,7 @@ struct Ring {
     // a ring for chunk-sized sums (plain fp16 words and a flag per block and hop): this card's flags and the next's
     unsigned* flags = nullptr;
     unsigned* next_flags = nullptr;
+    unsigned long long timeout_ticks = 4000000000ULL;
 };
 size_t ring_flag_words();
 // the ring's buffers for a capacity of `rows` rows (fp32 words): words of in, of ag

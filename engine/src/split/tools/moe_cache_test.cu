@@ -88,6 +88,7 @@ void run_cache(int dev, int slots, int pattern, bool coherent, int groups = 1, b
         char* pool = (char*) alloc(prefix + ec.n[p] * ec.slot_bytes[p] + 2 * guard);
         pools.push_back(pool); ec.pool[p] = pool + guard + prefix;
     }
+    ec.miss_bits = (unsigned*) alloc(NEXP / 32 * sizeof(unsigned));
     int* list = (int*) alloc((capacity + 1) * sizeof(int));
     Job* jobs = (Job*) alloc(capacity * sizeof(Job));
     int* count = (int*) alloc(sizeof(int));
@@ -143,6 +144,7 @@ void run_cache(int dev, int slots, int pattern, bool coherent, int groups = 1, b
             ck(cudaMemsetAsync(ec.pool[pool],0x6b,(size_t)take*ec.slot_bytes[pool],stream),"overwrite residual scratch");
             // Return also models cancellation after a partly completed read.
             arena_slots(residual,take,0,stream);
+            oracle_hand[pool] = first;
             ck(cudaMemcpyAsync(during.data(),ec.lent,EC_POOLS*sizeof(int),cudaMemcpyDeviceToHost,stream),"residual return ownership");
             ck(cudaStreamSynchronize(stream),"residual return");
             if(during[ec.arena_pool]!=lent || during[pool]!=0) throw std::runtime_error("residual return changed KV ownership");
@@ -156,7 +158,7 @@ void run_cache(int dev, int slots, int pattern, bool coherent, int groups = 1, b
                 if (old >= 0) oracle_slot[old] = -1;
                 oracle_owner[slot] = -1; oracle_ref[slot] = next > lent ? 3 : 0; oracle_age[slot] = 0;
             }
-            if (oracle_hand[p] < s0 + next) oracle_hand[p] = s0 + next;
+            if (next < lent || oracle_hand[p] < s0 + next) oracle_hand[p] = s0 + next;
             arena_slots(ec, lent, next, stream);
             lent = next;
             // K/V may overwrite every byte of a lent slot. Neither direct launches
@@ -176,6 +178,7 @@ void run_cache(int dev, int slots, int pattern, bool coherent, int groups = 1, b
         // Sequential CLOCK oracle: same hit pinning and job-order insertion as the GPU warp.
         const int cp = ec.pool_of[layer], start = ec.s0[cp] + (cp == ec.arena_pool ? lent : 0);
         const int size = ec.n[cp] - (cp == ec.arena_pool ? lent : 0);
+        std::vector<unsigned> miss_bits(NEXP / 32), got_bits(miss_bits.size());
         int hand = oracle_hand[cp] - start;
         if (hand < 0 || hand >= size) hand = 0;
         for (int j = 0; j < n; ++j) {
@@ -185,6 +188,7 @@ void run_cache(int dev, int slots, int pattern, bool coherent, int groups = 1, b
         for (int j = 0; j < n; ++j) {
             const int expert = layer * NEXP + js[j].w;
             if (oracle_slot[expert] != -1) continue;
+            miss_bits[js[j].w / 32] |= 1u << (js[j].w % 32);
             int slot;
             for (;;) {
                 slot = start + hand; hand = (hand + 1) % size;
@@ -224,6 +228,8 @@ void run_cache(int dev, int slots, int pattern, bool coherent, int groups = 1, b
             if (!std::all_of(borrowed.begin(), borrowed.end(), [](unsigned char b) { return b == 0xC7; }))
                 throw std::runtime_error("cache wrote a lent K/V slot");
         }
+        ck(cudaMemcpy(got_bits.data(), ec.miss_bits, got_bits.size() * sizeof(unsigned), cudaMemcpyDeviceToHost), "read miss bitmap");
+        if (got_bits != miss_bits) throw std::runtime_error("miss bitmap differs from sequential oracle");
         ck(cudaMemcpy(now.data(), ec.slot_of, experts * sizeof(int), cudaMemcpyDeviceToHost), "read places");
         ck(cudaMemcpy(owner.data(), ec.owner, slots * sizeof(int), cudaMemcpyDeviceToHost), "read owners");
         ck(cudaMemcpy(got_ref.data(), ec.ref, slots, cudaMemcpyDeviceToHost), "read refs");

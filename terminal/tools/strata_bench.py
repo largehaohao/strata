@@ -68,6 +68,12 @@ AGENT_MIN_CONTEXT = 10240      # the last turn of the session holds about 10K to
 BURST_MAX_TOKENS = 128
 
 
+def checkout_root() -> Path:
+    if ROOT.name == "terminal" and (ROOT.parent / "docs" / "AI_REFERENCE.md").is_file():
+        return ROOT.parent
+    return ROOT
+
+
 # --------------------------------------------------------------------------------------------------------- redaction
 def usable_key(value) -> str:
     """An API key as a client may send it: "" for nothing, blanks, or "none" in any case (the server's word for no key, #4483)."""
@@ -318,16 +324,17 @@ class Suite:
     def agent_files(self) -> list[tuple[str, str]]:
         """Five pieces of text a coding agent would read: this folder's own documents when they exist (nothing personal),
         else generated filler of the same size."""
+        checkout = checkout_root()
         names = []
         for rel in ("README.md", "docs/HOW_IT_WORKS.md", "docs/DETAILS.md", "docs/INSTALL.md", "docs/MODELS.md", "docs/COMMUNITY_BENCHMARKS.md"):
-            p = ROOT / rel
+            p = checkout / rel
             if p.is_file():
                 words = p.read_text(encoding="utf-8", errors="replace").split()
                 if len(words) >= AGENT_WORDS // 2:
                     names.append((rel, " ".join(words[:AGENT_WORDS])))
         i = 0
         while len(names) < AGENT_TURNS:
-            names.append((f"generated/part{i}.txt", long_prompt(AGENT_WORDS)))
+            names.append((f"generated/part{i}.txt", long_prompt(AGENT_WORDS, seed=7 + i)))
             i += 1
         return names[:AGENT_TURNS]
 
@@ -658,9 +665,10 @@ def project_version() -> str | None:
 
 
 def git_commit() -> str | None:
-    if not (ROOT / ".git").exists():
+    checkout = checkout_root()
+    if not (checkout / ".git").exists():
         return None
-    out = run_cmd(["git", "-C", str(ROOT), "rev-parse", "--short=8", "HEAD"]).strip()
+    out = run_cmd(["git", "-C", str(checkout), "rev-parse", "--short=8", "HEAD"]).strip()
     return out or None
 
 
@@ -745,9 +753,12 @@ def collect_machine(base: str, key: str, cfg: dict | None, gpu_arg: str | None =
 
 
 # --------------------------------------------------------------------------------------------------- the server
-def find_configs(folder: Path = ROOT) -> list[Path]:
+def find_configs(folder: Path | None = None) -> list[Path]:
+    candidates = list((folder or ROOT).glob("strata-*.json"))
+    if folder is None and checkout_root() != ROOT:
+        candidates.extend(checkout_root().glob("strata-*.json"))
     out = []
-    for p in folder.glob("strata-*.json"):
+    for p in candidates:
         if p.name.endswith(".shared-settings.json"):
             continue
         try:
@@ -1059,7 +1070,7 @@ def main(argv=None) -> int:
         if a.config:
             cfg_path = Path(a.config)
             if not cfg_path.is_absolute() and not cfg_path.exists():
-                cfg_path = ROOT / a.config
+                cfg_path = checkout_root() / a.config
         else:
             found = find_configs()
             if found:

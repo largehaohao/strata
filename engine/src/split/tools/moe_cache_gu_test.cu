@@ -43,7 +43,8 @@ template <GgmlType TA> int run(int dev,int rows,bool coherent) {
     for(int e=0;e<experts;++e){hep[e]=pool+guard+((e*5)%experts)*slot_stride;hht[base+e]=host+e*host_stride;}
     ck(cudaMemcpy(ep,hep.data(),hep.size()*sizeof(char*),cudaMemcpyHostToDevice),"expert pointers");
     ck(cudaMemcpy(ht,hht.data(),hht.size()*sizeof(char*),cudaMemcpyHostToDevice),"host pointers");
-    MoeW w{nullptr,raw_bytes,row_bytes,rows,cols,ep};CacheGateUpCopy cache{ht,list,3};
+    MoeW w{nullptr,raw_bytes,row_bytes,rows,cols,ep};auto* bits = (unsigned*)alloc((experts + 31) / 32 * sizeof(unsigned));
+    CacheGateUpCopy cache{ht,list,3,coherent ? bits : nullptr};
     const size_t dn_bytes=TA==T_IQ3_XXS&&rows==640&&!coherent?460800:4112;
     const size_t dn_stride=dn_bytes+256,dn_pool_bytes=experts*dn_stride+guard*2;
     char* dn_host=nullptr;ck(hipHostMalloc((void**)&dn_host,experts*dn_bytes,coherent?hipHostMallocCoherent:hipHostMallocNonCoherent),"down host");
@@ -78,6 +79,9 @@ template <GgmlType TA> int run(int dev,int rows,bool coherent) {
         expected=initial;hl[0]=std::min(nj,misses);
         std::fill(dn_expected.begin(),dn_expected.end(),0xCD);
         for(size_t i=0;i<experts*dn_bytes;++i)dn_host[i]=(i*19+i/31+seed*7)&255;
+        std::vector<unsigned> bitmap((experts + 31) / 32);
+        for (int j = 0; j < hl[0]; ++j) bitmap[hj[j].w / 32] |= 1u << (hj[j].w % 32);
+        ck(cudaMemcpy(bits, bitmap.data(), bitmap.size() * sizeof(unsigned), cudaMemcpyHostToDevice), "miss bitmap");
         for(int j=0;j<hl[0];++j){const int e=hj[j].w;std::memcpy(dn_expected.data()+guard+((e*5)%experts)*dn_stride+128,dn_host+e*dn_bytes,dn_bytes);}
         for(int j=0;j<hl[0];++j){const int e=hj[j].w;hl[1+j]=base+e;std::memset(initial.data()+guard+((e*5)%experts)*slot_stride,0xA5,raw_bytes);}
         for(size_t i=0;i<hx.size();++i){int sum=0;for(int k=0;k<32;++k)sum+=hx[i].qs[k]=seed==0?0:(int)((i*7+k*11+seed*13)%255)-127;hx[i].ds=make_half2(__float2half(.02f),__float2half(sum*.02f));}

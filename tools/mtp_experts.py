@@ -30,7 +30,7 @@ def main():
     ap.add_argument('--src', type=Path, required=True)
     ap.add_argument('--out', type=Path, required=True)
     args = ap.parse_args()
-    sys.path.insert(0, str(args.repo.resolve() / 'tools'))
+    sys.path.insert(0, str(args.repo.resolve() / 'terminal' / 'tools'))
     from mtp_pack import q4_0, gguf
 
     src = args.src.resolve()
@@ -99,7 +99,7 @@ def main():
     report = {'format': 'Q4_0', 'layout': 'gate, up, down; expert-major row-major blocks',
               'source_manifest_sha256': digest(src / 'mtp-manifest.json'), 'inputs': inputs,
               'output_bytes': count, 'output_sha256': h.hexdigest(),
-              'quantizer': 'tools/mtp_pack.py:q4_0', 'quantizer_source_sha256': digest(args.repo / 'tools/mtp_pack.py'),
+              'quantizer': 'terminal/tools/mtp_pack.py:q4_0', 'quantizer_source_sha256': digest(args.repo / 'terminal/tools/mtp_pack.py'),
               'reference_blocks_checked': checks, 'elapsed_s': time.monotonic() - start,
               'runtime_files': {name: {'sha256': digest(src / 'rt' / name)}
                                 for name in ('dense.bin', 'dense.txt', 'draft_vocab.bin')}}

@@ -231,6 +231,20 @@ class RedactionTests(unittest.TestCase):
 
 
 class ReportTests(unittest.TestCase):
+    def test_source_checkout_finds_parent_and_terminal_profiles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = Path(tmp)
+            terminal = checkout / "terminal"
+            terminal.mkdir()
+            (checkout / "docs").mkdir()
+            (checkout / "docs" / "AI_REFERENCE.md").touch()
+            profiles = [d / "strata-config.json" for d in (checkout, terminal)]
+            for profile in profiles:
+                profile.write_text(json.dumps({"exe": "engine", "args": []}), encoding="utf-8")
+            with mock.patch.object(B, "ROOT", terminal):
+                self.assertCountEqual(B.find_configs(), profiles)
+                self.assertEqual(B.find_configs(terminal), [profiles[1]])
+
     def setUp(self):
         p = mock.patch.object(B, "gpu_info_local", return_value={"gpus": []})     # the server's own GPU name, not this PC's
         p.start()

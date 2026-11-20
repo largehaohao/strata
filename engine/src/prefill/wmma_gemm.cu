@@ -932,7 +932,7 @@ __global__ void __launch_bounds__(512) kernel_hcup_q8_register(const _Float16* _
     for (int i = tid; i < 4 * COLS * (RANK / 16); i += 512) {
         const int row = i / (RANK / 16), k = i % (RANK / 16) * 16;
         const size_t at = (size_t) (row / COLS * WIDTH + d0 + row % COLS) * RANK + k;
-        const h16 value = gsu_weight_fragment<true, false>(Q, scales, at);
+        const h16 value = gsu_weight_fragment<true, true>(Q, scales, at);
         __builtin_memcpy(&weights[row][k], &value, sizeof(value));
     }
     __syncthreads();
@@ -1226,7 +1226,7 @@ __global__ void __launch_bounds__(128) kernel_q8_k320(const _Float16* x, const i
     const int m0 = blockIdx.y * TileRows, n = blockIdx.x * 64 + wave * 16 + (lane & 15);
     f8 acc[TileRows / 16]{};
     for (int k = 0; k < 320; k += 16) {
-        const h16 weight = gsu_weight_fragment<true, false>(q, scales, (size_t) n * 320 + k);
+        const h16 weight = gsu_weight_fragment<true, true>(q, scales, (size_t) n * 320 + k);
 #pragma unroll
         for (int i = 0; i < TileRows / 16; ++i) {
             const int m = min(m0 + i * 16 + (lane & 15), rows - 1);
