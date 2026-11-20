@@ -265,6 +265,10 @@ inline std::shared_ptr<TopKPartsScratch> topk_parts_scratch(cudaStream_t stream,
     });
     return scratch;
 }
+inline void topk_parts_prepare(void* stream) {
+    const int parts = std::max(topk_parts_mode(), draft_topk_parts());
+    if (parts) (void) topk_parts_scratch((cudaStream_t) stream, parts);
+}
 inline bool topk_parts(float* logits, int n, int T, int v0, const int* pen_tok, const int* pen_cnt,
     const int* pen_n, int pen_stride, const float* pen_par, float* out_v, int* out_i, unsigned* err, void* stream, bool draft = false) {
     const int parts = draft ? draft_topk_parts() : topk_parts_mode();
@@ -286,6 +290,7 @@ inline bool topk_parts(float* logits, int n, int T, int v0, const int* pen_tok, 
 
 #else
 namespace {
+inline void topk_parts_prepare(void*) {}
 inline bool topk_parts(float*, int, int, int, const int*, const int*, const int*, int, const float*, float*, int*, unsigned*, void*, bool = false) {
     (void)draft_topk_parts();
     return false;

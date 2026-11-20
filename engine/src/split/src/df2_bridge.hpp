@@ -45,9 +45,18 @@ public:
     void* stream(int lane) const;
     // the committed rows' taps (device, [n][kTaps * kNEmbd]) for positions pos0 ... into lane's ring; waits
     bool context(int lane, const float* taps_dev, int64_t n, int64_t pos0, std::string& err);
+    struct SampleSpec {
+        bool enabled = false;
+        float temp = 1.0f, top_p = 1.0f, min_p = 0.0f;
+        int top_k = 0;
+        float u[kDrafts] = {};
+    };
     // one round: rows 0..n_new-1 of landing(lane) are the committed rows at pos0 ..., anchor the last committed token (at pos0 + n_new)
-    bool launch(int lane, int n_new, int64_t pos0, int anchor, std::string& err);
-    bool finish(int lane, int32_t* drafts, float* probs, std::string& err);   // kDrafts of each
+    bool launch(int lane, int n_new, int64_t pos0, int anchor, std::string& err, const SampleSpec& ss);
+    bool launch(int lane, int n_new, int64_t pos0, int anchor, std::string& err) {
+        return launch(lane, n_new, pos0, anchor, err, SampleSpec{});
+    }
+    bool finish(int lane, int32_t* drafts, float* probs, std::string& err, int32_t* cand_toks = nullptr, float* cand_scores = nullptr);   // kDrafts of each
     void reset(int lane);                      // the lane's ring is empty (a new sequence)
     int64_t ring_hi(int lane) const;           // one past the highest position its ring holds in this epoch
     void set_max_drafts(int n);

@@ -1582,6 +1582,16 @@ void Engine::prefill_draft(int C, int set) {
 void Engine::prefill(const std::vector<int>& tokens, int after) {
     if (!pending_.empty() || !rows_pending_.lanes.empty()) throw std::runtime_error("prefill: a window is not committed");
     if (mtp_ && after < 0) throw std::runtime_error("prefill: the draft layer needs the token after the last row");
+    static const int max_decode_rows = [] {
+        const long long n = env_int("FNX_PF_DECODE_MAX_ROWS", 0);
+        if (n < 0) throw std::runtime_error("FNX_PF_DECODE_MAX_ROWS: expected >= 0");
+        return (int) n;
+    }();
+    if (max_decode_rows > 0 && !tokens.empty() && (int) tokens.size() <= max_decode_rows &&
+        lanes_[(size_t) cur_].images.empty() && !dump && !verify_prof_) {
+        prefill_via_decode(tokens, after);
+        return;
+    }
     if (pf_[0]->decode_cache && lanes_.size() != 1)
         throw std::runtime_error("FNX_PF_DECODE_CACHE requires one lane");
     // a prompt shorter than FNX_PF_STAGE_ROWS reads the experts in RAM in place, a chunk at a time

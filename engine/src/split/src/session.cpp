@@ -686,20 +686,51 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
             for (int j = 0; j < used; ++j) window->append(o[j]);
         // the draft layer reads the kept rows either way (its cells stay current for later turns)
         mtp_round = false;
+        static const int lookup_before_min = (int) env_int("FNX_LOOKUP_BEFORE_DRAFT_MIN", 0);
         if (df2) {
             if (!speculate) {
                 drafts.clear(), qs.clear();
                 continue;
             }
+            if (lookup_before_min > 0 && !penalize) {
+                std::vector<int> lk = lookup(-1);
+                if ((int) lk.size() >= lookup_before_min) {
+                    e_.df2_defer(Engine::Df2Req{lane_, 0, used, p, x});
+                    drafts = std::move(lk);
+                    qs.assign(drafts.size(), Dist{});
+                    ++st.lookup_rounds;
+                    continue;
+                }
+            }
+            static const bool df2_sample_on = env_flag("FNX_DF2_SAMPLE");
+            const bool df2_samp = df2_sample_on && sample;
             std::vector<Engine::Df2Req> rq(1);
             rq[0].lane = lane_, rq[0].row0 = 0, rq[0].used = used, rq[0].pos0 = p, rq[0].anchor = x;
+            if (df2_samp) {
+                rq[0].sample = true;
+                rq[0].temp = s.temperature;
+                rq[0].top_p = s.top_p;
+                rq[0].min_p = s.min_p;
+                rq[0].top_k = s.top_k;
+                for (int j = 0; j < df2::kDrafts; ++j) rq[0].u[j] = (float) unif(rng);
+            }
             e_.df2_draft(rq);
             st.draft_ms += e_.last_df2_ms, ++st.draft_calls;
+            auto df2_cand_dist = [&](int j) {
+                std::vector<std::pair<float, int>> c16(16);
+                for (int r = 0; r < 16; ++r)
+                    c16[(size_t) r] = {rq[0].cand_scores[(size_t) j * 16 + r], rq[0].cand_tokens[(size_t) j * 16 + r]};
+                std::sort(c16.begin(), c16.end(), [](const auto& a, const auto& b) {
+                    return a.first > b.first || (a.first == b.first && a.second < b.second);
+                });
+                return make_dist(c16, s);
+            };
             const int d1 = rq[0].tokens[0];
             drafts = lookup(d1);   // a lookup that begins with the drafter's first draft goes on from there, as it does behind the draft layer's
             if (!drafts.empty()) {
                 ++st.lookup_rounds;
                 qs.assign(drafts.size(), Dist{});
+                if (df2_samp) qs[0] = df2_cand_dist(0);
                 continue;
             }
             int kmax = 0;
@@ -714,16 +745,21 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
             mtp_round = k > 0;
             drafts.assign(rq[0].tokens, rq[0].tokens + k);
             qs.assign(drafts.size(), Dist{});
+            if (df2_samp)
+                for (int j = 0; j < k; ++j) qs[(size_t) j] = df2_cand_dist(j);
             continue;
         }
         // Opt-in, greedy only: arbitrary fixed context copies are checked by the main model's argmax above.
-        // Sampling keeps the original d1 proposal and its q; penalties and DFlash2 also keep their existing path.
+        // Sampling keeps the original d1 proposal and its q; penalties also keep their existing path.
+        // FNX_LOOKUP_BEFORE_DRAFT_MIN additionally allows sampled/greedy fixed-length >= L lookup proposals.
         static const bool lookup_first = env_flag("FNX_LOOKUP_BEFORE_DRAFT");
-        if (lookup_first && speculate && !sample && !penalize) {
-            drafts = lookup(-1);
-            if (!drafts.empty()) {
+        if (speculate && !penalize && ((lookup_first && !sample) || lookup_before_min > 0)) {
+            std::vector<int> lk = lookup(-1);
+            const bool accept_lk = (lookup_first && !sample) ? !lk.empty() : ((int) lk.size() >= lookup_before_min);
+            if (accept_lk) {
                 // Skipping the whole draft layer would leave holes in its K/V when a later lookup misses.
                 e_.draft_catch_up(used, 0, std::vector<int>(o.begin(), o.begin() + used), p);
+                drafts = std::move(lk);
                 st.draft_ms += e_.last_draft_ms, st.draft_gpu_ms += e_.last_draft_gpu_ms, ++st.draft_calls;
                 qs.assign(drafts.size(), Dist{});
                 ++st.lookup_rounds;

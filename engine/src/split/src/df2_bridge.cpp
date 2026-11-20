@@ -108,7 +108,7 @@ bool Bridge::context(int lane, const float* taps_dev, int64_t n, int64_t pos0, s
     return p_->d[(size_t) lane]->context(taps_dev, n, pos0, err);
 }
 
-bool Bridge::launch(int lane, int n_new, int64_t pos0, int anchor, std::string& err) {
+bool Bridge::launch(int lane, int n_new, int64_t pos0, int anchor, std::string& err, const SampleSpec& ss) {
     Impl& I = *p_;
     cudaSetDevice(I.device);
     std::vector<float>& a = I.anchor[(size_t) lane];
@@ -119,10 +119,19 @@ bool Bridge::launch(int lane, int n_new, int64_t pos0, int anchor, std::string& 
         return false;
     }
     Dflash2Drafter& d = *I.d[(size_t) lane];
-    return d.draft_launch(d.landing(), n_new, pos0, anchor, err);
+    Dflash2Drafter::SampleParams sp;
+    sp.enabled = ss.enabled;
+    sp.temp = ss.temp;
+    sp.top_p = ss.top_p;
+    sp.min_p = ss.min_p;
+    sp.top_k = ss.top_k;
+    for (int i = 0; i < kDrafts; ++i) sp.u[i] = ss.u[i];
+    return d.draft_launch(d.landing(), n_new, pos0, anchor, err, sp);
 }
 
-bool Bridge::finish(int lane, int32_t* drafts, float* probs, std::string& err) { return p_->d[(size_t) lane]->draft_finish(drafts, probs, err); }
+bool Bridge::finish(int lane, int32_t* drafts, float* probs, std::string& err, int32_t* cand_toks, float* cand_scores) {
+    return p_->d[(size_t) lane]->draft_finish(drafts, probs, err, cand_toks, cand_scores);
+}
 void Bridge::reset(int lane) { p_->d[(size_t) lane]->reset(); }
 int64_t Bridge::ring_hi(int lane) const { return p_->d[(size_t) lane]->ring_hi(); }
 void Bridge::set_max_drafts(int n) { for (auto& d : p_->d) d->set_max_drafts(n); }

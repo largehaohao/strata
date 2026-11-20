@@ -137,10 +137,20 @@ public:
     /// selector's pick and its probability).  The taps pointer must be the same device buffer on every call (graphs are captured on it).
     bool draft(const float* taps_dev, int n_new, int64_t pos0, int32_t anchor, int32_t* drafts, float* probs, std::string& err);
 
+    struct SampleParams {
+        bool enabled = false;
+        float temp = 1.0f, top_p = 1.0f, min_p = 0.0f;
+        int top_k = 0;
+        float u[kDrafts] = {};
+    };
+
     /// draft() in two halves: draft_launch queues the round's graph and returns, draft_finish waits and reads the picks.  Several drafters (batch slots, each on its
     /// own stream) can launch first and finish after, so their graphs run at the same time.
-    bool draft_launch(const float* taps_dev, int n_new, int64_t pos0, int32_t anchor, std::string& err);
-    bool draft_finish(int32_t* drafts, float* probs, std::string& err);
+    bool draft_launch(const float* taps_dev, int n_new, int64_t pos0, int32_t anchor, std::string& err, const SampleParams& sp);
+    bool draft_launch(const float* taps_dev, int n_new, int64_t pos0, int32_t anchor, std::string& err) {
+        return draft_launch(taps_dev, n_new, pos0, anchor, err, SampleParams{});
+    }
+    bool draft_finish(int32_t* drafts, float* probs, std::string& err, int32_t* cand_toks = nullptr, float* cand_scores = nullptr);
 
     /// Captures the eight round graphs (n_new = 1..8) on `taps` now, so no round pays for a capture.
     bool prepare(const float* taps_dev, std::string& err);
@@ -210,10 +220,10 @@ private:
     bool bound_ = false;
 
     // device buffers
-    int32_t* d_meta_ = nullptr;     ///< [0..7] context positions, [8..15] block positions, [16] anchor token, [17] anchor position, [24..31] block tokens
+    int32_t* d_meta_ = nullptr;     ///< [0..7] context positions, [8..15] block positions, [16] anchor token, [17] anchor position, [24..31] block tokens, [32..43] sampling
     int32_t* h_meta_ = nullptr;     ///< host staging of d_meta_ (mapped; m_meta_ is its device alias)
     int32_t* m_meta_ = nullptr;
-    int32_t* h_out_ = nullptr;      ///< pinned: 7 draft tokens then 7 probabilities
+    int32_t* h_out_ = nullptr;      ///< pinned: 7 draft tokens, 7 probs, [32..] cand tokens, [144..] cand scores
     float* hp_out_ = nullptr;
     float *kring_[8] = {}, *vring_[8] = {};
     float *rt_ctx_ = nullptr, *rt_blk_ = nullptr;   ///< rope tables of the context rows and of the block rows: one allocation, rt_blk_ = rt_ctx_ + 8 * 128
@@ -231,8 +241,8 @@ private:
     float *fcy_ = nullptr, *hctx_ = nullptr, *kc_ = nullptr, *vc_ = nullptr;
     float *h_ = nullptr, *xn_ = nullptr, *xc_ = nullptr, *dyn_ = nullptr, *q_ = nullptr, *qn_ = nullptr, *k_ = nullptr, *v_ = nullptr, *kblk_ = nullptr;
     float *ao_ = nullptr, *o_ = nullptr, *gate_ = nullptr, *up_ = nullptr, *mlp_ = nullptr, *part_ = nullptr, *fn_ = nullptr;
-    float *logits_ = nullptr, *topval_ = nullptr, *hsel_ = nullptr, *out_prob_ = nullptr;
-    int32_t *toptok_ = nullptr, *out_tok_ = nullptr;
+    float *logits_ = nullptr, *topval_ = nullptr, *hsel_ = nullptr, *out_prob_ = nullptr, *out_cand_sc_ = nullptr;
+    int32_t *toptok_ = nullptr, *out_tok_ = nullptr, *out_cand_tok_ = nullptr;
     uint32_t* topscratch_ = nullptr;
     cudaGraphExec_t exec_[kRows + 1] = {};
     const float* graph_taps_ = nullptr;

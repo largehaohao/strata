@@ -74,6 +74,7 @@ public:
     // logits); the caller puts the prompt's last token through a window for its next token. With the draft layer
     // attached it reads the rows too, each paired with the token after it (`after`: the one after the last row)
     void prefill(const std::vector<int>& tokens, int after = -1);
+    void prefill_via_decode(const std::vector<int>& tokens, int after);
     std::function<void(int)> on_prefill_chunk;   // after each chunk of prefill(): the rows read so far
     // at most `rows` prompt rows to a pass (0: the engine's own, FNX_PF_PASS chunks). The server asks for 8192 while other requests decode: they run a window between
     // two passes, so a pass is how long they wait
@@ -129,8 +130,14 @@ public:
     bool df2_on() const { return df2_ != nullptr; }
     struct Df2Req {
         int lane = 0, row0 = 0, used = 1, pos0 = 0, anchor = 0;   // rows row0 .. row0 + used - 1 of the last window were kept, the first at position pos0
+        bool sample = false;
+        float temp = 1.0f, top_p = 1.0f, min_p = 0.0f;
+        int top_k = 0;
+        float u[df2::kDrafts] = {};
         int tokens[df2::kDrafts] = {};
         float probs[df2::kDrafts] = {};
+        int cand_tokens[df2::kDrafts * 16] = {};
+        float cand_scores[df2::kDrafts * 16] = {};
     };
     // one round for each lane in turn (launched together, finished together). Throws on a failure of the drafter
     void df2_draft(std::vector<Df2Req>& reqs);
@@ -371,10 +378,22 @@ private:
     std::map<std::vector<int>, int> seen_;
     int last_kind_ = 0;
     int prepare_top_tokens(int T, const Penalties& pen);
+    void enqueue_top_tokens_device(int c, int T, int stride);
+    void enqueue_top_tokens_d2h(int c, int T);
     void enqueue_top_tokens(int c, int T, int stride);
     Candidates collect_top_tokens(int T) const;
+    struct VerifyProf;
+    VerifyProf* verify_prof_ = nullptr;
+    bool verify_prof_active_ = false;
+    void vp_init();
+    void vp_destroy();
+    void vp_report() const;
+    void vp_begin(int T);
+    void vp_stamp(int stage);
+    void vp_record_misses(int layer, const int* cache_list, void* st);
+    void vp_collect();
     std::vector<int> verify_impl(const std::vector<int>& tokens, int sampling_stride);
-    void enqueue(int T, bool dumps, bool greedy);
+    void enqueue(int T, bool dumps, bool greedy, bool compute_head = true);
     void enqueue_batch(const std::vector<int>& lanes);   // step()'s window: one row per lane
     void enqueue_rows(const std::vector<int>& lanes, const std::vector<int>& counts);   // verify_rows()'s
     struct RowsWindow {          // verify_rows()'s window until its commit_rows()
@@ -395,7 +414,7 @@ private:
     void df2_forget(int lane);       // the lane's sequence changed: drafter ring and host ring empty
     void df2_prompt_tap(int slot, int pos_first, int row, int n, CardBuf& b, const float* R, const float* bo, const float* inj);
     int mtp_head_mode_ = 0;  // per-call draft head, including opt-in sampled proposals
-    void mtp_enqueue(int T, bool head, bool candidates);
+    void mtp_enqueue(int T, bool head, bool candidates, bool skip_pen = false, bool graph_topk = false);
     void mtp_enqueue_lanes(const std::vector<DraftReq>& reqs, int T);
     const Mtp* mtp_ = nullptr;
     std::vector<Pf*> pf_;
@@ -437,8 +456,8 @@ private:
     // pieces of a layer, for the main layers and the draft layer
     void dense(const DW& W, const void* y, float* out, CardBuf& b, int T);
     void attention(int T, CardBuf& b, const CardW& w, const LayerW& L, uint16_t* kc, uint16_t* vc, const int* ctl,
-                   uint16_t* qsa_ring, uint16_t* qsa_pooled, int call, bool cache_only = false);
-    void ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW& L, float* R, const int* ctl, int lyr);
+                   uint16_t* qsa_ring, uint16_t* qsa_pooled, int call, bool cache_only = false, bool prof = false);
+    void ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW& L, float* R, const int* ctl, int lyr, bool prof = false);
 #if FNX_27B
     // the 27B's window (s27_engine.cu): the layers and head over T rows, one sequence's or a batched window's (lanes),
     // with the recurrent core each kind runs

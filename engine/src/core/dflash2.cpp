@@ -250,7 +250,7 @@ bool Dflash2Drafter::alloc(std::string& err) {
         return true;
     };
     const size_t B = kRows;
-    bool ok = dev(&d_meta_, 32) && dev(&xq_, kernels::native_q8_1_bytes(N_, kRows) + 4096) && dev(&xil_, kernels::native_q8_1_il_bytes(N_, kRows) + 4096) && dev(&xqp_, (size_t) 5 * N_ * 8 + 4096) && dev(&xdp_, (size_t) 5 * N_ / 32 * 8 + 64) && dev(&xqc_, (size_t) 5 * N_ * 8 + 4096) && dev(&xdc_, (size_t) 5 * N_ / 32 * 8 + 64) && dev(&rt_ctx_, 2 * B * 128) && dev(&rope_inv_, 64) &&
+    bool ok = dev(&d_meta_, 48) && dev(&xq_, kernels::native_q8_1_bytes(N_, kRows) + 4096) && dev(&xil_, kernels::native_q8_1_il_bytes(N_, kRows) + 4096) && dev(&xqp_, (size_t) 5 * N_ * 8 + 4096) && dev(&xdp_, (size_t) 5 * N_ / 32 * 8 + 64) && dev(&xqc_, (size_t) 5 * N_ * 8 + 4096) && dev(&xdc_, (size_t) 5 * N_ / 32 * 8 + 64) && dev(&rt_ctx_, 2 * B * 128) && dev(&rope_inv_, 64) &&
               dev(&fcy_, B * N_) && dev(&hctx_, B * N_) && dev(&kc_, B * NKV_ * HD_) && dev(&vc_, B * NKV_ * HD_) && dev(&h_, B * N_) && dev(&xn_, B * N_) &&
               dev(&xc_, B * N_) && dev(&dyn_, B * 640) && dev(&q_, B * NH_ * HD_) && dev(&qn_, B * NH_ * HD_) && dev(&k_, B * NKV_ * HD_) && dev(&v_, B * NKV_ * HD_) &&
               dev(&kblk_, B * NKV_ * HD_) && dev(&ao_, B * NH_ * HD_) && dev(&o_, B * N_) && dev(&gate_, B * I_) && dev(&up_, B * I_) && dev(&mlp_, B * N_) &&
@@ -261,13 +261,16 @@ bool Dflash2Drafter::alloc(std::string& err) {
     if (!ok) { err = "dflash2: the drafter's buffers do not fit in VRAM"; return false; }
     void* hd = nullptr;
     void* dd = nullptr;
-    if (!mapped(32 * 4, (void**) &hd, &dd)) { err = "dflash2: mapped staging"; return false; }
+    if (!mapped(48 * 4, (void**) &hd, &dd)) { err = "dflash2: mapped staging"; return false; }
     h_meta_ = (int32_t*) hd;
     m_meta_ = (int32_t*) dd;
-    if (!mapped(64 * 4, &hd, &dd)) { err = "dflash2: mapped output"; return false; }
+    std::memset(h_meta_, 0, 48 * 4);
+    if (!mapped(320 * 4, &hd, &dd)) { err = "dflash2: mapped output"; return false; }
     h_out_ = (int32_t*) hd;
     out_tok_ = (int32_t*) dd;            // the select kernel writes the 7 picks here (host-visible) ...
     out_prob_ = (float*) dd + 16;        // ... and their probabilities at +16 ints
+    out_cand_tok_ = (int32_t*) dd + 32;  // ... and 7 x 16 sampled candidates at +32 / +144 ints
+    out_cand_sc_ = (float*) dd + 144;
     rt_blk_ = rt_ctx_ + B * 128;
     cudaMemset(rt_ctx_, 0, 2 * B * 128 * 4);
     kernels::df2_rope_inv(theta_, rope_inv_, nullptr);
@@ -536,7 +539,7 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err, bool rope) 
         stamp("gemm:candidate_selector.hidden_projection");
         df2_select(hsel_, topval_, toptok_, reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.predecessor_codebook").off),
                    reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.successor_codebook").off), rank_, ndraft_, d_meta_ + 16, out_tok_,
-                   out_prob_, cs, find("candidate_selector.predecessor_codebook").dtype == "q4_0");
+                   out_prob_, cs, find("candidate_selector.predecessor_codebook").dtype == "q4_0", d_meta_ + 32, out_cand_tok_, out_cand_sc_);
     } catch (const std::exception& e) {
         err = e.what();
         return false;
@@ -547,7 +550,7 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err, bool rope) 
 bool Dflash2Drafter::capture(int n, const float* taps, std::string& err) {
     if (exec_[n]) return true;
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "dflash2: begin capture"; return false; }
-    kernels::copy_i32_from_mapped(d_meta_, m_meta_, 32, cs_);
+    kernels::copy_i32_from_mapped(d_meta_, m_meta_, 48, cs_);
     kernels::df2_rope_table_inv(d_meta_, 16, rope_inv_, rt_ctx_, cs_);   // the context rows' and the block rows' tables in one launch, before the branches split
     // the context update (fc, the keys and values) and the block's front run side by side: they meet before each layer's attention
     // measured: -0.3 ms a round on an RTX 3060, +0.0..0.7 on a Strix Halo (gfx1151), so the HIP builds keep one stream (STRATA_DF2_FORK=1 / 0 overrides)
@@ -1016,7 +1019,7 @@ bool Dflash2Drafter::draft(const float* taps, int n_new, int64_t pos0, int32_t a
     return draft_launch(taps, n_new, pos0, anchor, err) && draft_finish(drafts, probs, err);
 }
 
-bool Dflash2Drafter::draft_launch(const float* taps, int n_new, int64_t pos0, int32_t anchor, std::string& err) {
+bool Dflash2Drafter::draft_launch(const float* taps, int n_new, int64_t pos0, int32_t anchor, std::string& err, const SampleParams& sp) {
     if (!bound_) { err = "dflash2: not bound"; return false; }
     if (!context_wait(err)) return false;
     if (n_new < 1 || n_new > kRows) { err = "dflash2: draft rows out of range"; return false; }
@@ -1026,6 +1029,7 @@ bool Dflash2Drafter::draft_launch(const float* taps, int n_new, int64_t pos0, in
     if (!prof_ && !exec_[n_new]) {
         // the staging must hold valid positions while the capture runs the (empty) kernels' parameter checks
         for (int i = 0; i < 8; ++i) h_meta_[i] = (int32_t) (pos0 + i);
+        h_meta_[32] = 0;
         if (!capture(n_new, taps, err)) return false;
         graph_taps_ = taps;
     }
@@ -1036,6 +1040,14 @@ bool Dflash2Drafter::draft_launch(const float* taps, int n_new, int64_t pos0, in
     h_meta_[17] = (int32_t) s;
     h_meta_[24] = anchor;
     for (int i = 1; i < 8; ++i) h_meta_[24 + i] = mask_token_;
+    h_meta_[32] = sp.enabled ? 1 : 0;
+    if (sp.enabled) {
+        h_meta_[33] = sp.top_k;
+        std::memcpy(&h_meta_[34], &sp.temp, 4);
+        std::memcpy(&h_meta_[35], &sp.top_p, 4);
+        std::memcpy(&h_meta_[36], &sp.min_p, 4);
+        for (int i = 0; i < kDrafts; ++i) std::memcpy(&h_meta_[37 + i], &sp.u[i], 4);
+    }
     for (int i = 0; i < kDrafts; ++i) { ((volatile int32_t*) h_out_)[i] = -1; }
     std::atomic_thread_fence(std::memory_order_seq_cst);
     log_stage(pos0, n_new);
@@ -1045,7 +1057,7 @@ bool Dflash2Drafter::draft_launch(const float* taps, int n_new, int64_t pos0, in
         for (cudaEvent_t e : prof_->ev) cudaEventDestroy(e);   // the stamps of context() calls are not a round
         prof_->ev.clear();
         prof_->name.clear();
-        kernels::copy_i32_from_mapped(d_meta_, m_meta_, 32, cs_);
+        kernels::copy_i32_from_mapped(d_meta_, m_meta_, 48, cs_);
         stamp("start");
         if (!record_context(taps, n_new, cs_, err) || !record_block(cs_, err)) return false;
         prof_collect();
@@ -1060,7 +1072,7 @@ bool Dflash2Drafter::draft_launch(const float* taps, int n_new, int64_t pos0, in
     return true;
 }
 
-bool Dflash2Drafter::draft_finish(int32_t* drafts, float* probs, std::string& err) {
+bool Dflash2Drafter::draft_finish(int32_t* drafts, float* probs, std::string& err, int32_t* cand_toks, float* cand_scores) {
     if (!launched_) { err = "dflash2: draft_finish without draft_launch"; return false; }
     launched_ = false;
     const OnDevice on_device(device_);
@@ -1073,6 +1085,12 @@ bool Dflash2Drafter::draft_finish(int32_t* drafts, float* probs, std::string& er
         const bool made = i < ndraft_;
         drafts[i] = made ? ((volatile int32_t*) h_out_)[i] : 0;
         if (probs) probs[i] = made ? ((volatile float*) h_out_)[16 + i] : 0.0f;
+        if (cand_toks)
+            for (int r = 0; r < kernels::kDf2TopK; ++r)
+                cand_toks[i * kernels::kDf2TopK + r] = made ? ((volatile int32_t*) h_out_)[32 + i * kernels::kDf2TopK + r] : 0;
+        if (cand_scores)
+            for (int r = 0; r < kernels::kDf2TopK; ++r)
+                cand_scores[i * kernels::kDf2TopK + r] = made ? ((volatile float*) h_out_)[144 + i * kernels::kDf2TopK + r] : 0.0f;
     }
     if (timing_) {
         float ms = 0;

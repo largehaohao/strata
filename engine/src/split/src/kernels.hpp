@@ -355,8 +355,11 @@ void cache_copy(const ExpertCache& ec, int p, const int* list, void* st);
 // FNX_ARENA: the arena pool's first `to` slots lent where `from` were (from < to: slots [from, to) lent, their experts
 // pointed back at RAM; from > to: slots [to, from) given back empty); the pool's lent count and hand follow
 void arena_slots(const ExpertCache& ec, int from, int to, void* st);
-// part rows of N from silu(gate) * up of the gu rows
-void moe_down(const DW& A, size_t sa, const Job* jobs, const int* njobs, int njobs_max, const float* gu, float* part, void* st);
+// part rows of N from silu(gate) * up of the gu rows; optionally fuses the shared expert's swiglu and down rows
+bool moe_down_can_fuse_sh(int T, uint32_t down_type);
+void moe_down(const DW& A, size_t sa, const Job* jobs, const int* njobs, int njobs_max, const float* gu, float* part, void* st,
+              const Q8S* sh_down = nullptr, int sh_ffs = 0, const float* sh_gu = nullptr, void* sh_hq = nullptr,
+              float* sh_out = nullptr);
 // T rows of [gate (ffs) | up (ffs)] -> silu(gate) * up as q8_1 rows of ffs (the shared expert)
 void swiglu_stacked_q8_1(const float* gu, void* hq, int ffs, int T, void* st);
 // the weighted sum of the expert rows, read by the ring in place of x when part is not null
@@ -446,6 +449,7 @@ void penalize_row(float* row, int n, const int* pen, const float* par, void* st,
 // before the penalties
 constexpr int TOPK_N = 64;
 void validate_topk_config();
+void prepare_top_tokens(void* st);
 void top_tokens(float* logits, int n, int T, int v0, const int* pen_tok, const int* pen_cnt, const int* pen_n, int pen_stride,
                 const float* pen_par, float* out_v, int* out_i, unsigned* err, void* st, bool draft = false);   // pen_par: per row repeat, freq, present
 

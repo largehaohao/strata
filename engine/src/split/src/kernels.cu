@@ -1253,28 +1253,29 @@ int hc_blocks() { return H_BLOCKS; }
 constexpr int HC_MAXDEV = 64;
 int hc_grid_[HC_MAXDEV] = {};
 int hc_wide_grid_[HC_MAXDEV] = {};
+int hc_rg80_max_t_[HC_MAXDEV] = {};
 unsigned long long hc_timeout_[HC_MAXDEV] = {};
 
-bool hc_compact() {
-    static const bool compact = [] {
+int hc_row_group() {
+    static const int rg = [] {
         const auto rows = env_int("FNX_HC_ROW_GROUP", 96);
-        if (rows != 64 && rows != 96) throw std::runtime_error("FNX_HC_ROW_GROUP: expected 64 or 96");
+        if (rows != 64 && rows != 80 && rows != 96) throw std::runtime_error("FNX_HC_ROW_GROUP: expected 64, 80 or 96");
 #if !FNX_HIP
-        if (rows == 64) throw std::runtime_error("FNX_HC_ROW_GROUP=64 requires HIP gfx1100");
+        if (rows != 96) throw std::runtime_error("FNX_HC_ROW_GROUP=64/80 requires HIP gfx1100");
 #endif
-        return rows == 64;
+        return (int) rows;
     }();
-    return compact;
+    return rg;
 }
 
 #if FNX_HIP
-template <int T> int hc_compact_residency() {
+template <int T, int RG, bool WALK = (RG == 64)> int hc_rg_residency() {
     int blocks = 0;
     hipError_t e;
     if constexpr (T <= 8) {
-        if (T <= hc1_rows()) e = hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, k_hc<T, true, true, 64>, 512, 0);
-        else e = hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, k_hc<T, false, true, 64>, 512, 0);
-    } else e = hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, k_hc<T, false, true, 64>, 512, 0);
+        if (T <= hc1_rows()) e = hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, k_hc<T, true, WALK, RG>, RG * H_TPRD, 0);
+        else e = hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, k_hc<T, false, WALK, RG>, RG * H_TPRD, 0);
+    } else e = hipOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, k_hc<T, false, WALK, RG>, RG * H_TPRD, 0);
     if (e != hipSuccess || blocks <= 0)
         throw std::runtime_error("hc_prepare: cannot determine compact kernel residency");
     return blocks;
@@ -1303,21 +1304,49 @@ int hc_prepare(float* scratch, int cap) {
     if (sms <= 0) throw std::runtime_error("hc_prepare: card " + std::to_string(dev) + " reports " + std::to_string(sms) + " SMs");
     if (cap < 0 || cap > H_BLOCKS) throw std::runtime_error("hc_prepare: cap 1.." + std::to_string(H_BLOCKS) + " (0: none), got " + std::to_string(cap));
     int capacity = sms;
+    int walk_capacity = sms;
     hc_timeout_[dev] = 2000000000ULL;
+    const int rg = hc_row_group();
+    const bool compact = rg != 96;
 #if FNX_HIP
     int wall_khz = 0;
     if (hipDeviceGetAttribute(&wall_khz, hipDeviceAttributeWallClockRate, dev) != hipSuccess || wall_khz <= 0)
         throw std::runtime_error("hc_prepare: cannot determine wall-clock rate");
     hc_timeout_[dev] = (unsigned long long) wall_khz * 1000;   // one second
-    if (hc_compact()) {
+    if (compact) {
         hipDeviceProp_t prop{};
         if (hipGetDeviceProperties(&prop, dev) != hipSuccess || std::string(prop.gcnArchName).rfind("gfx1100", 0) != 0)
-            throw std::runtime_error("FNX_HC_ROW_GROUP=64 has only been validated on gfx1100");
-        const int per_sm = std::min({hc_compact_residency<1>(), hc_compact_residency<2>(),
-            hc_compact_residency<3>(), hc_compact_residency<4>(), hc_compact_residency<5>(), hc_compact_residency<6>(),
-            hc_compact_residency<7>(), hc_compact_residency<8>(), hc_compact_residency<9>(), hc_compact_residency<10>(),
-            hc_compact_residency<11>(), hc_compact_residency<12>()});
-        capacity = sms * per_sm;
+            throw std::runtime_error("FNX_HC_ROW_GROUP=64/80 has only been validated on gfx1100");
+        if (rg == 64) {
+            const int per_sm = std::min({hc_rg_residency<1, 64, true>(), hc_rg_residency<2, 64, true>(),
+                hc_rg_residency<3, 64, true>(), hc_rg_residency<4, 64, true>(), hc_rg_residency<5, 64, true>(), hc_rg_residency<6, 64, true>(),
+                hc_rg_residency<7, 64, true>(), hc_rg_residency<8, 64, true>(), hc_rg_residency<9, 64, true>(), hc_rg_residency<10, 64, true>(),
+                hc_rg_residency<11, 64, true>(), hc_rg_residency<12, 64, true>()});
+            capacity = walk_capacity = sms * per_sm;
+        } else {
+            const int per_sm_8 = std::min({hc_rg_residency<1, 80, false>(), hc_rg_residency<2, 80, false>(),
+                hc_rg_residency<3, 80, false>(), hc_rg_residency<4, 80, false>(), hc_rg_residency<5, 80, false>(), hc_rg_residency<6, 80, false>(),
+                hc_rg_residency<7, 80, false>(), hc_rg_residency<8, 80, false>()});
+            const int per_sm_12 = std::min({per_sm_8, hc_rg_residency<9, 80, false>(), hc_rg_residency<10, 80, false>(),
+                hc_rg_residency<11, 80, false>(), hc_rg_residency<12, 80, false>()});
+            const int per_sm_walk_8 = std::min({hc_rg_residency<1, 80, true>(), hc_rg_residency<2, 80, true>(),
+                hc_rg_residency<3, 80, true>(), hc_rg_residency<4, 80, true>(), hc_rg_residency<5, 80, true>(), hc_rg_residency<6, 80, true>(),
+                hc_rg_residency<7, 80, true>(), hc_rg_residency<8, 80, true>()});
+            const int per_sm_walk_12 = std::min({per_sm_walk_8, hc_rg_residency<9, 80, true>(), hc_rg_residency<10, 80, true>(),
+                hc_rg_residency<11, 80, true>(), hc_rg_residency<12, 80, true>()});
+            if (sms * per_sm_12 >= H_BLOCKS) {
+                hc_rg80_max_t_[dev] = 12;
+                capacity = sms * per_sm_12;
+                walk_capacity = sms * per_sm_walk_12;
+            } else if (sms * per_sm_8 >= H_BLOCKS) {
+                hc_rg80_max_t_[dev] = 8;
+                capacity = sms * per_sm_8;
+                walk_capacity = sms * per_sm_walk_8;
+            } else {
+                hc_rg80_max_t_[dev] = 8;
+                capacity = walk_capacity = sms * per_sm_walk_8;
+            }
+        }
     }
 #endif
     hc_grid_[dev] = std::min(capacity, cap ? cap : H_BLOCKS);
@@ -1327,13 +1356,14 @@ int hc_prepare(float* scratch, int cap) {
     // ran in 2-3 turns each; several blocks fit one WGP, and a barrier that waits too long sets err bit 4 rather than hang
     if (const long long g = env_int("FNX_HC_GRID", 0); g > 0) {
         const int requested = (int) std::min<long long>(g, cap ? cap : H_BLOCKS);
-        if (hc_compact() && requested > capacity)
+        const int eff_cap = (rg == 80 && requested < H_BLOCKS) ? walk_capacity : capacity;
+        if (compact && requested > eff_cap)
             throw std::runtime_error("FNX_HC_GRID exceeds compact kernel residency");
         hc_grid_[dev] = requested;
-        hc_wide_grid_[dev] = hc_compact() ? std::min(requested, sms) : requested;
+        hc_wide_grid_[dev] = compact ? std::min(requested, sms) : requested;
     }
-    if (hc_compact()) std::fprintf(stderr, "fnx: HC row group 64, grid %d, resident capacity %d on card %d\n",
-                                   hc_grid_[dev], capacity, dev);
+    if (compact) std::fprintf(stderr, "fnx: HC row group %d, grid %d, resident capacity %d on card %d\n",
+                              rg, hc_grid_[dev], capacity, dev);
 #endif
     // a counter left by another grid sits mid-generation for this one: its next barrier would let blocks through early
     const unsigned zero[2] = {};
@@ -1351,32 +1381,34 @@ void hc_read(float* R, const float* bo, const float* inj_prev, const float* w_no
     a.ssp = a.part + (size_t) H_NS * T * H_ROWS;
     a.loq = (int8_t*) (a.ssp + (size_t) T * H_NS);
     a.lod = a.ssp + (size_t) T * H_NS + (size_t) T * LR / 4;
+    const int dev = hc_dev(), rg = hc_row_group();
+    const int max_t = rg == 64 ? 12 : (rg == 80 ? hc_rg80_max_t_[dev] : 0);
+    const int active_rg = T <= max_t ? rg : 96;
     // Separate counters keep each grid in its own barrier generation when T changes.
-    const bool compact = hc_compact() && T <= 12;
-    a.bar = (unsigned*) (scratch + hc_scratch_floats(MAXT) - (compact ? 1 : 2));
+    a.bar = (unsigned*) (scratch + hc_scratch_floats(MAXT) - (active_rg != 96 ? 1 : 2));
     if (q8) twin_of(q8, N, a.tq, a.td);
     cudaStream_t s = (cudaStream_t) st;
     const bool one = T <= hc1_rows();
-    const int prepared_grid = hc_grid(), dev = hc_dev();
-    const int grid = compact ? prepared_grid : hc_wide_grid_[dev];
+    const int prepared_grid = hc_grid();
+    const int grid = active_rg != 96 ? prepared_grid : hc_wide_grid_[dev];
     a.timeout_ticks = hc_timeout_[dev];
     switch (T) {
-        case 1: hc_launch<1>(a, s, one, grid, compact); break;
-        case 2: hc_launch<2>(a, s, one, grid, compact); break;
-        case 3: hc_launch<3>(a, s, one, grid, compact); break;
-        case 4: hc_launch<4>(a, s, one, grid, compact); break;
-        case 5: hc_launch<5>(a, s, one, grid, compact); break;
-        case 6: hc_launch<6>(a, s, one, grid, compact); break;
-        case 7: hc_launch<7>(a, s, one, grid, compact); break;
-        case 8: hc_launch<8>(a, s, one, grid, compact); break;
-        case 9: hc_launch<9>(a, s, one, grid, compact); break;
-        case 10: hc_launch<10>(a, s, one, grid, compact); break;
-        case 11: hc_launch<11>(a, s, one, grid, compact); break;
-        case 12: hc_launch<12>(a, s, one, grid, compact); break;
-        case 13: hc_launch<13>(a, s, one, grid, compact); break;
-        case 14: hc_launch<14>(a, s, one, grid, compact); break;
-        case 15: hc_launch<15>(a, s, one, grid, compact); break;
-        case 16: hc_launch<16>(a, s, one, grid, compact); break;
+        case 1: hc_launch<1>(a, s, one, grid, active_rg); break;
+        case 2: hc_launch<2>(a, s, one, grid, active_rg); break;
+        case 3: hc_launch<3>(a, s, one, grid, active_rg); break;
+        case 4: hc_launch<4>(a, s, one, grid, active_rg); break;
+        case 5: hc_launch<5>(a, s, one, grid, active_rg); break;
+        case 6: hc_launch<6>(a, s, one, grid, active_rg); break;
+        case 7: hc_launch<7>(a, s, one, grid, active_rg); break;
+        case 8: hc_launch<8>(a, s, one, grid, active_rg); break;
+        case 9: hc_launch<9>(a, s, one, grid, active_rg); break;
+        case 10: hc_launch<10>(a, s, one, grid, active_rg); break;
+        case 11: hc_launch<11>(a, s, one, grid, active_rg); break;
+        case 12: hc_launch<12>(a, s, one, grid, active_rg); break;
+        case 13: hc_launch<13>(a, s, one, grid, active_rg); break;
+        case 14: hc_launch<14>(a, s, one, grid, active_rg); break;
+        case 15: hc_launch<15>(a, s, one, grid, active_rg); break;
+        case 16: hc_launch<16>(a, s, one, grid, active_rg); break;
         default: throw std::runtime_error("hc_read: T out of range");
     }
     ck_launch("hc_read");
@@ -1901,6 +1933,8 @@ void ring_sum(const Ring& r, float* x, int T, const unsigned* tag, int call, voi
 
 void validate_topk_config() { (void)topk_exact_fast_mode(); (void)draft_topk_parts(); }
 
+void prepare_top_tokens(void* st) { topk_parts_prepare(st); }
+
 void top_tokens(float* logits, int n, int T, int v0, const int* pen_tok, const int* pen_cnt, const int* pen_n, int pen_stride,
                 const float* pen_par, float* out_v, int* out_i, unsigned* err, void* st, bool draft) {
     if (n < TOPK_N) throw std::runtime_error("top_tokens: a vocabulary slice smaller than the candidates");
@@ -2245,8 +2279,14 @@ void gdn_core(const float* qkvz, const float* ab, float* hist, const float* conv
         if (value != 0 && value != 1) throw std::runtime_error("FNX_GDN_EIGHT_PARTS: expected 0 or 1");
         return value == 1;
     }();
+    // FNX_GDN_EIGHT_MIN_T=n: the eight-part replay core from n rows (default 6, as before)
+    static const int eight_min_t = [] {
+        const auto value = env_int("FNX_GDN_EIGHT_MIN_T", 6);
+        if (value < 1 || value > MAXT) throw std::runtime_error("FNX_GDN_EIGHT_MIN_T: expected 1..16");
+        return (int) value;
+    }();
 #define FNX_GDN(t) \
-    if (replay_log && eight_parts && t >= 6) k_gdn_core_8<t, true><<<nv * GDN_Q, 256, 0, s>>>(qkvz, ab, hist, convw, dt, a, nw, S, y, ctl, scratch, snap, hsnap, nk, nv, vmap, eps, tq, td, y32, GdnLanes{}, replay_log); \
+    if (replay_log && eight_parts && t >= eight_min_t) k_gdn_core_8<t, true><<<nv * GDN_Q, 256, 0, s>>>(qkvz, ab, hist, convw, dt, a, nw, S, y, ctl, scratch, snap, hsnap, nk, nv, vmap, eps, tq, td, y32, GdnLanes{}, replay_log); \
     else if (replay_log) k_gdn_core<t, true><<<nv * GDN_Q, GDN_THREADS, 0, s>>>(qkvz, ab, hist, convw, dt, a, nw, S, y, ctl, scratch, snap, hsnap, nk, nv, vmap, eps, tq, td, y32, GdnLanes{}, replay_log); \
     else k_gdn_core<t><<<nv * GDN_Q, GDN_THREADS, 0, s>>>(qkvz, ab, hist, convw, dt, a, nw, S, y, ctl, scratch, snap, hsnap, nk, nv, vmap, eps, tq, td, y32, GdnLanes{})
 #else
@@ -2631,8 +2671,49 @@ void moe_down_big(const DW& A, size_t sa, const BigJob* jobs, const int* njobs, 
 void moe_gate_up_jobs(const DW& A, size_t sa, const Job* jobs, const int* njobs, int njobs_cap, const void* xq, float* gu, void* st) {
     moe_mm(false, A, sa, jobs, njobs, njobs_cap, xq, gu, st, MAXT);
 }
-void moe_down(const DW& A, size_t sa, const Job* jobs, const int* njobs, int njobs_max, const float* gu, float* part, void* st) {
-    moe_mm(true, A, sa, jobs, njobs, njobs_max, gu, part, st);
+bool moe_down_can_fuse_sh(int T, uint32_t down_type) {
+    if (N >= 4096 || T < moe_pre_rows_env()) return false;
+    switch (down_type) {
+        case T_Q4_0:
+        case T_Q2_0:
+        case T_Q5_0:
+        case T_Q5_1:
+        case T_Q8_0:
+        case T_IQ4_NL:
+            return true;
+        default:
+            return false;
+    }
+}
+void moe_down(const DW& A, size_t sa, const Job* jobs, const int* njobs, int njobs_max, const float* gu, float* part, void* st,
+              const Q8S* sh_down, int sh_ffs, const float* sh_gu, void* sh_hq, float* sh_out) {
+    if (!sh_down) {
+        moe_mm(true, A, sa, jobs, njobs, njobs_max, gu, part, st);
+        return;
+    }
+    if (N >= 4096 || sh_ffs < 32 || sh_ffs > SH_MAXF || sh_ffs % 32 || !sh_gu || !sh_hq || !sh_out)
+        throw std::runtime_error("moe_down (shared expert): invalid shape or buffer");
+    ShexpDownHq sd;
+    for (int k = 0; k < Q8S_SEGS; ++k) sd.w.q[k] = sh_down->q, sd.w.d[k] = sh_down->d, sd.w.out[k] = sh_out, sd.w.end[k] = N, sd.w.stride[k] = N;
+    sd.rows = N, sd.ffs = sh_ffs, sd.nqb = (N + Q8S_THREADS / 32 - 1) / (Q8S_THREADS / 32);
+    sd.y = (const block_q8_1*) sh_hq;
+    int8_t* tq;
+    float* td;
+    twin_of(sh_hq, sh_ffs, tq, td);
+    sd.tq = tq, sd.td = td;
+    const MoeW w{(const char*) A.p, sa, A.row_bytes, A.n_out, A.n_in, A.ep};
+    const int T = njobs_max / TOPK;
+    cudaStream_t s = (cudaStream_t) st;
+    switch (A.type) {
+        case T_Q5_1: moe_down_sh_launch<T_Q5_1>(w, jobs, njobs, njobs_max, gu, part, s, T, sd, sh_gu, (block_q8_1*) sh_hq); break;
+        case T_Q5_0: moe_down_sh_launch<T_Q5_0>(w, jobs, njobs, njobs_max, gu, part, s, T, sd, sh_gu, (block_q8_1*) sh_hq); break;
+        case T_Q4_0: moe_down_sh_launch<T_Q4_0>(w, jobs, njobs, njobs_max, gu, part, s, T, sd, sh_gu, (block_q8_1*) sh_hq); break;
+        case T_Q2_0: moe_down_sh_launch<T_Q4_0, true>(w, jobs, njobs, njobs_max, gu, part, s, T, sd, sh_gu, (block_q8_1*) sh_hq); break;
+        case T_Q8_0: moe_down_sh_launch<T_Q8_0>(w, jobs, njobs, njobs_max, gu, part, s, T, sd, sh_gu, (block_q8_1*) sh_hq); break;
+        case T_IQ4_NL: moe_down_sh_launch<T_IQ4_NL>(w, jobs, njobs, njobs_max, gu, part, s, T, sd, sh_gu, (block_q8_1*) sh_hq); break;
+        default: throw std::runtime_error("moe_down (shared expert): expert type " + std::to_string(A.type) + " not handled");
+    }
+    ck_launch("moe_down (with the shared expert)");
 }
 void swiglu_stacked_q8_1(const float* gu, void* hq, int ffs, int T, void* st) {
     int8_t* tq;
@@ -2689,12 +2770,19 @@ void q8s_run(const Q8Segs& g, int rows, int cols, const void* y, int T, void* st
             throw std::runtime_error("FNX_Q8S_ROW_GROUP: expected 0, 1, 2 or 4");
         return (int) n;
     }();
+    static const int head_row_group = [] {
+        const long long n = env_int("FNX_Q8S_HEAD_ROW_GROUP", 0);
+        if (n != 0 && n != 1 && n != 2 && n != 4)
+            throw std::runtime_error("FNX_Q8S_HEAD_ROW_GROUP: expected 0, 1, 2 or 4");
+        return (int) n;
+    }();
     const block_q8_1* yq = (const block_q8_1*) y;
     cudaStream_t s = (cudaStream_t) st;
     // Optional large-matrix override; small projections retain their existing dispatch.
-    if (rows >= 8192 && row_group) {
-        if (row_group == 1) q8s_launch<1, SEG>(g, rows, cols, yq, T, s);
-        else if (row_group == 2) q8s_launch<2, SEG>(g, rows, cols, yq, T, s);
+    const int rg = (rows >= 65536 && head_row_group) ? head_row_group : row_group;
+    if (rows >= 8192 && rg) {
+        if (rg == 1) q8s_launch<1, SEG>(g, rows, cols, yq, T, s);
+        else if (rg == 2) q8s_launch<2, SEG>(g, rows, cols, yq, T, s);
         else q8s_launch<4, SEG>(g, rows, cols, yq, T, s);
         ck_launch("q8s_gemv row group");
         return;

@@ -98,7 +98,10 @@ struct CardBuf {
                            batch_graphs = std::vector<GraphSlot>(MAXT + 1);
     // Captured only when lookup-first needs K/V catch-up. Keep these separate so a lookup miss can reuse the full head graph.
     std::vector<GraphSlot> win_external_graphs = std::vector<GraphSlot>(MAXT + 1);
+    std::vector<GraphSlot> win_sample_nopen_graphs = std::vector<GraphSlot>(MAXT + 1);
+    std::vector<GraphSlot> win_prefill_graphs = std::vector<GraphSlot>(MAXT + 1);
     std::vector<GraphSlot> mtp_sample_graphs = std::vector<GraphSlot>(MAXT + 1);
+    std::vector<GraphSlot> mtp_sample_nopen_graphs = std::vector<GraphSlot>(MAXT + 1);
     std::vector<GraphSlot> mtp_fast_graphs = std::vector<GraphSlot>(MAXT + 1);
     std::vector<GraphSlot> mtp_catchup_graphs = std::vector<GraphSlot>(MAXT + 1);
     // FNX_PRECAP: batched-window graphs that were not evicted by a window of another layout. batch_graphs[T] stays the graph the next

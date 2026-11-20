@@ -15,8 +15,8 @@
 // second-stream branches fork after it). A barrier that waits too long sets bit 4 of err.
 namespace {
 
-// Default row groups of 96 rows; the optional 64-row layout uses 512 threads and
-// 120 down / 80 up shares. Quantization blocks (32 rows) never straddle groups.
+// Default row groups of 96 rows; the optional 64- and 80-row layouts use 512 / 640 threads on gfx1100.
+// Quantization blocks (32 rows) never straddle groups.
 constexpr int H_SL = 512, H_NS = D / H_SL, H_SPS = N / H_SL, H_RPG = 96;
 constexpr int H_ROWS = LR + HC, H_RG = (H_ROWS + H_RPG - 1) / H_RPG;
 static_assert(H_RPG % 32 == 0, "lo blocks inside a group");
@@ -62,9 +62,32 @@ __device__ __forceinline__ unsigned long long hc_clock() {
 }
 
 __device__ __forceinline__ float rprime(const HcArgs& a, int t, int c, int i) {
-    float r = a.R[(size_t) t * D + c * N + i];
-    if (a.bo) r = fmaf(a.bo[(size_t) t * N + i], 2.0f * sigm(a.inj_prev[t * HC + c] / (float) HC), r);
-    return r;
+    const float r = a.R[(size_t) t * D + c * N + i];
+    return a.bo ? fmaf(a.bo[(size_t) t * N + i], 2.0f * sigm(a.inj_prev[t * HC + c] / (float) HC), r) : r;
+}
+
+template <int T, int NQ>
+__device__ __forceinline__ void hc_inj_row(const HcArgs& a, const float (*xs)[H_SL], int s, int col0, int inj_r, int j,
+                                           int out_row, bool live) {
+    const uint4* w4 = reinterpret_cast<const uint4*>(a.w_inj + (size_t) inj_r * D + col0);
+    uint4 u[NQ];
+#pragma unroll
+    for (int q = 0; q < NQ; ++q) u[q] = __ldg(w4 + q * H_TPRD + j);
+#pragma unroll 1
+    for (int k = 0; k < T; ++k) {
+        float acc = 0.f;
+#pragma unroll
+        for (int q = 0; q < NQ; ++q) {
+            const int ch = q * H_TPRD + j;
+            const uint16_t* hh = reinterpret_cast<const uint16_t*>(&u[q]);
+            const float4 x0 = *reinterpret_cast<const float4*>(&xs[k][ch * 8]);
+            const float4 x1 = *reinterpret_cast<const float4*>(&xs[k][ch * 8 + 4]);
+            acc += bf(hh[0]) * x0.x + bf(hh[1]) * x0.y + bf(hh[2]) * x0.z + bf(hh[3]) * x0.w + bf(hh[4]) * x1.x +
+                   bf(hh[5]) * x1.y + bf(hh[6]) * x1.z + bf(hh[7]) * x1.w;
+        }
+        for (int o = 1; o < H_TPRD; o <<= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+        if (live && j == 0) a.part[((size_t) s * T + k) * H_ROWS + out_row] = acc;
+    }
 }
 
 // 8 int8 weights (uint2) . 8 int8 activations (two ints)
@@ -125,13 +148,14 @@ template <int T> struct HcUp {
 // WALK: the grid is short of H_BLOCKS and each block takes the shares vb = blockIdx.x + k * gridDim.x in turn; else
 // vb = blockIdx.x alone, without the loops (the walk costs a register over the 79 of 80 SMs' form, and a stack slot at
 // T = 15)
-// HIP uses waves per SIMD for the second launch bound. Nine constrains the
-// compact layout's registers; host dispatch still checks actual residency.
+// HIP uses waves per SIMD for the second launch bound. Nine/ten constrain the
+// compact layouts' registers; host dispatch still checks actual residency.
 template <int T, bool ONE, bool WALK, int ROW_GROUP = 96>
-__global__ void __launch_bounds__(ROW_GROUP * H_TPRD, ROW_GROUP == 64 ? 9 : 1) k_hc(HcArgs a) {
-    static_assert(ROW_GROUP == 64 || ROW_GROUP == 96, "supported HC row groups");
+__global__ void __launch_bounds__(ROW_GROUP * H_TPRD, ROW_GROUP == 64 ? 9 : (ROW_GROUP == 80 ? 10 : 1)) k_hc(HcArgs a) {
+    static_assert(ROW_GROUP == 64 || ROW_GROUP == 80 || ROW_GROUP == 96, "supported HC row groups");
+    static_assert(ROW_GROUP != 80 || (LR % 80 == 0 && HC * H_TPRD == 32), "80-row groups fold inject into warp 0");
     constexpr int H_RPG = ROW_GROUP, H_DT = H_RPG * H_TPRD;
-    constexpr int H_RG = (H_ROWS + H_RPG - 1) / H_RPG, H_BLOCKS = H_NS * H_RG;
+    constexpr int H_RG = ROW_GROUP == 80 ? (LR / 80) : ((H_ROWS + H_RPG - 1) / H_RPG), H_BLOCKS = H_NS * H_RG;
     static_assert(sizeof(HcUp<T>) <= sizeof(float) * T * H_SL && LR % 16 == 0, "the up part's arrays inside xs, aligned");
     __shared__ __align__(16) float xs[T][H_SL];
     __shared__ __align__(16) int8_t xq[T][H_SL];
@@ -185,12 +209,12 @@ __global__ void __launch_bounds__(ROW_GROUP * H_TPRD, ROW_GROUP == 64 ? 9 : 1) k
     {
         constexpr int NQ = H_SL / 8 / H_TPRD;
         const int j = t % H_TPRD, row = grp * H_RPG + t / H_TPRD;
-        const int nrows = a.w_inj ? H_ROWS : LR;
+        const int nrows = ROW_GROUP == 80 ? LR : (a.w_inj ? H_ROWS : LR);
         const bool live = t / H_TPRD < H_RPG && row < nrows;
         const int rr = live ? row : 0;
         // the thread's weights to registers, then one pass per row t (rolled: unrolled over T the kernel is tens of KB
         // of code, fetched cold at every launch)
-        if (rr < LR) {
+        if (ROW_GROUP == 80 || rr < LR) {
             const uint2* w2 = reinterpret_cast<const uint2*>(a.w_down.q + (size_t) rr * D + col0);
             const uint16_t* wd = a.w_down.d + ((size_t) rr * D + col0) / 32;
             uint2 u[NQ];
@@ -212,24 +236,12 @@ __global__ void __launch_bounds__(ROW_GROUP * H_TPRD, ROW_GROUP == 64 ? 9 : 1) k
                 if (live && j == 0) a.part[((size_t) s * T + k) * H_ROWS + row] = acc;
             }
         } else {
-            const uint4* w4 = reinterpret_cast<const uint4*>(a.w_inj + (size_t) (rr - LR) * D + col0);
-            uint4 u[NQ];
-#pragma unroll
-            for (int q = 0; q < NQ; ++q) u[q] = __ldg(w4 + q * H_TPRD + j);
-#pragma unroll 1
-            for (int k = 0; k < T; ++k) {
-                float acc = 0.f;
-#pragma unroll
-                for (int q = 0; q < NQ; ++q) {
-                    const int ch = q * H_TPRD + j;
-                    const uint16_t* hh = reinterpret_cast<const uint16_t*>(&u[q]);
-                    const float4 x0 = *reinterpret_cast<const float4*>(&xs[k][ch * 8]);
-                    const float4 x1 = *reinterpret_cast<const float4*>(&xs[k][ch * 8 + 4]);
-                    acc += bf(hh[0]) * x0.x + bf(hh[1]) * x0.y + bf(hh[2]) * x0.z + bf(hh[3]) * x0.w + bf(hh[4]) * x1.x +
-                           bf(hh[5]) * x1.y + bf(hh[6]) * x1.z + bf(hh[7]) * x1.w;
-                }
-                for (int o = 1; o < H_TPRD; o <<= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
-                if (live && j == 0) a.part[((size_t) s * T + k) * H_ROWS + row] = acc;
+            hc_inj_row<T, NQ>(a, xs, s, col0, rr - LR, j, row, live);
+        }
+        if constexpr (ROW_GROUP == 80) {
+            if (a.w_inj && grp == H_RG - 1 && t < HC * H_TPRD) {
+                const int inj_r = t / H_TPRD;
+                hc_inj_row<T, NQ>(a, xs, s, col0, inj_r, j, LR + inj_r, true);
             }
         }
     }
@@ -399,10 +411,10 @@ __global__ void __launch_bounds__(ROW_GROUP * H_TPRD, ROW_GROUP == 64 ? 9 : 1) k
 }
 
 // one: k_hc's one-barrier form (built for windows of up to 8 rows); grid: the card's, from hc_prepare
-template <int T> void hc_launch(const HcArgs& a, cudaStream_t st, bool one, int grid, bool compact = false) {
+template <int T> void hc_launch(const HcArgs& a, cudaStream_t st, bool one, int grid, int row_group = 96) {
 #if FNX_HIP
     if constexpr (T <= 12) {
-        if (compact) {
+        if (row_group == 64) {
             if constexpr (T <= 8) {
                 if (one) {
                     k_hc<T, true, true, 64><<<grid, 64 * H_TPRD, 0, st>>>(a);
@@ -412,9 +424,22 @@ template <int T> void hc_launch(const HcArgs& a, cudaStream_t st, bool one, int 
             k_hc<T, false, true, 64><<<grid, 64 * H_TPRD, 0, st>>>(a);
             return;
         }
+        if (row_group == 80) {
+            constexpr int nblocks = H_NS * (LR / 80);
+            if constexpr (T <= 8) {
+                if (one) {
+                    if (grid < nblocks) k_hc<T, true, true, 80><<<grid, 80 * H_TPRD, 0, st>>>(a);
+                    else k_hc<T, true, false, 80><<<grid, 80 * H_TPRD, 0, st>>>(a);
+                    return;
+                }
+            }
+            if (grid < nblocks) k_hc<T, false, true, 80><<<grid, 80 * H_TPRD, 0, st>>>(a);
+            else k_hc<T, false, false, 80><<<grid, 80 * H_TPRD, 0, st>>>(a);
+            return;
+        }
     }
 #else
-    (void) compact;
+    (void) row_group;
 #endif
     if constexpr (T <= 8) {
         if (one) {

@@ -849,11 +849,17 @@ __device__ __forceinline__ float q4row_at(const uint8_t* row, int i) {
     return (float) ((j < 16 ? (byte & 15) : (byte >> 4)) - 8) * d;
 }
 
+__device__ __forceinline__ float df2_bits_to_f32(int32_t v) {
+    union { int32_t i; float f; } u{v};
+    return u.f;
+}
+
 // ---- the selector's walk: one block of 256 threads
 template <bool Q4>
 __global__ void select_kernel(const float* __restrict__ hp, const float* __restrict__ unary, const int32_t* __restrict__ tok,
                               const uint16_t* __restrict__ pred_cb, const uint16_t* __restrict__ succ_cb, int rank, int rows,
-                              const int32_t* __restrict__ anchor_tok, int32_t* __restrict__ out_tok, float* __restrict__ out_prob) {
+                              const int32_t* __restrict__ anchor_tok, int32_t* __restrict__ out_tok, float* __restrict__ out_prob,
+                              const int32_t* __restrict__ sample_meta, int32_t* __restrict__ out_cand_tok, float* __restrict__ out_cand_sc) {
     __shared__ float vp[256];
     __shared__ float sc[kDf2TopK];
     __shared__ int prev;
@@ -885,15 +891,88 @@ __global__ void select_kernel(const float* __restrict__ hp, const float* __restr
         }
         __syncthreads();
         if (tid == 0) {
-            int bj = 0;
-            float bv = sc[0];
-            for (int j = 1; j < kDf2TopK; ++j)
-                if (sc[j] > bv) { bv = sc[j]; bj = j; }
-            float z = 0.0f;
-            for (int j = 0; j < kDf2TopK; ++j) z += __expf(sc[j] - bv);
-            out_tok[i] = tok[i * kDf2TopK + bj];
-            out_prob[i] = 1.0f / z;
-            prev = out_tok[i];
+            if (!sample_meta || sample_meta[0] == 0) {
+                int bj = 0;
+                float bv = sc[0];
+                for (int j = 1; j < kDf2TopK; ++j)
+                    if (sc[j] > bv) { bv = sc[j]; bj = j; }
+                float z = 0.0f;
+                for (int j = 0; j < kDf2TopK; ++j) z += __expf(sc[j] - bv);
+                out_tok[i] = tok[i * kDf2TopK + bj];
+                out_prob[i] = 1.0f / z;
+                prev = out_tok[i];
+            } else {
+                float s_ord[kDf2TopK];
+                int32_t t_ord[kDf2TopK];
+                for (int j = 0; j < kDf2TopK; ++j) {
+                    t_ord[j] = tok[i * kDf2TopK + j];
+                    s_ord[j] = sc[j];
+                    if (out_cand_tok) out_cand_tok[i * kDf2TopK + j] = t_ord[j];
+                    if (out_cand_sc) out_cand_sc[i * kDf2TopK + j] = s_ord[j];
+                }
+                for (int a = 1; a < kDf2TopK; ++a) {
+                    const float ks = s_ord[a];
+                    const int32_t kt = t_ord[a];
+                    int b = a - 1;
+                    while (b >= 0 && (ks > s_ord[b] || (ks == s_ord[b] && kt < t_ord[b]))) {
+                        s_ord[b + 1] = s_ord[b];
+                        t_ord[b + 1] = t_ord[b];
+                        --b;
+                    }
+                    s_ord[b + 1] = ks;
+                    t_ord[b + 1] = kt;
+                }
+                const int top_k = sample_meta[1];
+                const float temp = df2_bits_to_f32(sample_meta[2]);
+                const float top_p = df2_bits_to_f32(sample_meta[3]);
+                const float min_p = df2_bits_to_f32(sample_meta[4]);
+                const double u = (double) df2_bits_to_f32(sample_meta[5 + i]);
+                const int k = (top_k <= 0 || top_k > kDf2TopK) ? kDf2TopK : top_k;
+                int keep = k;
+                const double mx = (double) s_ord[0];
+                if (top_p < 1.0f) {
+                    double rsum = 0.0;
+                    for (int r = 0; r < k; ++r) rsum += exp((double) s_ord[r] - mx);
+                    double cum = 0.0;
+                    for (int r = 0; r < k; ++r) {
+                        cum += exp((double) s_ord[r] - mx) / rsum;
+                        if (cum >= (double) top_p) {
+                            keep = r + 1;
+                            break;
+                        }
+                    }
+                }
+                if (min_p > 0.0f) {
+                    const float thresh = s_ord[0] + logf(min_p);
+                    for (int r = 1; r < keep; ++r) {
+                        if (s_ord[r] < thresh) {
+                            keep = r;
+                            break;
+                        }
+                    }
+                }
+                double p[kDf2TopK];
+                const double inv_t = 1.0 / (double) temp;
+                const double smx = (double) s_ord[0] * inv_t;
+                double sum = 0.0;
+                for (int r = 0; r < keep; ++r) {
+                    p[r] = exp((double) s_ord[r] * inv_t - smx);
+                    sum += p[r];
+                }
+                for (int r = 0; r < keep; ++r) p[r] /= sum;
+                double acc = 0.0;
+                int pick = keep - 1;
+                for (int r = 0; r < keep; ++r) {
+                    acc += p[r];
+                    if (u < acc) {
+                        pick = r;
+                        break;
+                    }
+                }
+                out_tok[i] = t_ord[pick];
+                out_prob[i] = (float) p[pick];
+                prev = out_tok[i];
+            }
         }
         __syncthreads();
     }
@@ -1156,10 +1235,11 @@ void df2_topk(const float* logits, int n, const int32_t* idx_map, int rows, uint
 }
 
 void df2_select(const float* hp, const float* unary, const int32_t* tok, const uint16_t* pred_cb, const uint16_t* succ_cb, int rank, int rows,
-                const int32_t* anchor_tok, int32_t* out_tok, float* out_prob, void* stream, bool cb_q4) {
+                const int32_t* anchor_tok, int32_t* out_tok, float* out_prob, void* stream, bool cb_q4,
+                const int32_t* sample_meta, int32_t* out_cand_tok, float* out_cand_sc) {
     if (rank != 256) throw std::invalid_argument("df2_select: the selector rank must be 256");
-    if (cb_q4) select_kernel<true><<<1, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, rows, anchor_tok, out_tok, out_prob);
-    else select_kernel<false><<<1, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, rows, anchor_tok, out_tok, out_prob);
+    if (cb_q4) select_kernel<true><<<1, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, rows, anchor_tok, out_tok, out_prob, sample_meta, out_cand_tok, out_cand_sc);
+    else select_kernel<false><<<1, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, rows, anchor_tok, out_tok, out_prob, sample_meta, out_cand_tok, out_cand_sc);
     check("select");
 }
 

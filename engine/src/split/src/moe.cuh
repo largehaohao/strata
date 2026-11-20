@@ -375,6 +375,100 @@ __global__ void __launch_bounds__(DN_THREADS) k_moe_down(MoeW w, const Job* __re
     }
 }
 
+// FNX_SH_FUSE_IQ: the shared expert inside the routed down launch for the IQ cache layers (whose gate|up launch cannot
+// carry it). k_moe_h_sh makes the pairs' h as k_moe_h does and, after them, the shared expert's swiglu as
+// k_swiglu_stacked does (q8_1 and its split twin); k_moe_down_sh runs the shared down rows as q8s blocks (one row a
+// warp, as q8s_gemv runs 2560 rows) in its first sd_rows rows of blocks and k_moe_down<TA, true>'s jobs after them.
+// Every value is made by the same expressions in the same order, so the same bits.
+struct ShexpDownHq {
+    Q8Segs w;
+    int rows = 0, ffs = 0, nqb = 0;
+    const block_q8_1* y = nullptr;
+    const int8_t* tq = nullptr;
+    const float* td = nullptr;
+};
+
+__global__ void k_moe_h_sh(const float* __restrict__ gu, int ffs, int npairs, const float* __restrict__ sh_gu, int sh_ffs,
+                           block_q8_1* __restrict__ sh_hq, int8_t* __restrict__ sh_tq, float* __restrict__ sh_td, int T) {
+    const int nb = ffs / DN_U, q = blockIdx.x * (blockDim.x / 32) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (q < npairs * nb) {
+        const int e = q / nb, b = q % nb;
+        const float* g = gu + (size_t) e * 2 * ffs;
+        const float xi = silu_(g[b * 32 + lane]) * g[ffs + b * 32 + lane];
+        const float amax = wmax(fabsf(xi)), sm = wsum(xi);
+        const float d = amax / 127.0f;
+        block_q8_1& h = g_moe_hq[e][b];
+        h.qs[lane] = amax == 0.0f ? 0 : (int8_t) roundf(xi / d);
+        if (lane == 0) h.ds = make_half2(__float2half(d), __float2half(sm));
+        return;
+    }
+    const int snb = sh_ffs / 32, r = q - npairs * nb;
+    if (r >= T * snb) return;
+    const int t = r / snb, b = r % snb;
+    const float* g = sh_gu + (size_t) t * 2 * sh_ffs;
+    const float xi = silu_(g[b * 32 + lane]) * g[sh_ffs + b * 32 + lane];
+    const float amax = wmax(fabsf(xi)), sum = wsum(xi);
+    const float d = amax / 127.0f;
+    block_q8_1& y = sh_hq[(size_t) t * snb + b];
+    const int8_t qv = amax == 0.0f ? 0 : (int8_t) roundf(xi / d);
+    y.qs[lane] = qv;
+    if (lane == 0) y.ds = make_half2(__float2half(d), __float2half(sum));
+    if (sh_tq) {
+        sh_tq[(size_t) t * sh_ffs + b * 32 + lane] = qv;
+        if (lane == 0) sh_td[(size_t) t * snb + b] = __half2float(__float2half(d));
+    }
+}
+
+template <GgmlType TA, bool PACKED_Q2, int TT>
+__global__ void __launch_bounds__(DN_THREADS) k_moe_down_sh(MoeW w, const Job* __restrict__ jobs, const int* __restrict__ njobs,
+                                                           float* __restrict__ out, const ShexpDownHq sd, int sd_rows) {
+    static_assert(DN_THREADS == Q8S_THREADS, "the shared expert's q8s blocks in the down launch");
+    static_assert(!PACKED_Q2 || TA == T_Q4_0, "packed Q2 retains Q4_0 arithmetic");
+    if ((int) blockIdx.y < sd_rows) {
+        const int bx = blockIdx.y * gridDim.x + blockIdx.x;
+        if (bx < sd.nqb) {
+            if (sd.tq) q8s_block<TT, 1, true, false>(sd.w, sd.rows, sd.ffs, sd.y, sd.tq, sd.td, bx);
+            else q8s_block<TT, 1, false, false>(sd.w, sd.rows, sd.ffs, sd.y, nullptr, nullptr, bx);
+        }
+        return;
+    }
+    const int ji = blockIdx.y - sd_rows;
+    if (ji >= *njobs) return;
+    __shared__ Job jb;
+    __shared__ block_q8_1 hq[MAXT][DN_MAXB];
+    extern __shared__ float dn_part[];
+    float(*part)[DN_THREADS] = reinterpret_cast<float(*)[DN_THREADS]>(dn_part);
+    if (threadIdx.x == 0) jb = jobs[ji];
+    __syncthreads();
+    const int ffs = w.ncols, nb = ffs / DN_U, n = jb.n;
+    static_assert(sizeof(block_q8_1) == 36, "a q8_1 block is 9 words");
+    for (int q = threadIdx.x; q < n * nb * 9; q += DN_THREADS) {
+        const int jb9 = q / 9, j = jb9 / nb, b = jb9 % nb;
+        reinterpret_cast<int*>(&hq[j][b])[q % 9] = reinterpret_cast<const int*>(&g_moe_hq[jb.y[j]][b])[q % 9];
+    }
+    __syncthreads();
+    const int rpb = DN_THREADS / nb, r = threadIdx.x / nb, u = threadIdx.x % nb;
+    const int row = blockIdx.x * rpb + r;
+    const bool live = r < rpb && row < w.nrows;
+    if (live) {
+        const char* wr = moe_expert(w, jb.w) + (size_t) row * w.row_a;
+        if constexpr (PACKED_Q2) {
+            const Q2Half decoded = q2_load_half(wr, u);
+            for (int j = 0; j < n; ++j) part[j][threadIdx.x] = q2_half_dot(decoded, hq[j] + u);
+        } else {
+            for (int j = 0; j < n; ++j) part[j][threadIdx.x] = unit_dot<TA, DN_U>(wr, u, hq[j]);
+        }
+    }
+    __syncthreads();
+    for (int e = threadIdx.x; e < n * rpb; e += DN_THREADS) {
+        const int j = e / rpb, rr = e % rpb, orow = blockIdx.x * rpb + rr;
+        if (orow >= w.nrows) continue;
+        float s = 0.f;
+        for (int k = 0; k < nb; ++k) s += part[j][rr * nb + k];
+        out[(size_t) jb.out[j] * w.nrows + orow] = s;
+    }
+}
+
 template <GgmlType type> constexpr int per_block_of() { return qtraits<type>::qi / vdr_of<type>(); }
 template <GgmlType type> constexpr bool unit_ok(int U) { return U % qtraits<type>::qk == 0; }
 
@@ -634,6 +728,43 @@ void moe_launch(bool down, const MoeW& w, const Job* jobs, const int* njobs, int
         }
         gu_launch<TA, 32>(T, grid, s, w, jobs, njobs, (const block_q8_1*) in, out);
     }
+}
+
+// FNX_SH_FUSE_IQ: the routed down (k_moe_h's h always made first, as FNX_MOE_PRE_ROWS <= T has it) with the shared
+// expert's swiglu in the same h launch and its down rows in the down launch
+template <GgmlType TA, bool PACKED_Q2 = false>
+void moe_down_sh_launch(const MoeW& w, const Job* jobs, const int* njobs, int njobs_max, const float* gu, float* out,
+                        cudaStream_t s, int T, const ShexpDownHq& sd, const float* sh_gu, block_q8_1* sh_hq) {
+    if constexpr (!unit_ok<TA>(DN_U)) {
+        throw std::runtime_error("moe_down (shared expert): shape or type does not fit the units");
+    } else {
+        if (w.ncols / DN_U > DN_MAXB || w.ncols % DN_U) throw std::runtime_error("moe_down (shared expert): shape does not fit the units");
+        if (njobs_max > MAXT * TOPK) throw std::runtime_error("moe_down (shared expert): more pairs than g_moe_hq holds");
+        if (T < 1 || T > MAXT || sd.ffs % 32 || sd.ffs > SH_MAXF) throw std::runtime_error("moe_down (shared expert): rows or FF slice");
+        const int nb = w.ncols / DN_U, rpb = DN_THREADS / nb, gx = (w.nrows + rpb - 1) / rpb;
+        const int nh = njobs_max * nb + T * (sd.ffs / 32);
+        k_moe_h_sh<<<(nh + 7) / 8, 256, 0, s>>>(gu, w.ncols, njobs_max, sh_gu, sd.ffs, sh_hq, const_cast<int8_t*>(sd.tq),
+                                               const_cast<float*>(sd.td), T);
+        const int sd_rows = (sd.nqb + gx - 1) / gx;
+        const dim3 grid(gx, njobs_max + sd_rows);
+        const size_t smem = sizeof(float) * T * DN_THREADS;
+#define FNX_DSH(t) case t: k_moe_down_sh<TA, PACKED_Q2, t><<<grid, DN_THREADS, smem, s>>>(w, jobs, njobs, out, sd, sd_rows); break;
+        switch (T) {
+            FNX_DSH(1) FNX_DSH(2) FNX_DSH(3) FNX_DSH(4) FNX_DSH(5) FNX_DSH(6) FNX_DSH(7) FNX_DSH(8)
+            FNX_DSH(9) FNX_DSH(10) FNX_DSH(11) FNX_DSH(12) FNX_DSH(13) FNX_DSH(14) FNX_DSH(15) FNX_DSH(16)
+            default: throw std::runtime_error("moe_down (shared expert): T out of range");
+        }
+#undef FNX_DSH
+    }
+}
+
+int moe_pre_rows_env() {
+    static const int pre_rows = [] {
+        const long long v = env_int("FNX_MOE_PRE_ROWS", 9);
+        if (v < 1 || v > MAXT + 1) throw std::runtime_error("FNX_MOE_PRE_ROWS: expected 1..17");
+        return (int) v;
+    }();
+    return pre_rows;
 }
 
 

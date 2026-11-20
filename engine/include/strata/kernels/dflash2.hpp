@@ -99,7 +99,8 @@ void df2_topk(const float* logits, int n, const int32_t* idx_map, int rows, uint
 /// `cb_q4`: the codebooks are ggml Q4_0 rows in block order (rank / 32 blocks of 18 bytes a row: fp16 d, 16 bytes, value i in the low nibble of byte i,
 /// value i + 16 in the high nibble; NOT tiled like the matrices), dequantized to fp32 ((q - 8) * d) before the same dot; default: bf16 rows.
 void df2_select(const float* hp, const float* unary, const int32_t* tok, const uint16_t* pred_cb, const uint16_t* succ_cb, int rank, int rows,
-                const int32_t* anchor_tok, int32_t* out_tok, float* out_prob, void* stream, bool cb_q4 = false);
+                const int32_t* anchor_tok, int32_t* out_tok, float* out_prob, void* stream, bool cb_q4 = false,
+                const int32_t* sample_meta = nullptr, int32_t* out_cand_tok = nullptr, float* out_cand_sc = nullptr);
 
 /// The verify window's tap: out[r][d] = mean over the hc streams c of (R[r][c][d] + bo[r][d] * 2 * sigmoid(inject[r][c] / hc)) - the layer output with
 /// its pending FFN write (gr_write) applied, averaged over the streams.  R rows are `R_stride` floats apart, bo rows `bo_stride`, inject rows

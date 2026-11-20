@@ -613,6 +613,7 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         ck(cudaSetDevice(cb_[c]->dev), "HC split init device");
         hc_row_split_prepare(c, peer_on, lanes, cb_[c]->ring.err);
     }
+    if (env_flag("FNX_VERIFY_PROFILE")) vp_init();
     construction.complete = true;
 }
 
@@ -1147,7 +1148,7 @@ void Engine::dense(const DW& W, const void* y, float* out, CardBuf& b, int T) {
 // an attention layer's mixer after its hc read (mixed in b.xq): q/k/v, the window's K/V into kc/vc at ctl[0], the
 // attention, the output projection into b.bo_a
 void Engine::attention(int T, CardBuf& b, const CardW& w, const LayerW& L, uint16_t* kc, uint16_t* vc, const int* ctl,
-                       uint16_t* qsa_ring, uint16_t* qsa_pooled, int call, bool cache_only) {
+                       uint16_t* qsa_ring, uint16_t* qsa_pooled, int call, bool cache_only, bool prof) {
     // the indexer first (it reads mixed / its q8 copy, which the projections below leave as they are)
     if (!L.idx_wq) {
         if (cache_only && L.idx_qk.s.q) {
@@ -1157,8 +1158,10 @@ void Engine::attention(int T, CardBuf& b, const CardW& w, const LayerW& L, uint1
             q8s_gemv(wk, QSA_KEY, N, b.xq, b.qsa_y + first, qsa_rows(), T, b.st);
         } else dense(L.idx_qk, b.xq, b.qsa_y, b, T);
     }
+    if (prof) vp_stamp(5);
     qsa(L.idx_wq, L.idx_wk, b.mixed, b.qsa_y, L.idx_qn, L.idx_kn, qsa_ring, qsa_pooled, b.pg, b.qsa_q, b.qsa_scores, b.qsa_cells,
         b.qsa_ncells, max_ctx_ / 4, ctl, T, m_.eps, rope_of(b.mrope), b.att_ring.card, b.st, !cache_only);
+    if (prof) vp_stamp(6);
     if (cache_only) {
         dense(L.wk, b.xq, b.k, b, T);
         dense(L.wv, b.xq, b.v, b, T);
@@ -1173,19 +1176,24 @@ void Engine::attention(int T, CardBuf& b, const CardW& w, const LayerW& L, uint1
         dense(L.wk, b.xq, b.k, b, T);
         dense(L.wv, b.xq, b.v, b, T);
     }
+    if (prof) vp_stamp(7);
     attn_prep_append(cache_only ? nullptr : b.qg, b.k, b.v, L.q_norm, L.k_norm, kc, vc, b.pg, b.att_ring.card, T, ctl, m_.eps, rope_of(b.mrope), b.st);
+    if (prof) vp_stamp(8);
     if (cache_only) return;
     attn(b.qg, kc, vc, b.pg, b.att, b.att_ring, (const unsigned*) (ctl + 1), call, ctl, T, b.att_part, b.st, b.qsa_cells, b.qsa_ncells);
+    if (prof) vp_stamp(9);
     quantize_q8_1(b.att, b.xq, w.nq * HD, T, b.st);
     dense(L.wo, b.xq, b.bo_a, b, T);
+    if (prof) vp_stamp(10);
 }
 
 // the FFN half: the hc read with the attention half's write folded in, the shared expert (in the router's and the
 // routed gate|up's launches on Q4_K layers, else on the second stream beside the router), the routing and the routed
 // experts, the weighted sum across the cards into b.bo_f
-void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW& L, float* R, const int* ctl, int lyr) {
+void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW& L, float* R, const int* ctl, int lyr, bool prof) {
     const int P = T * TOPK, ffs = w.ff1 - w.ff0;
     hc_read(R, b.bo_a, b.inj_a, L.hc_norm[1], L.hc_down[1], L.hc_up[1], L.hc_inj[1], m_.eps, b.mixed, b.inj_f, b.hcs, b.ring.err, T, b.st, b.xq);
+    if (prof) vp_stamp(12);
     const bool static_live = b.static_cache.n_slots && lyr >= 0 && lyr < NL;
     const ExpertCache& ec = static_live ? b.static_cache : w.ec;
     static const int fused_dn_blocks = (int) env_int("FNX_STATIC_CACHE_FUSED_DN", 0);
@@ -1203,9 +1211,11 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
     // If moe_cache defers those copies, the IQ launch must perform them before
     // either projection reads a cold expert; run the shared expert on st2 then.
     static const bool iq_reuse = env_int("FNX_IQ_REUSE", 0) == 1;
+    static const bool sh_fuse_iq = env_flag("FNX_SH_FUSE_IQ");
     const bool reuse_iq_gu = iq_reuse && (L.gu_e.type == T_IQ2_S || L.gu_e.type == T_IQ3_S || L.gu_e.type == T_IQ3_XXS);
     const bool sh_in = !reuse_iq_gu && !fused_dn && (L.gu_e.type == T_Q4_K || (sh_all && (L.gu_e.type == T_Q5_K || L.gu_e.type == T_Q5_1 || L.gu_e.type == T_Q4_0 || L.gu_e.type == T_Q8_0 || L.gu_e.type == T_IQ4_NL || L.gu_e.type == T_IQ4_XS || L.gu_e.type == T_IQ3_S || L.gu_e.type == T_IQ3_XXS || L.gu_e.type == T_IQ2_S))) && L.sh_gu.s.q && L.sh_down.s.q && ffs % 32 == 0 && ffs <= SH_MAXF;
-    if (!sh_in) {
+    const bool sh_in_down = !sh_in && sh_fuse_iq && static_live && (fused_dn || reuse_iq_gu) && L.sh_gu.s.q && L.sh_down.s.q && ffs % 32 == 0 && ffs <= SH_MAXF && moe_down_can_fuse_sh(T, L.down_e.type);
+    if (!sh_in && !sh_in_down) {
         ck(cudaEventRecord(b.fork, b.st), "fork");
         ck(cudaStreamWaitEvent(b.st2, b.fork, 0), "fork wait");
         q8s_gemv(L.sh_gu.s, 2 * ffs, N, b.xq, b.sh_gu, 2 * ffs, T, b.st2);
@@ -1218,7 +1228,7 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
     const bool live = (static_live || cache_live()) && lyr >= 0 && lyr < NL;
     const bool plan_in_router = live && !b.probe_cnt;
     router_route(L.router, b.mixed, b.logits, T, b.topi, b.topw, b.jobs_gu, b.jobs_dn, b.njobs, b.st, plan_in_router ? &ec : nullptr,
-                 lyr, b.cache_list, sh_in ? &L.sh_gu.s : nullptr, 2 * ffs, b.xq, b.sh_gu, L.router_bf16, b.ring.err);
+                 lyr, b.cache_list, (sh_in || sh_in_down) ? &L.sh_gu.s : nullptr, 2 * ffs, b.xq, b.sh_gu, L.router_bf16, b.ring.err);
     if (const int l = lyr; l >= 0 && l < NL) {
         if (b.route_cnt) route_count(b.topi, P, b.route_cnt + (size_t) l * NEXP, b.st);
         if (b.route_trace) fnx::route_trace(b.topi, P, l, b.route_trace, b.route_trace_len, b.route_trace_cap, b.st);
@@ -1233,7 +1243,9 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
         }
         // the planned experts copied into their slots before the MoE kernels read the layer's tables
         if (live) moe_cache(l, L.gu_e_stride, L.down_e_stride, ec, b.cache_list, b.st, plan_in_router ? nullptr : b.jobs_gu, b.njobs, static_live, fused_dn, fused_gu);
+        if (prof && live && b.cache_list) vp_record_misses(l, b.cache_list, b.st);
     }
+    if (prof) vp_stamp(13);
     // The scratch capacity covers main-model strides. MTP experts already reside in VRAM.
     char* stage = lyr >= 0 && lyr < NL ? b.moe_stage : nullptr;
     const unsigned char* hot = stage && b.moe_stage_hot
@@ -1254,19 +1266,24 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
     if (sh_in) moe_gate_up(gu, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st, &L.sh_down.s, ffs, b.sh_gu, b.part + (size_t) P * N);
     else moe_gate_up(gu, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st, nullptr, 0, nullptr, nullptr,
                      fused_dn ? &copy : nullptr, fused_gu ? &gu_copy : nullptr);
+    if (prof) vp_stamp(14);
     const DW down = stage_moe(down_source, L.down_e_stride, b.jobs_dn, b.njobs, P, stage, b.moe_stage_ep, b.st, hot);
-    moe_down(down, L.down_e_stride, b.jobs_dn, b.njobs, P, b.gu, b.part, b.st);
-    if (!sh_in) ck(cudaStreamWaitEvent(b.st, b.join, 0), "join wait");
+    if (sh_in_down) moe_down(down, L.down_e_stride, b.jobs_dn, b.njobs, P, b.gu, b.part, b.st, &L.sh_down.s, ffs, b.sh_gu, b.sh_hq, b.part + (size_t) P * N);
+    else moe_down(down, L.down_e_stride, b.jobs_dn, b.njobs, P, b.gu, b.part, b.st);
+    if (!sh_in && !sh_in_down) ck(cudaStreamWaitEvent(b.st, b.join, 0), "join wait");
+    if (prof) vp_stamp(15);
     RingMoe m;
     m.part = b.part;
     m.topw = b.topw;
     m.logits = b.logits;
     ring_sum(b.ring, b.bo_f, T, (const unsigned*) (ctl + 1), call, b.st, m);
+    if (prof) vp_stamp(16);
 }
 
 // every card's work for one window of T rows, in stream order (captured into a graph unless dumping)
-void Engine::enqueue(int T, bool dumps, bool greedy) {
+void Engine::enqueue(int T, bool dumps, bool greedy, bool compute_head) {
     const float eps = m_.eps;
+    const bool prof = verify_prof_active_;
     int call = 0;
     auto each = [&](auto&& f) {
         for (int c = 0; c < NCARD; ++c) {
@@ -1282,6 +1299,7 @@ void Engine::enqueue(int T, bool dumps, bool greedy) {
         // ---- attention half
         each([&](int c, CardBuf& b, const CardW& w) {
             const LayerW& L = w.L[l];
+            const bool p0 = prof && c == 0;
             bool apply = pending;
             if (l == PLE_LAYER) {
                 hc_write(b.R, b.bo_f, b.inj_f, T, b.st);
@@ -1291,9 +1309,11 @@ void Engine::enqueue(int T, bool dumps, bool greedy) {
                 dense(w.ple_value, b.xq, b.ple_val, b, T);
                 ple_post(b.R, b.ple_key, b.ple_val, w.ple_norm_key, w.ple_norm_query, w.ple_norm_conv, w.ple_conv,
                          b.ple_hist, b.ple_hsnap, T, eps, b.st, b.ple_key + (size_t) MAXT * D);
+                if (p0) vp_stamp(0);
             }
             hc_read(b.R, apply ? b.bo_f : nullptr, b.inj_f, L.hc_norm[0], L.hc_down[0], L.hc_up[0], L.hc_inj[0], eps, b.mixed,
                     b.inj_a, b.hcs, b.ring.err, T, b.st, b.xq);
+            if (p0) vp_stamp(1);
             if (!is_attn(l)) {
                 const int nv = w.nv(), ch = w.conv_ch();
                 // The two-card 8192-row projection uses the same R=2 arithmetic
@@ -1309,19 +1329,23 @@ void Engine::enqueue(int T, bool dumps, bool greedy) {
                     dense(L.qkvz, b.xq, b.qkvz, b, T);
                     ck(cudaStreamWaitEvent(b.st, b.join, 0), "join wait");
                 }
+                if (p0) vp_stamp(2);
                 gdn_core(b.qkvz, b.ab, b.chist[l], L.conv, L.dt_bias, L.ssm_a, L.ssm_norm, b.S[l], b.xq, b.ctl, b.gdn_scratch, b.snap[l],
                          b.hsnap[l], w.nk, nv, w.vmap, T, eps, b.st, nullptr, b.gdn_updates[l]);
+                if (p0) vp_stamp(3);
                 dense(L.ssm_out, b.xq, b.bo_a, b, T);
+                if (p0) vp_stamp(4);
             } else {
-                attention(T, b, w, L, b.kc[l], b.vc[l], b.ctl, b.qsa_ring[l], b.qsa_pooled[l], 128 + l);
+                attention(T, b, w, L, b.kc[l], b.vc[l], b.ctl, b.qsa_ring[l], b.qsa_pooled[l], 128 + l, false, p0);
             }
             ring_sum(b.ring, b.bo_a, T, (const unsigned*) (b.ctl + 1), call, b.st);
+            if (p0) vp_stamp(11);
         });
         ++call;
         dd("hc_mixed", l, cb_[0]->mixed, N);
         dd("mixer_out", l, cb_[0]->bo_a, N);
         // ---- FFN half
-        each([&](int, CardBuf& b, const CardW& w) { ffn_half(T, call, b, w, w.L[l], b.R, b.ctl, l); });
+        each([&](int c, CardBuf& b, const CardW& w) { ffn_half(T, call, b, w, w.L[l], b.R, b.ctl, l, prof && c == 0); });
         df2_tap_window(l, T);
         ++call;
         dd("ffn_mixed", l, cb_[0]->mixed, N);
@@ -1330,12 +1354,19 @@ void Engine::enqueue(int T, bool dumps, bool greedy) {
         dd("inj_ffn", l, cb_[0]->inj_f, HC);
     }
     // ---- head: the final mixer (no injection) with the last write folded in, then this card's vocabulary
-    each([&](int c, CardBuf& b, const CardW& w) {
-        hc_read(b.R, b.bo_f, b.inj_f, w.head_norm, w.head_down, w.head_up, nullptr, eps, b.mixed, b.inj_a, b.hcs, b.ring.err, T, b.st, b.xq);
-        dense(w.out, b.xq, b.head_logits, b, T);
-        if (greedy) argmax(b.head_logits, w.v1 - w.v0, T, w.v0, b.best_v, b.best_i, b.am_keys, b.ring.err, b.st);
-    });
-    dd("result_norm", -1, cb_[0]->mixed, N);
+    if (compute_head) {
+        each([&](int c, CardBuf& b, const CardW& w) {
+            hc_read(b.R, b.bo_f, b.inj_f, w.head_norm, w.head_down, w.head_up, nullptr, eps, b.mixed, b.inj_a, b.hcs, b.ring.err, T, b.st, b.xq);
+            dense(w.out, b.xq, b.head_logits, b, T);
+            if (prof && c == 0) vp_stamp(17);
+            if (greedy) argmax(b.head_logits, w.v1 - w.v0, T, w.v0, b.best_v, b.best_i, b.am_keys, b.ring.err, b.st);
+        });
+        dd("result_norm", -1, cb_[0]->mixed, N);
+    } else {
+        each([&](int, CardBuf& b, const CardW&) {
+            hc_write(b.R, b.bo_f, b.inj_f, T, b.st);
+        });
+    }
 }
 
 // enqueue()'s layers for a window of one row per lane (row r: lanes[r]): the shared work over all rows, the
@@ -1642,7 +1673,7 @@ void Engine::mtp_attach(const Mtp& mtp) {
 // one draft-layer window of T rows from b.mtp_src (rows of D) and b.mtp_emb (the tokens' embeddings), cells at
 // mtp_ctl[0]: R = fc_hidden(rms(src) w) per stream + fc_embedding(rms(emb) w), then the layer as a main attention
 // layer, then the final mixer and optionally this card's draft head rows
-void Engine::mtp_enqueue(int T, bool head, bool candidates) {
+void Engine::mtp_enqueue(int T, bool head, bool candidates, bool skip_pen, bool graph_topk) {
     const float eps = m_.eps;
     for (int c = 0; c < NCARD; ++c) {
         CardBuf& b = *cb_[c];
@@ -1684,16 +1715,28 @@ void Engine::mtp_enqueue(int T, bool head, bool candidates) {
             const void* input = (const uint8_t*) b.xq + (size_t) last * q8_1_bytes(N);
             if (mtp_head_mode_) mtp_head_gemv(mc.head, input, logits, mtp_head_mode_, b.st);
             else dense(mc.head, input, logits, b, 1);
-            penalize_row(logits, nv, b.mtp_pen, b.mtp_pen_par, b.st, candidates && mtp_head_mode_ >= 2);
+            if (!skip_pen) penalize_row(logits, nv, b.mtp_pen, b.mtp_pen_par, b.st, candidates && mtp_head_mode_ >= 2);
             if (!candidates) argmax(logits, nv, 1, mc.dv0, b.mtp_bv + last, b.mtp_bi + last, b.am_keys + last, b.ring.err, b.st);
         } else {
             if (mtp_head_mode_) mtp_head_gemv(mc.head, b.xq, b.mtp_logits, mtp_head_mode_, b.st);
             else dense(mc.head, b.xq, b.mtp_logits, b, T);
-            penalize_row(b.mtp_logits + (size_t) (T - 1) * (mc.dv1 - mc.dv0), mc.dv1 - mc.dv0, b.mtp_pen, b.mtp_pen_par, b.st,
-                         candidates && mtp_head_mode_ >= 2);
+            if (!skip_pen)
+                penalize_row(b.mtp_logits + (size_t) (T - 1) * (mc.dv1 - mc.dv0), mc.dv1 - mc.dv0, b.mtp_pen, b.mtp_pen_par, b.st,
+                             candidates && mtp_head_mode_ >= 2);
             // Top-k validates the sampled row. Preserve nonfinite checks on any earlier dense rows.
             const int reduce_rows = candidates ? T - 1 : T;
             if (reduce_rows) argmax(b.mtp_logits, mc.dv1 - mc.dv0, reduce_rows, mc.dv0, b.mtp_bv, b.mtp_bi, b.am_keys, b.ring.err, b.st);
+        }
+        if (graph_topk && candidates) {
+            const int nv = mc.dv1 - mc.dv0;
+            const int last = (mtp_last_head() && T > 1) || MTP_HEAD_EVERY_ROW ? T - 1 : 0;
+            if (nv > 0) {
+                ck(cudaMemsetAsync(b.mtp_tk_err, 0, 4, b.st), "draft top err");
+                fnx::top_tokens(b.mtp_logits + (size_t) last * nv, nv, 1, mc.dv0, nullptr, nullptr, nullptr, 0, nullptr,
+                                b.mtp_tk_v, b.mtp_tk_i, b.mtp_tk_err, b.st, true);
+            }
+            if (draft_sample_io_mode())
+                ck(cudaMemcpyAsync(&b.mtp_sample_packet->error, err_word(b), sizeof(unsigned), cudaMemcpyDeviceToDevice, b.st), "draft packet error");
         }
     }
 }
