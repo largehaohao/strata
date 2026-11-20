@@ -898,8 +898,10 @@ this profile.
 
 For sampled decode, each column below uses three 384-token requests. The
 draft chain was fixed at six, the main top-k had 32 partitions, and the
-sampling temperature was 0.8. The penalty case used a 256-token window.
-Throughput is total generated tokens divided by total decode time.
+sampling temperature was 0.8. The sample column used an LRU cache prompt
+and seed 284. The penalty column used a JSON Lines processor prompt, seed
+381 and a 256-token window. Each column compares draft settings on its own
+workload. Throughput is total generated tokens divided by total decode time.
 
 | IQ2_XS draft settings | Sample, tok/s | Sample with penalties, tok/s |
 | --- | ---: | ---: |
@@ -934,8 +936,10 @@ bulk copy reproduced every source byte and preserved the destination guards.
 The final run compared each installed profile with its previous executable
 and settings. Each request used the same input, sampling parameters and seed
 as its reference. IQ2_XS ran twice per case, IQ3_XXS and Swift once per case.
-All 24 final requests matched token-for-token. All profiles used 32 main
-and draft top-k partitions and enabled prefill copy overlap with two blocks.
+All 24 final requests matched token-for-token. All profiles used the default
+adaptive draft length, 32 main and draft top-k partitions, and prefill copy
+overlap with two blocks. The before/after
+columns include all engine and profile changes in this deployment.
 
 | Profile | Sampled decode before / after, tok/s | With penalties before / after, tok/s | 32K prefill before / after, tok/s |
 | --- | ---: | ---: | ---: |
@@ -959,3 +963,64 @@ with identical prompt, reuse, generation and draft acceptance counts. On the
 177.2 on the deployed one. Total generated tokens divided by total decode
 time was 176.64 and 176.49 tok/s respectively. Both accepted 982 of 2147
 draft tokens and generated 1539 follow-up tokens.
+
+## Penalty windows and speculative acceptance on two RX 7900 XTX cards
+
+Single-lane decoding now builds the penalty counts once per request. Draft
+and verify temporarily advance the same window, then restore the evicted
+tokens in reverse order. Only emitted tokens carry into the next round.
+Image positions still take a place in the window. A CPU test compared
+123,605 intermediate rows against a fresh count of the token history,
+including windows shorter than the draft chain and windows of 4,096.
+
+Each GPU reads verify penalties in one host-to-device copy when needed.
+The payload includes each row's parameters, length, token IDs and counts.
+The host's pinned verify result slots now have a 64-byte boundary per card.
+A sampled draft returns 520 bytes per card per call, down from 704 bytes.
+The device still uses the greedy scratch fields. On a Ryzen 7 7700, with a
+256-token window, preparing seven verify rows and six draft rows took
+15.63 µs per round before and 2.50 µs after (medians of six host runs,
+10,000 rounds per run, four committed tokens per round).
+
+For the controlled comparison, each quantization ran the same two coding
+prompts with seeds 284, 381 and 727. The LRU cache prompt was 64 tokens and
+the JSON Lines processor prompt was 60. Sampling used temperature 0.8,
+top-k 20, top-p 0.95 and a maximum of 384 new tokens. Each prompt was read
+fresh.
+The penalty settings were repeat 1.05, frequency 0.3 and presence 1 over the
+last 256 positions. Fixed chains used six MTP drafts, with lookup enabled.
+Each throughput figure divides total generated tokens by total decode time.
+Acceptance is the fraction of offered drafts that contributed an output token.
+
+The following measurements use the previous deployed engine (`5dc3955bd`).
+
+| Quantization, fixed chain | Decode off / on, tok/s | Accepted off / on | Output tokens per verify round, off / on | GPU verify per round, off / on |
+| --- | ---: | ---: | ---: | ---: |
+| Unsloth UD-IQ2_XS | 237.96 / 164.37 | 53.39% / 31.79% | 4.14 / 2.89 | 14.23 / 14.32 ms |
+| Unsloth UD-IQ3_XXS | 236.06 / 162.76 | 56.95% / 33.11% | 4.35 / 2.97 | 15.22 / 14.98 ms |
+
+A frequency penalty of `1e-30` exercised penalty handling while preserving
+the generated tokens and draft counts on all 12 fixed-chain controls. These
+ran at 237.96 and 236.92 tok/s for IQ2_XS and IQ3_XXS respectively. With
+the full penalties, the smaller number of tokens per verify round accounts
+for most of the throughput loss on these prompts. The experiment measured
+draft acceptance and timings. It did not measure distribution entropy.
+
+Enabling adaptive chain length with the full penalties gave 187.13 tok/s
+on IQ2_XS and 183.55 tok/s on IQ3_XXS. The three serving profiles already
+use this default. The greedy agent follow-ups above use temperature zero,
+so this sampled penalty comparison describes a different workload.
+
+The new HIP executable reproduced the fixed-chain outputs with the full
+penalties at 164.21 tok/s on IQ2_XS and 162.97 tok/s on IQ3_XXS. Across
+both models and all three penalty settings, the largest old-to-new rate
+change in this run was 0.25%. With adaptive chains and full penalties, the
+new build ran at 186.88 and 183.04 tok/s respectively. The CPU saving above
+had little effect on end-to-end throughput.
+
+Across the two Unsloth models and Swift IQ3_S, 84 old/new request pairs
+matched every token ID, finish reason and draft acceptance count (27,206
+generated tokens per executable, excluding warmups). This included greedy,
+lookup, sampled decode with and without penalties, and 4K/32K prefill.
+The tested gfx1100 executable has SHA-256
+`d0aed6f6a87125b836594ba8923ef6b30099bf359b043e4c6ad95ad491b1c72f`.

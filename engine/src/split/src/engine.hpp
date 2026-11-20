@@ -26,6 +26,7 @@ struct Refused : std::runtime_error {
 
 struct DraftSamplePacket;
 struct VerifySamplePacket;
+struct VerifyPenaltyInput;
 struct DraftSampleInput;
 struct CardBuf;
 struct CardPool;
@@ -337,9 +338,8 @@ private:
         void* rows_commit_jobs;   // per card: commit_rows()'s, room for MAXT lanes
     } h_{};
     struct TopHost {             // top_tokens()'s page-locked copies
-        int *pen_tok = nullptr, *pen_cnt = nullptr, *pen_n = nullptr;
+        VerifyPenaltyInput* penalties = nullptr;
         VerifySamplePacket* packet = nullptr;
-        float* par = nullptr;   // per row: repeat, freq, present
     } tk_;
     // a window's rows r .. r + k - 1 in its page-locked inputs (h_.R0, and what else the model reads), for positions
     // p0 .. p0 + k - 1 (tok_at: the token at a position); batched: the caller's name when the rows are a batched

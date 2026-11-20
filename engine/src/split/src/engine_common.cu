@@ -731,39 +731,48 @@ std::vector<float> Engine::last_logits(int T) const {
     return out;
 }
 
+struct VerifyPenaltyInput {
+    float params[3 * MAXT];   // repeat, frequency and presence per row
+    int lengths[MAXT];
+    // T * stride token IDs, followed immediately by T * stride counts.
+    int entries[2 * MAXT * Engine::PEN_CAP];
+};
+
 int Engine::prepare_top_tokens(int T, const Penalties& pen) {
     if (T < 1 || T > MAXT) throw std::runtime_error("top_tokens: 1..MAXT rows");
     if (!pen.rows.empty() && (int) pen.rows.size() != T) throw std::runtime_error("top_tokens: one penalty list per row");
-    if (!tk_.pen_tok) {
-        tk_.pen_tok = halloc<int>((size_t) MAXT * PEN_CAP);
-        tk_.pen_cnt = halloc<int>((size_t) MAXT * PEN_CAP);
-        tk_.pen_n = halloc<int>(MAXT);
-        tk_.packet = halloc<VerifySamplePacket>(NCARD);
-        tk_.par = halloc<float>((size_t) MAXT * 3);
+    if (!tk_.packet) {
         for (CardBuf* b : cb_) {
             ck(cudaSetDevice(b->dev), "set");
-            b->tk_pen_tok = dalloc<int>((size_t) MAXT * PEN_CAP);
-            b->tk_pen_cnt = dalloc<int>((size_t) MAXT * PEN_CAP);
-            b->tk_pen_n = dalloc<int>(MAXT);
             b->tk_packet = dalloc<VerifySamplePacket>(1);
-            b->tk_par = dalloc<float>((size_t) MAXT * 3);
         }
+        tk_.packet = halloc<VerifySamplePacket>(NCARD);
     }
     // the rows' penalty lists at the stride of the longest (the copies carry only what is used)
     int stride = 0;
     for (const auto& row : pen.rows) stride = std::max(stride, (int)row.counts.size());
     if (!stride) return 0;
     if (stride > PEN_CAP) throw std::runtime_error("top_tokens: more penalized tokens than " + std::to_string(PEN_CAP));
+    if (!tk_.penalties) {
+        for (CardBuf* b : cb_) {
+            ck(cudaSetDevice(b->dev), "set");
+            b->tk_penalties = dalloc<VerifyPenaltyInput>(1);
+        }
+        tk_.penalties = halloc<VerifyPenaltyInput>(1);
+        std::memset(tk_.penalties, 0, sizeof(VerifyPenaltyInput));
+    }
+    auto& input = *tk_.penalties;
+    int* counts = input.entries + T * stride;
     for (int t = 0; t < T; ++t) {
         const Penalties::Row& row = pen.rows[(size_t) t];
         const auto& r = row.counts;
-        tk_.par[3 * t] = row.repeat;
-        tk_.par[3 * t + 1] = row.freq;
-        tk_.par[3 * t + 2] = row.present;
-        tk_.pen_n[t] = (int) r.size();
+        input.params[3 * t] = row.repeat;
+        input.params[3 * t + 1] = row.freq;
+        input.params[3 * t + 2] = row.present;
+        input.lengths[t] = (int) r.size();
         for (size_t k = 0; k < r.size(); ++k) {
-            tk_.pen_tok[(size_t) t * stride + k] = r[k].first;
-            tk_.pen_cnt[(size_t) t * stride + k] = r[k].second;
+            input.entries[(size_t) t * stride + k] = r[k].first;
+            counts[(size_t) t * stride + k] = r[k].second;
         }
     }
     return stride;
@@ -772,17 +781,21 @@ int Engine::prepare_top_tokens(int T, const Penalties& pen) {
 void Engine::enqueue_top_tokens(int c, int T, int stride) {
     CardBuf& b = *cb_[c];
     const CardW& w = m_.cards[c];
+    const auto* input = b.tk_penalties;
+    const int* ids = nullptr;
+    const int* counts = nullptr;
     if (stride) {
-        ck(cudaMemcpyAsync(b.tk_pen_tok, tk_.pen_tok, (size_t) T * stride * 4, cudaMemcpyHostToDevice, b.st), "penalties");
-        ck(cudaMemcpyAsync(b.tk_pen_cnt, tk_.pen_cnt, (size_t) T * stride * 4, cudaMemcpyHostToDevice, b.st), "penalties");
-        ck(cudaMemcpyAsync(b.tk_pen_n, tk_.pen_n, (size_t) T * 4, cudaMemcpyHostToDevice, b.st), "penalties");
-        ck(cudaMemcpyAsync(b.tk_par, tk_.par, (size_t) T * 3 * 4, cudaMemcpyHostToDevice, b.st), "penalties");
+        const size_t slots = (size_t) T * stride;
+        const size_t bytes = offsetof(VerifyPenaltyInput, entries) + 2 * slots * sizeof(int);
+        ck(cudaMemcpyAsync(b.tk_penalties, tk_.penalties, bytes, cudaMemcpyHostToDevice, b.st), "verify penalties");
+        ids = input->entries;
+        counts = ids + slots;
     }
     auto* packet = b.tk_packet;
     const size_t count = (size_t)T * TOPK_N, first = MAXT * TOPK_N - count;
     ck(cudaMemsetAsync(&packet->top_error, 0, sizeof(unsigned), b.st), "top err");
-    fnx::top_tokens(b.head_logits, w.v1 - w.v0, T, w.v0, b.tk_pen_tok, b.tk_pen_cnt, stride ? b.tk_pen_n : nullptr,
-                    stride, b.tk_par, packet->values + first, packet->ids, &packet->top_error, b.st);
+    fnx::top_tokens(b.head_logits, w.v1 - w.v0, T, w.v0, ids, counts, stride ? input->lengths : nullptr,
+                    stride, stride ? input->params : nullptr, packet->values + first, packet->ids, &packet->top_error, b.st);
     ck(cudaMemcpyAsync(&packet->window_error, err_word(b), sizeof(unsigned), cudaMemcpyDeviceToDevice, b.st), "verify packet error");
     const size_t bytes = count * (sizeof(float) + sizeof(int)) + 2 * sizeof(unsigned);
     const size_t offset = first * sizeof(float);
@@ -1549,7 +1562,8 @@ int Engine::draft_rows(const std::vector<const float*>& src, int T, const std::v
         ck(cudaEventRecord(b.ev1, b.st), "event");
         if (sample_io) {
             ck(cudaMemcpyAsync(&b.mtp_sample_packet->error, err_word(b), sizeof(unsigned), cudaMemcpyDeviceToDevice, b.st), "draft packet error");
-            ck(cudaMemcpyAsync(h_.mtp_sample_packet + c, b.mtp_sample_packet, sizeof(DraftSamplePacket), cudaMemcpyDeviceToHost, b.st), "draft result packet");
+            constexpr size_t bytes = offsetof(DraftSamplePacket, error) + sizeof(unsigned);
+            ck(cudaMemcpyAsync(h_.mtp_sample_packet + c, b.mtp_sample_packet, bytes, cudaMemcpyDeviceToHost, b.st), "draft result packet");
         } else {
             if (head && !cands) {
                 ck(cudaMemcpyAsync(&h_.bv[c], b.mtp_bv + last, 4, cudaMemcpyDeviceToHost, b.st), "draft v");

@@ -14,6 +14,8 @@
 
 namespace fnx {
 
+struct VerifyPenaltyInput;
+
 // a lane's state on one card: its page table, recurrent states and histories, QSA raw-key rings; the engine's
 // current-lane pointers in CardBuf are a copy of the lane's (Engine::use_lane)
 struct LaneDev {
@@ -50,9 +52,8 @@ struct CardBuf {
     void* sh_hq;                      // its h as q8_1
     float *ple_emb, *ple_key, *ple_val;
     float* head_logits;
-    int *tk_pen_tok = nullptr, *tk_pen_cnt = nullptr, *tk_pen_n = nullptr;   // top_tokens()
+    VerifyPenaltyInput* tk_penalties = nullptr;   // top_tokens()
     VerifySamplePacket* tk_packet = nullptr;
-    float* tk_par = nullptr;
     float* best_v;
     int* best_i;
     unsigned long long* am_keys;      // argmax's per-row keys

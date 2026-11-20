@@ -5,7 +5,8 @@
 #include "env.hpp"
 #include "kernels.hpp"
 namespace fnx {
-struct VerifySamplePacket {
+// Each card writes its own pinned result slot, including when every row is active.
+struct alignas(64) VerifySamplePacket {
     // Right-align the active scores and left-align IDs so T rows and both errors copy together.
     float values[MAXT * TOPK_N];
     unsigned top_error, window_error;
@@ -13,12 +14,15 @@ struct VerifySamplePacket {
 };
 static_assert(offsetof(VerifySamplePacket, ids) == MAXT * TOPK_N * sizeof(float) + 2 * sizeof(unsigned),
               "verify packet layout");
+static_assert(alignof(VerifySamplePacket) == 64 && sizeof(VerifySamplePacket) % 64 == 0,
+              "verify result slots occupy whole cache lines");
 struct alignas(64) DraftSamplePacket {
     float values[TOPK_N];
     int ids[TOPK_N];
-    float best_v[MAXT];
-    int best_i[MAXT];
     unsigned top_error, error;
+    // Device scratch for greedy reductions; sampled D2H ends at error.
+    alignas(64) float best_v[MAXT];
+    int best_i[MAXT];
 };
 struct alignas(64) DraftSampleInput {
     int ctl[2];

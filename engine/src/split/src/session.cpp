@@ -3,6 +3,7 @@
 #include "lookup.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <random>
 #include <optional>
@@ -89,46 +90,64 @@ namespace {
 // The ring counts image positions towards the window but never penalizes an image ID.
 class PenaltyWindow {
 public:
-    PenaltyWindow(const std::vector<int>& seq, const Sampling& s) : limit_(s.pen_last_n) {
+    PenaltyWindow(const std::vector<int>& seq, const Sampling& s) : ring_(s.pen_last_n, Engine::IMAGE_TOK) {
         row.repeat = s.pen_repeat;
         row.freq = s.pen_freq;
         row.present = s.pen_present;
-        const size_t start = seq.size() - std::min(seq.size(), limit_);
-        ring_.reserve(limit_);
+        const size_t start = seq.size() - std::min(seq.size(), ring_.size());
         index_.reserve(seq.size() - start);
         for (size_t i = start; i < seq.size(); ++i) append(seq[i]);
     }
 
-    void append(int token) {
-        if (!limit_) return;
-        if (ring_.size() == limit_) {
-            const int old = ring_[next_];
-            ring_[next_] = token;
-            next_ = (next_ + 1) % limit_;
-            if (old == token) return;
-            if (old < Engine::IMAGE_TOK) {
-                const size_t pos = index_.at(old);
-                if (--row.counts[pos].second == 0) {
-                    row.counts[pos] = row.counts.back();
-                    index_[row.counts[pos].first] = pos;
-                    row.counts.pop_back();
-                    index_.erase(old);
-                }
-            }
-        } else ring_.push_back(token);
+    int append(int token) {
+        if (ring_.empty()) return Engine::IMAGE_TOK;
+        const int old = replace(next_, token);
+        if (++next_ == ring_.size()) next_ = 0;
+        return old;
+    }
 
-        if (token < Engine::IMAGE_TOK) {
-            auto [it, fresh] = index_.emplace(token, row.counts.size());
-            if (fresh) row.counts.emplace_back(token, 1);
-            else ++row.counts[it->second].second;
+    // Save the evictions so even a draft chain longer than the penalty window can be undone.
+    void append_draft(int token) {
+        if (ring_.empty()) return;
+        int& old = evicted_.at(draft_count_);
+        old = append(token);
+        ++draft_count_;
+    }
+    void discard_drafts() {
+        while (draft_count_) {
+            const int old = evicted_[--draft_count_];
+            if (!next_) next_ = ring_.size();
+            replace(--next_, old);
         }
     }
 
     Engine::Penalties::Row row;
 private:
-    size_t limit_, next_ = 0;
+    int replace(size_t slot, int token) {
+        const int old = ring_[slot];
+        if (old == token) return old;
+        ring_[slot] = token;
+        if (old < Engine::IMAGE_TOK) {
+            const size_t pos = index_.at(old);
+            if (--row.counts[pos].second == 0) {
+                row.counts[pos] = row.counts.back();
+                index_[row.counts[pos].first] = pos;
+                row.counts.pop_back();
+                index_.erase(old);
+            }
+        }
+        if (token < Engine::IMAGE_TOK) {
+            auto [it, fresh] = index_.emplace(token, row.counts.size());
+            if (fresh) row.counts.emplace_back(token, 1);
+            else ++row.counts[it->second].second;
+        }
+        return old;
+    }
+    size_t next_ = 0;
     std::vector<int> ring_;
     std::unordered_map<int, size_t> index_;
+    std::array<int, MAXT - 1> evicted_;
+    size_t draft_count_ = 0;
 };
 }  // namespace
 
@@ -523,6 +542,8 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
     const auto t0 = std::chrono::steady_clock::now();
     timing_ = &st;
     std::vector<int> ctx(prompt_);   // every token so far, the next window's first row last
+    std::optional<PenaltyWindow> window;
+    if (penalize) window.emplace(ctx, s);
     LookupIndex index;
     const bool indexed = env_flag("FNX_LOOKUP_INDEX");
     auto lookup = [&](int first) {
@@ -564,12 +585,13 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
         const int p = e_.pos();
         const auto tv = std::chrono::steady_clock::now();
         Engine::Penalties pen;
-        if (penalize) {
-            PenaltyWindow window(ctx, s);
+        if (window) {
+            pen.rows.reserve(rows.size());
             for (size_t j = 0; j < rows.size(); ++j) {
-                if (j) window.append(rows[j]);
-                pen.rows.push_back(window.row);
+                if (j) window->append_draft(rows[j]);
+                pen.rows.push_back(window->row);
             }
+            window->discard_drafts();
         }
         Engine::Candidates cand;
         std::vector<int> o;
@@ -660,6 +682,8 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
         ctx.insert(ctx.end(), o.begin(), o.begin() + used);
         x = o[used - 1];
         if (done) break;
+        if (window)
+            for (int j = 0; j < used; ++j) window->append(o[j]);
         // the draft layer reads the kept rows either way (its cells stay current for later turns)
         mtp_round = false;
         if (df2) {
@@ -706,9 +730,7 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
                 continue;
             }
         }
-        std::optional<PenaltyWindow> draft_window;
-        if (pen_drafts) draft_window.emplace(ctx, s);
-        const auto* draft_pen = draft_window ? &draft_window->row : nullptr;
+        const auto* draft_pen = pen_drafts ? &window->row : nullptr;
         Dist q1;
         const int d1 = draft_one(used, true, 0, std::vector<int>(o.begin(), o.begin() + used), p, draft_pen, q1);
         if (!speculate) {
@@ -734,11 +756,12 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
         const int next_room = e_.max_ctx() - e_.pos() - 1;
         const int chain = k > next_room ? std::min(next_room, max_new - produced - 1) : k;
         for (int j = 1; j < chain; ++j) {
-            if (draft_window) draft_window->append(drafts.back());
+            if (pen_drafts) window->append_draft(drafts.back());
             Dist q;
             drafts.push_back(draft_one(1, false, j == 1 ? used - 1 : 0, {drafts.back()}, p + used - 1 + j, draft_pen, q));
             qs.push_back(std::move(q));
         }
+        if (pen_drafts) window->discard_drafts();
     }
     prompt_.clear();
     timing_ = nullptr;
