@@ -1062,8 +1062,9 @@ __global__ void __launch_bounds__(256) kernel_hcdown(const uint16_t* __restrict_
 
 // The native HC down tile with FP16 operands and the original ascending K order.
 // BK64 reuses each loaded operand over four WMMAs; the old narrow tile uses BK32.
+template<bool Quantized = false>
 __global__ void __launch_bounds__(256) kernel_narrow_bk64(const _Float16* __restrict__ X, int ldx,
-    const _Float16* __restrict__ W, int ldw, float* __restrict__ Y, int M, int N, int K, int ldy) {
+    const void* __restrict__ W, int ldw, float* __restrict__ Y, int M, int N, int K, int ldy, const uint16_t* scales = nullptr) {
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__)
     constexpr int BN = 128, WN = 32, TN = 2, BK64 = 64, LDK64 = BK64 + 8;
     __shared__ __align__(16) _Float16 sA[BM][LDK64];
@@ -1079,8 +1080,18 @@ __global__ void __launch_bounds__(256) kernel_narrow_bk64(const _Float16* __rest
     };
     auto ldB = [&](int k0, int r) -> uint4 {
         const int n = min(n0 + r, N - 1);
-        const _Float16* row = W + (size_t) n * ldw;
-        return *reinterpret_cast<const uint4*>(row + k0 + 8 * sq);
+        const size_t index = (size_t)n * ldw + k0 + 8 * sq;
+        if constexpr (Quantized) {
+            using Bytes = int8_t __attribute__((ext_vector_type(8)));
+            using Halves = _Float16 __attribute__((ext_vector_type(8)));
+            Bytes q;
+            __builtin_memcpy(&q, static_cast<const int8_t*>(W) + index, sizeof(q));
+            const float scale = (float)__builtin_bit_cast(_Float16, scales[index / 32]);
+            Halves values;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) values[i] = (_Float16)(scale * (float)q[i]);
+            return __builtin_bit_cast(uint4, values);
+        } else return *reinterpret_cast<const uint4*>(static_cast<const _Float16*>(W) + index);
     };
     uint4 ra0, ra1, ra2, ra3, rb0, rb1, rb2, rb3;
     auto load = [&](int k0) {
@@ -1402,6 +1413,15 @@ bool strata_pf_wide_gsu3_f16(const uint16_t* x, const uint16_t* w, float* y, int
     return false;
 }
 
+bool strata_pf_hcdown_q8_f16(const uint16_t* x, const int8_t* q, const uint16_t* scales, float* y, int rows, void* stream) {
+    if (!x || !q || !scales || !y || rows < 64 || rows > 4096 || !strata_wmma_gfx11_device()) return false;
+    constexpr int K = 10240, N = 320;
+    const unsigned grid = ((rows + pfg::BM - 1) / pfg::BM) * ((N + 127) / 128);
+    pfg::kernel_narrow_bk64<true><<<grid, 256, 0, static_cast<hipStream_t>(stream)>>>(
+        (const _Float16*)x, K, q, K, y, rows, N, K, N, scales);
+    return hipGetLastError() == hipSuccess;
+}
+
 bool strata_pf_gemm_narrow_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t* W, int64_t ldw, float* Y,
                                   int64_t T, int64_t N, int64_t K, int64_t ldy, void* stream) {
     if (!X || !W || !Y || T < 64 || N < 1 || N >= 512 || K < pfg::BK || K % pfg::BK != 0 || ldy < N ||
@@ -1488,6 +1508,7 @@ bool strata_pf_hcup_mix_f16(const uint16_t*, const uint16_t*, const float*, cons
                             int64_t, int64_t, int64_t, void*) {
     return false;
 }
+bool strata_pf_hcdown_q8_f16(const uint16_t*, const int8_t*, const uint16_t*, float*, int, void*) { return false; }
 bool strata_pf_gemm_narrow_f16_ld(const uint16_t*, int64_t, const uint16_t*, int64_t, float*, int64_t, int64_t, int64_t,
                                   int64_t, void*) {
     return false;

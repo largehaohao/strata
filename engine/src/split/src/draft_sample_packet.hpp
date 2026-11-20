@@ -1,10 +1,18 @@
-// Coalesced transport for sampled draft results; no arithmetic or sampler change.
+// Result buffers shared by the sampled verify and draft paths with their host readers.
 #pragma once
 #include <cstddef>
 #include <type_traits>
 #include "env.hpp"
 #include "kernels.hpp"
 namespace fnx {
+struct VerifySamplePacket {
+    // Right-align the active scores and left-align IDs so T rows and both errors copy together.
+    float values[MAXT * TOPK_N];
+    unsigned top_error, window_error;
+    int ids[MAXT * TOPK_N];
+};
+static_assert(offsetof(VerifySamplePacket, ids) == MAXT * TOPK_N * sizeof(float) + 2 * sizeof(unsigned),
+              "verify packet layout");
 struct alignas(64) DraftSamplePacket {
     float values[TOPK_N];
     int ids[TOPK_N];

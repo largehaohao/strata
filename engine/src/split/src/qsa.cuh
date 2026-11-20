@@ -22,7 +22,8 @@ __device__ __forceinline__ float bf16f(uint16_t h) { return __uint_as_float((uns
 template <int T>
 __global__ void __launch_bounds__(256) k_idx_proj(const uint16_t* __restrict__ wq, const uint16_t* __restrict__ wk,
                                                  const float* __restrict__ x, float* __restrict__ y) {
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, r = blockIdx.x * 8 + warp;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int r = (wq ? 0 : QSA_HEADS * QSA_DIM) + blockIdx.x * 8 + warp;
     if (r >= QSA_ROWS) return;
     const uint16_t* w = r < QSA_HEADS * QSA_DIM ? wq + (size_t) r * N : wk + (size_t) (r - QSA_HEADS * QSA_DIM) * N;
     float acc[T] = {};
@@ -100,7 +101,7 @@ __global__ void __launch_bounds__(QSA_DIM) k_idx_pool(const __half* ring, int ri
 __global__ void __launch_bounds__(QSA_DIM) k_idx_prep_pool(const float* __restrict__ y, const float* __restrict__ qn,
                                                            const float* __restrict__ kn, __half* ring, int ring_rows, float* __restrict__ q,
                                                            __half* pooled, KvPages g, const int* pos0p, float eps, Rope base) {
-    const int t = blockIdx.x, part = blockIdx.y, i = threadIdx.x, pos0 = *pos0p, p = pos0 + t;
+    const int t = blockIdx.x, part = blockIdx.y + (q ? 0 : QSA_HEADS), i = threadIdx.x, pos0 = *pos0p, p = pos0 + t;
     __shared__ float sh[32];
     __shared__ float buf[QSA_DIM];
     const float* yt = y + (size_t) t * QSA_ROWS;

@@ -25,6 +25,7 @@ struct Refused : std::runtime_error {
 };
 
 struct DraftSamplePacket;
+struct VerifySamplePacket;
 struct DraftSampleInput;
 struct CardBuf;
 struct CardPool;
@@ -295,7 +296,7 @@ private:
     std::chrono::steady_clock::time_point arena_last_lend_{};
     void arena_fill(int c, cudaStream_t st);   // card c's arena pool slots from the experts' host copies, the tables (on st)
     size_t arena_slot_off(int c) const;     // where card c's arena pool slots start in its pool allocation
-    void arena_set(int w);                  // the K/V pool's top to w pages: slots lent or given back on every card
+    void arena_set(int w, int scratch_begin = -1);  // lend up to w pages, reserving the optional scratch tail from K/V
     void arena_refill(int c, int from, int to);   // card c's slots [to, from), given back, filled again (hottest missing first)
     int arena_slots_for(int c, int w) const;   // the arena pool's slots card c lends for a top of w pages
     void ensure_pages(int n_pos);   // the current lane's pages cover positions 0 .. n_pos - 1
@@ -337,9 +338,7 @@ private:
     } h_{};
     struct TopHost {             // top_tokens()'s page-locked copies
         int *pen_tok = nullptr, *pen_cnt = nullptr, *pen_n = nullptr;
-        float* v = nullptr;
-        int* i = nullptr;
-        unsigned* err = nullptr;
+        VerifySamplePacket* packet = nullptr;
         float* par = nullptr;   // per row: repeat, freq, present
     } tk_;
     // a window's rows r .. r + k - 1 in its page-locked inputs (h_.R0, and what else the model reads), for positions
@@ -395,8 +394,8 @@ private:
     void df2_catch_up(int lane, int pos0);
     void df2_forget(int lane);       // the lane's sequence changed: drafter ring and host ring empty
     void df2_prompt_tap(int slot, int pos_first, int row, int n, CardBuf& b, const float* R, const float* bo, const float* inj);
-    int mtp_head_mode_ = 0;  // per-call draft mode; zero for penalties and sampled candidates
-    void mtp_enqueue(int T, bool head = true);
+    int mtp_head_mode_ = 0;  // per-call draft head, including opt-in sampled proposals
+    void mtp_enqueue(int T, bool head, bool candidates);
     void mtp_enqueue_lanes(const std::vector<DraftReq>& reqs, int T);
     const Mtp* mtp_ = nullptr;
     std::vector<Pf*> pf_;

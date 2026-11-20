@@ -16,11 +16,24 @@ inline int topk_parts_mode() {
     static const int parts = [] {
         const auto p = env_int("FNX_TOPK_PARTS", 0);
         if (p != 0 && p != 2 && p != 4 && p != 8 && p != 16 && p != 32)
-            throw std::runtime_error("FNX_TOPK_PARTS: expected0,2,4,8,16,32");
+            throw std::runtime_error("FNX_TOPK_PARTS: expected 0, 2, 4, 8, 16 or 32");
 #if !FNX_HIP || FNX_NCARD != 2 || FNX_27B
         if (p) throw std::runtime_error("FNX_TOPK_PARTS requires two-card HIP Flash-Next");
 #endif
+        if (!p && topk_exact_fast_mode())
+            throw std::runtime_error("FNX_TOPK_EXACT_FAST requires FNX_TOPK_PARTS");
         return (int)p;
+    }();
+    return parts;
+}
+inline int draft_topk_parts() {
+    static const int parts = [] {
+        const auto n = env_int("FNX_DRAFT_TOPK_PARTS", 0);
+        if (!n) return topk_parts_mode();
+        if (n != 2 && n != 4 && n != 8 && n != 16 && n != 32)
+            throw std::runtime_error("FNX_DRAFT_TOPK_PARTS: expected 0, 2, 4, 8, 16 or 32");
+        if (!topk_parts_mode()) throw std::runtime_error("FNX_DRAFT_TOPK_PARTS requires FNX_TOPK_PARTS");
+        return (int)n;
     }();
     return parts;
 }
@@ -48,13 +61,15 @@ __global__ void __launch_bounds__(PART_THREADS) k_topk_parts(float* __restrict__
     if (bad) atomicOr(err, 16u);
     __syncthreads();   // every logit checked before any penalty changes one
     // the row's penalties on this card's tokens (each token once in the list)
-    const float repeat = pen_par[row * 3], freq = pen_par[row * 3 + 1], present = pen_par[row * 3 + 2];   // the row's penalty parameters
-    for (int i = tid; i < pen_n[row]; i += PART_THREADS) {
-        const int tok = pen_tok[row * pen_stride + i] - v0, cnt = pen_cnt[row * pen_stride + i];
-        if (tok < 0 || tok >= n || cnt <= 0) continue;
-        float l = L[tok];
-        l = l <= 0.f ? l * repeat : l / repeat;
-        L[tok] = l - (float) cnt * freq - present;
+    if (pen_n) {
+        const float repeat = pen_par[row * 3], freq = pen_par[row * 3 + 1], present = pen_par[row * 3 + 2];   // the row's penalty parameters
+        for (int i = tid; i < pen_n[row]; i += PART_THREADS) {
+            const int tok = pen_tok[row * pen_stride + i] - v0, cnt = pen_cnt[row * pen_stride + i];
+            if (tok < 0 || tok >= n || cnt <= 0) continue;
+            float l = L[tok];
+            l = l <= 0.f ? l * repeat : l / repeat;
+            L[tok] = l - (float) cnt * freq - present;
+        }
     }
     __syncthreads();
     // the TOPK_N-th highest key: four passes of 8 bits
@@ -251,10 +266,10 @@ inline std::shared_ptr<TopKPartsScratch> topk_parts_scratch(cudaStream_t stream,
     return scratch;
 }
 inline bool topk_parts(float* logits, int n, int T, int v0, const int* pen_tok, const int* pen_cnt,
-    const int* pen_n, int pen_stride, const float* pen_par, float* out_v, int* out_i, unsigned* err, void* stream) {
-    const int parts = topk_parts_mode();
+    const int* pen_n, int pen_stride, const float* pen_par, float* out_v, int* out_i, unsigned* err, void* stream, bool draft = false) {
+    const int parts = draft ? draft_topk_parts() : topk_parts_mode();
     if (!parts || T < 1 || T > MAXT || n - (parts - 1) * ((n + parts - 1) / parts) < TOPK_N) return false;
-    auto scratch = topk_parts_scratch((cudaStream_t)stream, parts);
+    auto scratch = topk_parts_scratch((cudaStream_t)stream, std::max(topk_parts_mode(), draft_topk_parts()));
     if (!scratch) return false;
     const int fast = topk_exact_fast_mode();
     topk_partition_launch(logits,n,T,v0,parts,pen_tok,pen_cnt,pen_n,pen_stride,pen_par,scratch->values,scratch->ids,err,(cudaStream_t)stream,fast);
@@ -271,8 +286,9 @@ inline bool topk_parts(float* logits, int n, int T, int v0, const int* pen_tok, 
 
 #else
 namespace {
-inline bool topk_parts(float*, int, int, int, const int*, const int*, const int*, int, const float*, float*, int*, unsigned*, void*) {
-    (void)topk_parts_mode();return false;
+inline bool topk_parts(float*, int, int, int, const int*, const int*, const int*, int, const float*, float*, int*, unsigned*, void*, bool = false) {
+    (void)draft_topk_parts();
+    return false;
 }
 }
 #endif

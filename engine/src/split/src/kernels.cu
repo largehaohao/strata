@@ -17,6 +17,7 @@
 #include <mutex>
 #include <atomic>
 #include <cmath>
+#include <cfloat>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -1529,7 +1530,7 @@ int qsa_rows() { return QSA_ROWS; }
 
 void qsa_proj(const uint16_t* wq, const uint16_t* wk, const float* x, float* y, int T, void* st) {
     cudaStream_t s = (cudaStream_t) st;
-    const int grid = (QSA_ROWS + 7) / 8;
+    const int grid = ((wq ? QSA_ROWS : QSA_DIM) + 7) / 8;
 #define FNX_QP(t) k_idx_proj<t><<<grid, 256, 0, s>>>(wq, wk, x, y)
     switch (T) {
         case 1: FNX_QP(1); break;
@@ -1558,11 +1559,12 @@ void qsa(const uint16_t* wq, const uint16_t* wk, const float* x, float* y, const
          uint16_t* pooled, const KvPages& g, float* q, float* scores, int* cells, int* n_cells, int max_pools, const int* pos0, int T, float eps,
          Rope base, int card, void* st, bool select) {
     cudaStream_t s = (cudaStream_t) st;
-    if (wq) qsa_proj(wq, wk, x, y, T, st);
+    if (wq) qsa_proj(select ? wq : nullptr, wk, x, y, T, st);
     __half* r = reinterpret_cast<__half*>(ring);
     __half* pl = reinterpret_cast<__half*>(pooled);
     if (T + QSA_POOL > qsa_ring) throw std::runtime_error("qsa: the ring is shorter than a window and a block");
-    k_idx_prep_pool<<<dim3(T, QSA_HEADS + 2), QSA_DIM, 0, s>>>(y, qn, kn, r, qsa_ring, q, pl, g, pos0, eps, base);
+    k_idx_prep_pool<<<dim3(T, select ? QSA_HEADS + 2 : 2), QSA_DIM, 0, s>>>(
+        y, qn, kn, r, qsa_ring, select ? q : nullptr, pl, g, pos0, eps, base);
     if (!select) { ck_launch("QSA cache update"); return; }
     // FNX_QSA_DENSE=1 (for comparisons): no selection, every row attends every position
     static const bool dense_only = env_flag("FNX_QSA_DENSE");
@@ -1897,11 +1899,13 @@ void ring_sum(const Ring& r, float* x, int T, const unsigned* tag, int call, voi
     ck_launch("ring_sum");
 }
 
+void validate_topk_config() { (void)topk_exact_fast_mode(); (void)draft_topk_parts(); }
+
 void top_tokens(float* logits, int n, int T, int v0, const int* pen_tok, const int* pen_cnt, const int* pen_n, int pen_stride,
-                const float* pen_par, float* out_v, int* out_i, unsigned* err, void* st) {
+                const float* pen_par, float* out_v, int* out_i, unsigned* err, void* st, bool draft) {
     if (n < TOPK_N) throw std::runtime_error("top_tokens: a vocabulary slice smaller than the candidates");
-    if (!topk_parts(logits, n, T, v0, pen_tok, pen_cnt, pen_n, pen_stride, pen_par, out_v, out_i, err, st))
-    k_topk_rows<<<T, TOPK_THREADS, 0, (cudaStream_t) st>>>(logits, n, v0, pen_tok, pen_cnt, pen_n, pen_stride, pen_par,
+    if (!topk_parts(logits, n, T, v0, pen_tok, pen_cnt, pen_n, pen_stride, pen_par, out_v, out_i, err, st, draft))
+        k_topk_rows<<<T, TOPK_THREADS, 0, (cudaStream_t) st>>>(logits, n, v0, pen_tok, pen_cnt, pen_n, pen_stride, pen_par,
                                                          out_v, out_i, err);
     ck_launch("top_tokens");
 }
@@ -1913,21 +1917,22 @@ void argmax(const float* logits, int rows, int T, int v0, float* best_v, int* be
 }
 
 namespace {
-__global__ void k_penalize_row(float* L, int n, const int* pen, const float* par) {
+__global__ void k_penalize_row(float* L, int n, const int* pen, const float* par, bool pruned) {
     const int k = pen[0];
     const float repeat = par[0], freq = par[1], present = par[2];
     for (int i = threadIdx.x; i < k; i += blockDim.x) {
         const int j = pen[1 + i], cnt = pen[1 + k + i];
         if (j < 0 || j >= n || cnt <= 0) continue;
         float l = L[j];
+        if (pruned && l == -FLT_MAX) continue;
         l = l <= 0.f ? l * repeat : l / repeat;
         L[j] = l - (float) cnt * freq - present;
     }
 }
 }  // namespace
 
-void penalize_row(float* row, int n, const int* pen, const float* par, void* st) {
-    k_penalize_row<<<1, 256, 0, (cudaStream_t) st>>>(row, n, pen, par);
+void penalize_row(float* row, int n, const int* pen, const float* par, void* st, bool pruned) {
+    k_penalize_row<<<1, 256, 0, (cudaStream_t) st>>>(row, n, pen, par, pruned);
     ck_launch("penalize_row");
 }
 
@@ -2000,7 +2005,7 @@ __global__ void k_kv_append(const float* k, const float* v, __half* kc, __half* 
 // card's appends nothing). The same values as the two kernels
 __global__ void __launch_bounds__(HD) k_attn_prep_append(float* qg, float* k, const float* v, const float* qn, const float* kn, __half* kc,
                                                          __half* vc, KvPages g, int card, const int* pos0p, float eps, Rope base) {
-    const int t = blockIdx.y, h = blockIdx.x, i = threadIdx.x, p = *pos0p + t, j = p / 4;
+    const int t = blockIdx.y, h = blockIdx.x + (qg ? 0 : NQH), i = threadIdx.x, p = *pos0p + t, j = p / 4;
     __shared__ float sh[32];
     if (h < NQH) {
         norm_rope(qg + ((size_t) t * NQH + h) * 2 * HD, qn, p, eps, base, sh);
@@ -2108,13 +2113,16 @@ __global__ void __launch_bounds__(32) k_cache_plan(const Job* jobs, const int* n
 __global__ void __launch_bounds__(256) k_cache_copy(ExpertCache ec, int p, const int* list, size_t gu_bytes, size_t dn_bytes) {
     const int n = list[0];
     const size_t ug = gu_bytes / 16, per = ug + dn_bytes / 16;
-    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < (size_t) n * per; i += (size_t) gridDim.x * blockDim.x) {
-        const int k = (int) (i / per);
-        const size_t o = i % per;
+    if (!n) return;
+    const int groups = min(n, (int)gridDim.x), group = blockIdx.x % groups;
+    const int rank = blockIdx.x / groups, blocks = 1 + ((int)gridDim.x - 1 - group) / groups;
+    for (int k = group; k < n; k += groups) {
         const int g = list[1 + k];
         char* at = ec.pool[p] + (size_t) (ec.slot_of[g] - ec.s0[p]) * ec.slot_bytes[p];
-        if (o < ug) reinterpret_cast<uint4*>(at)[o] = reinterpret_cast<const uint4*>(ec.host_gu[g])[o];
-        else reinterpret_cast<uint4*>(at + ec.dn_off[p])[o - ug] = reinterpret_cast<const uint4*>(ec.host_dn[g])[o - ug];
+        for (size_t o = (size_t)rank * blockDim.x + threadIdx.x; o < per; o += (size_t)blocks * blockDim.x) {
+            if (o < ug) reinterpret_cast<uint4*>(at)[o] = reinterpret_cast<const uint4*>(ec.host_gu[g])[o];
+            else reinterpret_cast<uint4*>(at + ec.dn_off[p])[o - ug] = reinterpret_cast<const uint4*>(ec.host_dn[g])[o - ug];
+        }
     }
 }
 }  // namespace
@@ -2201,12 +2209,12 @@ void kv_append(const float* k, const float* v, uint16_t* kc, uint16_t* vc, const
 void attn_prep_append(float* qg, float* k, const float* v, const float* q_norm, const float* k_norm, uint16_t* kc, uint16_t* vc,
                       const KvPages& g, int card, int T, const int* pos0, float eps, Rope base, void* st) {
     if (attn_head_split()) {
-        k_attn_prep_append_head<<<dim3(ATT_OWN + 2, T), HD, 0, (cudaStream_t) st>>>(qg, k, v, q_norm, k_norm,
+        k_attn_prep_append_head<<<dim3((qg ? ATT_OWN : 0) + 2, T), HD, 0, (cudaStream_t) st>>>(qg, k, v, q_norm, k_norm,
             reinterpret_cast<__half*>(kc), reinterpret_cast<__half*>(vc), g, card, pos0, eps, base);
         ck_launch("attn prep append heads");
         return;
     }
-    k_attn_prep_append<<<dim3(NQH + 2 * NKVH, T), HD, 0, (cudaStream_t) st>>>(qg, k, v, q_norm, k_norm, reinterpret_cast<__half*>(kc),
+    k_attn_prep_append<<<dim3((qg ? NQH : 0) + 2 * NKVH, T), HD, 0, (cudaStream_t) st>>>(qg, k, v, q_norm, k_norm, reinterpret_cast<__half*>(kc),
                                                                           reinterpret_cast<__half*>(vc), g, card, pos0, eps, base);
     ck_launch("attn_prep_append");
 }

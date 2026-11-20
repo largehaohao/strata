@@ -227,6 +227,21 @@ void run(){
         ck(cudaMemcpy(&peer_error,peer.mail.errors,4,cudaMemcpyDeviceToHost),"read peer error");
         if(peer_error!=64u)throw std::runtime_error("peer lost producer error");
         ++error_checks;
+        // A future high error bit must neither corrupt the sentinel nor decode as success.
+        for (unsigned error : {0x10000u, 0x10020u}) {
+            ck(cudaSetDevice(c), "high error producer");
+            reset();
+            ck(cudaMemcpy(a.mail.errors, &error, sizeof(error), cudaMemcpyHostToDevice), "set high error");
+            k_qsx_push<<<1,256,0,a.st>>>(a.cells,a.counts,1,max_rows,0,4,a.mail,peer.mail);
+            expect(error);
+            ck(cudaSetDevice(1-c), "high error peer");
+            ck(cudaMemset(peer.mail.errors, 0, 4), "reset high error peer");
+            k_qsx_pull<<<1,256,0,peer.st>>>(peer.cells,peer.counts,1,max_rows,1,4,peer.mail);
+            ck(cudaStreamSynchronize(peer.st), "high error publication");
+            ck(cudaMemcpy(&peer_error, peer.mail.errors, 4, cudaMemcpyDeviceToHost), "high error read");
+            if (peer_error != (64u | (error & 0xffffu))) throw std::runtime_error("high QSA error lost");
+            ++error_checks;
+        }
         ck(cudaSetDevice(c),"negative producer");
         reset();
         int count=4,unaligned=3;

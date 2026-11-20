@@ -60,12 +60,16 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         bool complete = false;
         ~Construction() {
             if (complete) return;
+            // One card may still be filling its arena when allocation on the next card fails.
+            for (CardBuf* card : cards)
+                if (cudaSetDevice(card->dev) == cudaSuccess) (void)cudaDeviceSynchronize();
             release_owned_from(mark);
             for (CardBuf* card : cards) delete card;
         }
     } construction{cb_, owned_mark()};
     attn_head_check_runtime(lanes, batch_drafts() != BatchDrafts::off);
     (void) q8s_fused_ab();
+    validate_topk_config();
     // the 27B build's settings: this Flash-Next engine has none of what they set, so one given is a mistake, not a
     // run of the default
     for (const char* k : {"FNX_PF_SKIP", "FNX_PF_SKIP_CONFIRM", "FNX_PF_SCORE_MIB", "FNX_PF_WINDOWS", "FNX_PF_SCORES",
@@ -752,7 +756,7 @@ void Engine::arena_refill(int c, int from, int to) {
 // lending: the slots' experts to RAM (their tables first), then K/V may write there; giving back: the pages are free,
 // model-arena slots refill immediately; static-cache slots refill on demand. Every card idle first: a window or a prompt pass in
 // flight may read a slot being lent, or a page being given back
-void Engine::arena_set(int w) {
+void Engine::arena_set(int w, int scratch_begin) {
     if (w == arena_w_) return;
     if (w < arena_base_ || w > arena_cap_) throw std::runtime_error("arena: top " + std::to_string(w) + " outside its range");
     if (prefill_arena_end_ && w < prefill_arena_end_)
@@ -777,14 +781,17 @@ void Engine::arena_set(int w) {
         if (to < from && !static_arena_) arena_refill(c, from, to);
     }
     if (w > arena_w_) {
-        for (int pg = arena_w_; pg < w; ++pg) free_pages_.push_back(pg);
         // zeroed: they held expert weights, and the draft layer reads K/V it never wrote (batched windows skip it), which
         // as int8 rows and scales could be inf or NaN (the own pages only ever held finite K/V or zeros)
-        for (int c = 0; c < NCARD; ++c) {
-            ck(cudaSetDevice(cb_[c]->dev), "set");
-            const size_t page = kvp_page(c) * sizeof(uint16_t);
-            ck(cudaMemset((char*) cb_[c]->pool + (size_t) arena_w_ * page, 0, (size_t) (w - arena_w_) * page), "arena: zero");
+        const int kv_end = scratch_begin < 0 ? w : scratch_begin;
+        if (kv_end > arena_w_) {
+            for (int c = 0; c < NCARD; ++c) {
+                ck(cudaSetDevice(cb_[c]->dev), "set");
+                const size_t page = kvp_page(c) * sizeof(uint16_t);
+                ck(cudaMemset((char*) cb_[c]->pool + (size_t)arena_w_ * page, 0, (size_t)(kv_end - arena_w_) * page), "arena: zero");
+            }
         }
+        for (int pg = arena_w_; pg < kv_end; ++pg) free_pages_.push_back(pg);
         arena_last_lend_ = std::chrono::steady_clock::now();
     } else {
         free_pages_.erase(std::remove_if(free_pages_.begin(), free_pages_.end(), [&](int pg) { return pg >= w; }), free_pages_.end());
@@ -839,11 +846,16 @@ bool Engine::borrow_prefill_arena(size_t bytes, int end_pos) {
     for (int pg:lanes_[0].pages) used_top=std::max(used_top,pg+1);
     const auto plan=plan_prefill_scratch(arena_base_,arena_cap_,end_pos/KVP_POS+1,used_top,bytes,page_bytes);
     if (!plan) return false;
-    // arena_set idles both cards, redirects/invalidate cache entries, and
-    // zeroes newly exposed pages before any scratch kernel can write them.
-    arena_set(plan.end);
-    if (!reserve_prefill_pages(plan,free_pages_))
+    // Reserve already-lent pages first. New scratch pages never enter the K/V free list.
+    const int existing_end = std::min(plan.end, arena_w_);
+    if (existing_end > plan.begin && !reserve_prefill_pages({plan.begin, existing_end}, free_pages_))
         throw std::runtime_error("prefill scratch: reserved page was not free");
+    try {
+        arena_set(plan.end, plan.begin);
+    } catch (...) {
+        if (existing_end > plan.begin) return_prefill_pages({plan.begin, existing_end}, free_pages_);
+        throw;
+    }
     prefill_arena_begin_=plan.begin;
     prefill_arena_end_=plan.end;
     return true;
@@ -863,9 +875,23 @@ void Engine::release_prefill_arena() {
         ck(cudaSetDevice(b->dev),"prefill scratch: set");
         ck(cudaDeviceSynchronize(),"prefill scratch: cards idle");
     }
-    return_prefill_pages({prefill_arena_begin_,prefill_arena_end_},free_pages_);
-    prefill_arena_begin_=prefill_arena_end_=0;
-    arena_reclaim(0.0);
+    int top = arena_base_;
+    for (const auto& lane : lanes_)
+        for (int pg : lane.pages) top = std::max(top, pg + 1);
+    if (top > prefill_arena_begin_) {
+        // A request grew beyond the loan. Any scratch pages retained as free K/V must be initialized.
+        const int keep = std::min(top, prefill_arena_end_);
+        for (int c = 0; c < NCARD; ++c) {
+            CardBuf* b = cb_[c];
+            ck(cudaSetDevice(b->dev), "prefill scratch: set");
+            const size_t page = kvp_page(c) * sizeof(uint16_t);
+            ck(cudaMemset((char*)b->pool + (size_t)prefill_arena_begin_ * page, 0,
+                          (size_t)(keep - prefill_arena_begin_) * page), "prefill scratch: zero for K/V");
+        }
+        return_prefill_pages({prefill_arena_begin_, keep}, free_pages_);
+    }
+    prefill_arena_begin_ = prefill_arena_end_ = 0;
+    arena_set(top);
 }
 
 void Engine::ensure_pages(int n_pos) { ensure_pages_of(cur_, n_pos); }
@@ -1123,10 +1149,20 @@ void Engine::dense(const DW& W, const void* y, float* out, CardBuf& b, int T) {
 void Engine::attention(int T, CardBuf& b, const CardW& w, const LayerW& L, uint16_t* kc, uint16_t* vc, const int* ctl,
                        uint16_t* qsa_ring, uint16_t* qsa_pooled, int call, bool cache_only) {
     // the indexer first (it reads mixed / its q8 copy, which the projections below leave as they are)
-    if (!L.idx_wq) dense(L.idx_qk, b.xq, b.qsa_y, b, T);
+    if (!L.idx_wq) {
+        if (cache_only && L.idx_qk.s.q) {
+            constexpr int first = QSA_HEADS * QSA_KEY;
+            const size_t offset = (size_t)first * N;
+            Q8S wk{L.idx_qk.s.q + offset, L.idx_qk.s.d + offset / 32};
+            q8s_gemv(wk, QSA_KEY, N, b.xq, b.qsa_y + first, qsa_rows(), T, b.st);
+        } else dense(L.idx_qk, b.xq, b.qsa_y, b, T);
+    }
     qsa(L.idx_wq, L.idx_wk, b.mixed, b.qsa_y, L.idx_qn, L.idx_kn, qsa_ring, qsa_pooled, b.pg, b.qsa_q, b.qsa_scores, b.qsa_cells,
         b.qsa_ncells, max_ctx_ / 4, ctl, T, m_.eps, rope_of(b.mrope), b.att_ring.card, b.st, !cache_only);
-    if (L.wq.s.q && L.wk.s.q && L.wv.s.q && L.wq.n_in == L.wk.n_in && L.wq.n_in == L.wv.n_in &&
+    if (cache_only) {
+        dense(L.wk, b.xq, b.k, b, T);
+        dense(L.wv, b.xq, b.v, b, T);
+    } else if (L.wq.s.q && L.wk.s.q && L.wv.s.q && L.wq.n_in == L.wk.n_in && L.wq.n_in == L.wv.n_in &&
         (L.wq.n_out + L.wk.n_out + L.wv.n_out >= 8192 || attn_head_split())) {   // q, k and v in one launch (compiled for 8192 rows and more)
         const Q8S ws[3] = {L.wq.s, L.wk.s, L.wv.s};
         const int rows[3] = {L.wq.n_out, L.wk.n_out, L.wv.n_out};
@@ -1137,7 +1173,7 @@ void Engine::attention(int T, CardBuf& b, const CardW& w, const LayerW& L, uint1
         dense(L.wk, b.xq, b.k, b, T);
         dense(L.wv, b.xq, b.v, b, T);
     }
-    attn_prep_append(b.qg, b.k, b.v, L.q_norm, L.k_norm, kc, vc, b.pg, b.att_ring.card, T, ctl, m_.eps, rope_of(b.mrope), b.st);
+    attn_prep_append(cache_only ? nullptr : b.qg, b.k, b.v, L.q_norm, L.k_norm, kc, vc, b.pg, b.att_ring.card, T, ctl, m_.eps, rope_of(b.mrope), b.st);
     if (cache_only) return;
     attn(b.qg, kc, vc, b.pg, b.att, b.att_ring, (const unsigned*) (ctl + 1), call, ctl, T, b.att_part, b.st, b.qsa_cells, b.qsa_ncells);
     quantize_q8_1(b.att, b.xq, w.nq * HD, T, b.st);
@@ -1510,6 +1546,8 @@ void Engine::mtp_attach(const Mtp& mtp) {
     if (mtp_last_head())
         for (const MtpCard& card : mtp.cards)
             if (card.head.type != T_Q4_0) throw std::runtime_error("FNX_MTP_LAST_HEAD requires a Q4 draft head");
+    if (env_flag("FNX_MTP_SAMPLE_HEAD") && !mtp_head_mode())
+        throw std::runtime_error("FNX_MTP_SAMPLE_HEAD requires FNX_MTP_HEAD_MODE");
     if (mtp_head_mode()) {
         if (!mtp_last_head()) throw std::runtime_error("FNX_MTP_HEAD_MODE requires FNX_MTP_LAST_HEAD=1");
         for (const MtpCard& card : mtp.cards)
@@ -1567,8 +1605,6 @@ void Engine::mtp_attach(const Mtp& mtp) {
             b.mtp_tk_i = dalloc<int>(TOPK_N);
             b.mtp_tk_err = dalloc<unsigned>(1);
         }
-        b.mtp_zero = dalloc<int>(1);
-        ck(cudaMemset(b.mtp_zero, 0, 4), "mtp zero");
     }
     if (!h_.mtp_emb) {
         if (sample_io == 2) {
@@ -1606,7 +1642,7 @@ void Engine::mtp_attach(const Mtp& mtp) {
 // one draft-layer window of T rows from b.mtp_src (rows of D) and b.mtp_emb (the tokens' embeddings), cells at
 // mtp_ctl[0]: R = fc_hidden(rms(src) w) per stream + fc_embedding(rms(emb) w), then the layer as a main attention
 // layer, then the final mixer and optionally this card's draft head rows
-void Engine::mtp_enqueue(int T, bool head) {
+void Engine::mtp_enqueue(int T, bool head, bool candidates) {
     const float eps = m_.eps;
     for (int c = 0; c < NCARD; ++c) {
         CardBuf& b = *cb_[c];
@@ -1648,13 +1684,16 @@ void Engine::mtp_enqueue(int T, bool head) {
             const void* input = (const uint8_t*) b.xq + (size_t) last * q8_1_bytes(N);
             if (mtp_head_mode_) mtp_head_gemv(mc.head, input, logits, mtp_head_mode_, b.st);
             else dense(mc.head, input, logits, b, 1);
-            penalize_row(logits, nv, b.mtp_pen, b.mtp_pen_par, b.st);
-            argmax(logits, nv, 1, mc.dv0, b.mtp_bv + last, b.mtp_bi + last, b.am_keys + last, b.ring.err, b.st);
+            penalize_row(logits, nv, b.mtp_pen, b.mtp_pen_par, b.st, candidates && mtp_head_mode_ >= 2);
+            if (!candidates) argmax(logits, nv, 1, mc.dv0, b.mtp_bv + last, b.mtp_bi + last, b.am_keys + last, b.ring.err, b.st);
         } else {
             if (mtp_head_mode_) mtp_head_gemv(mc.head, b.xq, b.mtp_logits, mtp_head_mode_, b.st);
             else dense(mc.head, b.xq, b.mtp_logits, b, T);
-            penalize_row(b.mtp_logits + (size_t) (T - 1) * (mc.dv1 - mc.dv0), mc.dv1 - mc.dv0, b.mtp_pen, b.mtp_pen_par, b.st);
-            argmax(b.mtp_logits, mc.dv1 - mc.dv0, T, mc.dv0, b.mtp_bv, b.mtp_bi, b.am_keys, b.ring.err, b.st);
+            penalize_row(b.mtp_logits + (size_t) (T - 1) * (mc.dv1 - mc.dv0), mc.dv1 - mc.dv0, b.mtp_pen, b.mtp_pen_par, b.st,
+                         candidates && mtp_head_mode_ >= 2);
+            // Top-k validates the sampled row. Preserve nonfinite checks on any earlier dense rows.
+            const int reduce_rows = candidates ? T - 1 : T;
+            if (reduce_rows) argmax(b.mtp_logits, mc.dv1 - mc.dv0, reduce_rows, mc.dv0, b.mtp_bv, b.mtp_bi, b.am_keys, b.ring.err, b.st);
         }
     }
 }
@@ -1727,8 +1766,8 @@ void Engine::mtp_enqueue_lanes(const std::vector<DraftReq>& reqs, int T) {
         for (int i = 0; i < nl; ++i)   // and the candidates of the lanes that sample their drafts
             if (reqs[(size_t) i].cands && nv > 0) {
                 ck(cudaMemsetAsync(b.mtp_tk_err_l + i, 0, 4, b.st), "draft top err");
-                fnx::top_tokens(b.mtp_logits + (size_t) (off[(size_t) i] + reqs[(size_t) i].T - 1) * nv, nv, 1, mc.dv0, b.mtp_zero, b.mtp_zero, b.mtp_zero, 0,
-                                b.mtp_pen_par_l + 3 * i, b.mtp_tk_v_l + (size_t) i * TOPK_N, b.mtp_tk_i_l + (size_t) i * TOPK_N, b.mtp_tk_err_l + i, b.st);
+                fnx::top_tokens(b.mtp_logits + (size_t) (off[(size_t) i] + reqs[(size_t) i].T - 1) * nv, nv, 1, mc.dv0, nullptr, nullptr, nullptr, 0,
+                                b.mtp_pen_par_l + 3 * i, b.mtp_tk_v_l + (size_t) i * TOPK_N, b.mtp_tk_i_l + (size_t) i * TOPK_N, b.mtp_tk_err_l + i, b.st, true);
             }
     }
 }

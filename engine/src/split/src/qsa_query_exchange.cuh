@@ -56,7 +56,12 @@ __global__ void k_qsx_push(const int* cells, const int* counts, int T, int strid
     if (threadIdx.x == 0) {
         // Publish even on failure so a waiting peer receives the original error.
         const unsigned error = *reinterpret_cast<volatile const unsigned*>(own.errors);
-        if (error) { dst[0] = 0xfffe0000u | error; __threadfence_system(); }
+        if (error) {
+            // The wire format reserves the upper half for the sentinel. Flag unrepresentable errors as malformed.
+            const unsigned code = (error & 0xffffu) | ((error >> 16) ? 64u : 0u);
+            dst[0] = 0xfffe0000u | code;
+            __threadfence_system();
+        }
         reinterpret_cast<volatile unsigned*>(peer.ready)[slot] = generation;
         __threadfence_system();
     }

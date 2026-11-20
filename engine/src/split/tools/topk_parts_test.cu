@@ -152,7 +152,7 @@ int exact(int device) {
     std::printf("{\"kind\":\"exact\",\"device\":%d,\"checks\":%d}\n", device, checks); std::fflush(stdout);
     return checks;
 }
-int dispatcher_lifetime(int device) {
+int dispatcher_lifetime(int device, bool draft_first) {
     check(cudaSetDevice(device),"dispatch device");
     Memory memory;
     constexpr int T=2, maximum=53149;
@@ -167,12 +167,14 @@ int dispatcher_lifetime(int device) {
     check(cudaMemset(error,0,4),"dispatch error");
     cudaStream_t stream;check(cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking),"dispatch stream");
     int checks=0;
-    for(int n:{maximum,1025}) {
+    bool have_scratch = false;
+    for(int n : {draft_first ? 16384 : maximum, draft_first ? maximum : 16384, 1025}) {
+        const bool draft = n == 16384;
         k_topk_rows<<<T,TOPK_THREADS,0,stream>>>(x,n,7,pn,pn,pn,0,par,ref_v,ref_i,error);
         check(cudaStreamSynchronize(stream),"reference ready");
         auto launch=[&] {
-            const bool fast=topk_parts(x,n,T,7,pn,pn,pn,0,par,out_v,out_i,error,stream);
-            if(!fast)k_topk_rows<<<T,TOPK_THREADS,0,stream>>>(x,n,7,pn,pn,pn,0,par,out_v,out_i,error);
+            const bool fast=topk_parts(x,n,T,7,nullptr,nullptr,nullptr,0,nullptr,out_v,out_i,error,stream,draft);
+            if(!fast)k_topk_rows<<<T,TOPK_THREADS,0,stream>>>(x,n,7,nullptr,nullptr,nullptr,0,nullptr,out_v,out_i,error);
             check(cudaGetLastError(),"dispatch launch");return fast;
         };
         auto compare=[&] {
@@ -185,7 +187,7 @@ int dispatcher_lifetime(int device) {
             if(std::memcmp(a.data(),b.data(),a.size()*4)||ia!=ib)throw std::runtime_error("dispatcher score/id mismatch");
             ++checks;
         };
-        const int parts=topk_parts_mode();
+        const int parts=draft ? draft_topk_parts() : topk_parts_mode();
         const bool geometry=parts>0&&n-(parts-1)*((n+parts-1)/parts)>=TOPK_N;
         // A fresh registry falls back during capture. Existing scratch can be
         // reused by later captures with another valid vocabulary size.
@@ -193,13 +195,14 @@ int dispatcher_lifetime(int device) {
         check(cudaStreamBeginCapture(stream,cudaStreamCaptureModeRelaxed),"first capture");
         const bool first_fast=launch();
         check(cudaStreamEndCapture(stream,&graph),"first capture end");
-        if(first_fast!=(n!=maximum&&geometry))throw std::runtime_error("capture used stale or newly allocated scratch");
+        if(first_fast!=(have_scratch&&geometry))throw std::runtime_error("capture used stale or newly allocated scratch");
         check(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0),"first instantiate");
         check(cudaGraphLaunch(exec,stream),"first replay");compare();
         check(cudaGraphExecDestroy(exec),"first exec destroy");check(cudaGraphDestroy(graph),"first graph destroy");
         const bool eager_fast=launch();compare();
         const bool expected_fast=geometry;
         if(eager_fast!=expected_fast)throw std::runtime_error("dispatcher fallback policy mismatch");
+        have_scratch |= eager_fast;
         check(cudaStreamBeginCapture(stream,cudaStreamCaptureModeRelaxed),"warm capture");
         const bool warm_fast=launch();
         check(cudaStreamEndCapture(stream,&graph),"warm capture end");
@@ -215,7 +218,18 @@ int dispatcher_lifetime(int device) {
     if(!fnx::take_owned().empty())throw std::runtime_error("scratch owner not cleared");
     check(cudaStreamDestroy(stream),"dispatch stream destroy");return checks;
 }
-int main() {
-    try { for (int device : {0, 1}) { exact(device);dispatcher_lifetime(device);dispatcher_lifetime(device); } return 0; }
+int main(int argc, char** argv) {
+    try {
+        (void)topk_exact_fast_mode();
+        (void)draft_topk_parts();
+        if (argc == 2 && std::string(argv[1]) == "--check-config") return 0;
+        for (int device : {0, 1}) {
+            if (argc == 1) exact(device);
+            else if (argc != 2 || std::string(argv[1]) != "--dispatch") throw std::runtime_error("unknown test argument");
+            dispatcher_lifetime(device, false);
+            dispatcher_lifetime(device, true);
+        }
+        return 0;
+    }
     catch (const std::exception& e) { std::fprintf(stderr, "%s\n", e.what()); return 1; }
 }

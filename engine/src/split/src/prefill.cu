@@ -2235,7 +2235,7 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, bool
                                        p.ncells + r0, max_ctx_ / 4, gctl, Tg, b.att_ring.card, s, C);
                         if (!p.attn_dec) continue;
                         attn(p.qg + (size_t) r0 * attn_projected_q_heads() * 2 * HD, b.kc[l], b.vc[l], b.pg, p.att + (size_t) r0 * w.nq * HD, b.att_ring,
-                             (const unsigned*) (gctl + 1), 128 + 2 * l + (p.att_decode_seq++ & 1u), gctl, Tg, b.att_part, s, p.cells + (size_t) r0 * qsa_maxsel(),
+                             (const unsigned*) (gctl + 1), 128 + 2 * (l / 4) + (p.att_decode_seq++ & 1u), gctl, Tg, b.att_part, s, p.cells + (size_t) r0 * qsa_maxsel(),
                              p.ncells + r0, C);
                     }
                     if (!p.attn_dec && p.overlap && !attn_head_split()) {
@@ -2446,7 +2446,8 @@ void Engine::prefill_pass(const std::vector<PfChunk>& chunks, bool staging, bool
             std::fprintf(stderr,"prefill cache check: card %d, %llu routed cached experts, %llu bytes exact\n",c,stats[1],stats[2]);
         }
     });
-    if (err) throw std::runtime_error("prefill: ring error " + std::to_string(err));
+    if (const char* reason = window_error(err, false))
+        throw std::runtime_error("prefill: ring error " + std::to_string(err) + " (" + reason + ")");
     const auto t_main = std::chrono::steady_clock::now();
     if (mtp_ && draft8)
         for (int j = 0; j < nk; ++j) {

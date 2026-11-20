@@ -444,7 +444,7 @@ Engine::~Engine() {
     for (CardBuf* b : cb_) {
         cudaSetDevice(b->dev);
         cudaDeviceSynchronize();
-        for (auto* slots : {&b->win_graphs, &b->mtp_graphs, &b->batch_graphs, &b->win_external_graphs, &b->mtp_fast_graphs, &b->mtp_catchup_graphs})
+        for (auto* slots : {&b->win_graphs, &b->mtp_graphs, &b->batch_graphs, &b->win_external_graphs, &b->mtp_fast_graphs, &b->mtp_sample_graphs, &b->mtp_catchup_graphs})
             for (CardBuf::GraphSlot& s : *slots)
                 if (s.exec) cudaGraphExecDestroy(s.exec);
         for (auto& v : b->batch_cache)
@@ -738,28 +738,24 @@ int Engine::prepare_top_tokens(int T, const Penalties& pen) {
         tk_.pen_tok = halloc<int>((size_t) MAXT * PEN_CAP);
         tk_.pen_cnt = halloc<int>((size_t) MAXT * PEN_CAP);
         tk_.pen_n = halloc<int>(MAXT);
-        tk_.v = halloc<float>((size_t) NCARD * MAXT * TOPK_N);
-        tk_.i = halloc<int>((size_t) NCARD * MAXT * TOPK_N);
-        tk_.err = halloc<unsigned>(NCARD);
+        tk_.packet = halloc<VerifySamplePacket>(NCARD);
         tk_.par = halloc<float>((size_t) MAXT * 3);
         for (CardBuf* b : cb_) {
             ck(cudaSetDevice(b->dev), "set");
             b->tk_pen_tok = dalloc<int>((size_t) MAXT * PEN_CAP);
             b->tk_pen_cnt = dalloc<int>((size_t) MAXT * PEN_CAP);
             b->tk_pen_n = dalloc<int>(MAXT);
-            b->tk_v = dalloc<float>((size_t) MAXT * TOPK_N);
-            b->tk_i = dalloc<int>((size_t) MAXT * TOPK_N);
-            b->tk_err = dalloc<unsigned>(1);
+            b->tk_packet = dalloc<VerifySamplePacket>(1);
             b->tk_par = dalloc<float>((size_t) MAXT * 3);
         }
     }
     // the rows' penalty lists at the stride of the longest (the copies carry only what is used)
-    static const Penalties::Row none;
-    int stride = 1;
-    for (int t = 0; t < T; ++t) stride = std::max(stride, (int) (pen.rows.empty() ? none : pen.rows[(size_t) t]).counts.size());
+    int stride = 0;
+    for (const auto& row : pen.rows) stride = std::max(stride, (int)row.counts.size());
+    if (!stride) return 0;
     if (stride > PEN_CAP) throw std::runtime_error("top_tokens: more penalized tokens than " + std::to_string(PEN_CAP));
     for (int t = 0; t < T; ++t) {
-        const Penalties::Row& row = pen.rows.empty() ? none : pen.rows[(size_t) t];
+        const Penalties::Row& row = pen.rows[(size_t) t];
         const auto& r = row.counts;
         tk_.par[3 * t] = row.repeat;
         tk_.par[3 * t + 1] = row.freq;
@@ -776,16 +772,22 @@ int Engine::prepare_top_tokens(int T, const Penalties& pen) {
 void Engine::enqueue_top_tokens(int c, int T, int stride) {
     CardBuf& b = *cb_[c];
     const CardW& w = m_.cards[c];
-    ck(cudaMemcpyAsync(b.tk_pen_tok, tk_.pen_tok, (size_t) T * stride * 4, cudaMemcpyHostToDevice, b.st), "penalties");
-    ck(cudaMemcpyAsync(b.tk_pen_cnt, tk_.pen_cnt, (size_t) T * stride * 4, cudaMemcpyHostToDevice, b.st), "penalties");
-    ck(cudaMemcpyAsync(b.tk_pen_n, tk_.pen_n, (size_t) T * 4, cudaMemcpyHostToDevice, b.st), "penalties");
-    ck(cudaMemcpyAsync(b.tk_par, tk_.par, (size_t) T * 3 * 4, cudaMemcpyHostToDevice, b.st), "penalties");
-    ck(cudaMemsetAsync(b.tk_err, 0, 4, b.st), "top err");
-    fnx::top_tokens(b.head_logits, w.v1 - w.v0, T, w.v0, b.tk_pen_tok, b.tk_pen_cnt, b.tk_pen_n, stride, b.tk_par,
-                    b.tk_v, b.tk_i, b.tk_err, b.st);
-    ck(cudaMemcpyAsync(tk_.v + (size_t) c * MAXT * TOPK_N, b.tk_v, (size_t) T * TOPK_N * 4, cudaMemcpyDeviceToHost, b.st), "top v");
-    ck(cudaMemcpyAsync(tk_.i + (size_t) c * MAXT * TOPK_N, b.tk_i, (size_t) T * TOPK_N * 4, cudaMemcpyDeviceToHost, b.st), "top i");
-    ck(cudaMemcpyAsync(tk_.err + c, b.tk_err, 4, cudaMemcpyDeviceToHost, b.st), "top err");
+    if (stride) {
+        ck(cudaMemcpyAsync(b.tk_pen_tok, tk_.pen_tok, (size_t) T * stride * 4, cudaMemcpyHostToDevice, b.st), "penalties");
+        ck(cudaMemcpyAsync(b.tk_pen_cnt, tk_.pen_cnt, (size_t) T * stride * 4, cudaMemcpyHostToDevice, b.st), "penalties");
+        ck(cudaMemcpyAsync(b.tk_pen_n, tk_.pen_n, (size_t) T * 4, cudaMemcpyHostToDevice, b.st), "penalties");
+        ck(cudaMemcpyAsync(b.tk_par, tk_.par, (size_t) T * 3 * 4, cudaMemcpyHostToDevice, b.st), "penalties");
+    }
+    auto* packet = b.tk_packet;
+    const size_t count = (size_t)T * TOPK_N, first = MAXT * TOPK_N - count;
+    ck(cudaMemsetAsync(&packet->top_error, 0, sizeof(unsigned), b.st), "top err");
+    fnx::top_tokens(b.head_logits, w.v1 - w.v0, T, w.v0, b.tk_pen_tok, b.tk_pen_cnt, stride ? b.tk_pen_n : nullptr,
+                    stride, b.tk_par, packet->values + first, packet->ids, &packet->top_error, b.st);
+    ck(cudaMemcpyAsync(&packet->window_error, err_word(b), sizeof(unsigned), cudaMemcpyDeviceToDevice, b.st), "verify packet error");
+    const size_t bytes = count * (sizeof(float) + sizeof(int)) + 2 * sizeof(unsigned);
+    const size_t offset = first * sizeof(float);
+    ck(cudaMemcpyAsync(reinterpret_cast<char*>(tk_.packet + c) + offset, reinterpret_cast<char*>(packet) + offset,
+                       bytes, cudaMemcpyDeviceToHost, b.st), "verify result packet");
 }
 
 Engine::Candidates Engine::top_tokens(int T, const Penalties& pen) {
@@ -799,15 +801,15 @@ Engine::Candidates Engine::top_tokens(int T, const Penalties& pen) {
 
 Engine::Candidates Engine::collect_top_tokens(int T) const {
     for (int c = 0; c < NCARD; ++c)
-        if (tk_.err[c] & 16u) throw std::runtime_error("top_tokens: the head's logits hold a NaN or inf");
+        if (tk_.packet[c].top_error & 16u) throw std::runtime_error("top_tokens: the head's logits hold a NaN or inf");
     std::vector<std::vector<std::pair<float, int>>> out(T);
     for (int t = 0; t < T; ++t) {
         auto& r = out[t];
         r.reserve((size_t) NCARD * TOPK_N);
         for (int c = 0; c < NCARD; ++c)
             for (int k = 0; k < TOPK_N; ++k) {
-                const size_t at = ((size_t) c * MAXT + t) * TOPK_N + k;
-                r.emplace_back(tk_.v[at], tk_.i[at]);
+                const size_t at = (size_t)t * TOPK_N + k;
+                r.emplace_back(tk_.packet[c].values[(MAXT - T) * TOPK_N + at], tk_.packet[c].ids[at]);
             }
         std::sort(r.begin(), r.end(), [](const std::pair<float, int>& a, const std::pair<float, int>& b) {
             return a.first > b.first || (a.first == b.first && a.second < b.second);
@@ -824,14 +826,15 @@ Engine::Candidates Engine::verify_sampled(const std::vector<int>& tokens, const 
 }
 
 std::vector<int> Engine::verify(const std::vector<int>& tokens) {
-    return verify_impl(tokens, 0);
+    return verify_impl(tokens, -1);
 }
 
 std::vector<int> Engine::verify_impl(const std::vector<int>& tokens, int sampling_stride) {
     const int T = (int) tokens.size();
     static const bool shared_sample_graph = env_flag("FNX_VERIFY_SAMPLE");
     // Sampled and greedy requests share the same body graph. Each launches its own head reduction afterwards.
-    const bool external_reduction = shared_sample_graph || sampling_stride;
+    const bool sampling = sampling_stride >= 0;  // zero is a sampled row with no penalties
+    const bool external_reduction = shared_sample_graph || sampling;
     if (!pending_.empty() || !rows_pending_.lanes.empty()) throw std::runtime_error("verify: the last window is not committed");
     if (T < 1 || T > MAXT) throw std::runtime_error("window: 1..MAXT tokens");
     if (pos_ + T > max_ctx_) throw std::runtime_error("window: context full");
@@ -866,15 +869,15 @@ std::vector<int> Engine::verify_impl(const std::vector<int>& tokens, int samplin
         ck(cudaMemcpyAsync(b.ctl, h_.ctl, 2 * sizeof(int), cudaMemcpyHostToDevice, b.st), "ctl");
     };
     auto download = [&](int c, CardBuf& b, const CardW& w) {
-        if (sampling_stride) {
+        if (sampling) {
             enqueue_top_tokens(c, T, sampling_stride);
         } else {
             if (external_reduction)
                 argmax(b.head_logits, w.v1 - w.v0, T, w.v0, b.best_v, b.best_i, b.am_keys, err_word(b), b.st);
             ck(cudaMemcpyAsync(&bv[c * T], b.best_v, T * 4, cudaMemcpyDeviceToHost, b.st), "best v");
             ck(cudaMemcpyAsync(&bi[c * T], b.best_i, T * 4, cudaMemcpyDeviceToHost, b.st), "best i");
+            ck(cudaMemcpyAsync(&h_.err[c], err_word(b), sizeof(unsigned), cudaMemcpyDeviceToHost, b.st), "window err");
         }
-        ck(cudaMemcpyAsync(&h_.err[c], err_word(b), 4, cudaMemcpyDeviceToHost, b.st), "window err");
         ck(cudaEventRecord(b.ev1, b.st), "event");
     };
     if (dump) {
@@ -915,14 +918,14 @@ std::vector<int> Engine::verify_impl(const std::vector<int>& tokens, int samplin
     float gpu_ms = 0.f;
     each([&](int c, CardBuf& b, const CardW&) {
         ck(cudaStreamSynchronize(b.st), "window sync");
-        err |= h_.err[c];
+        err |= sampling ? tk_.packet[c].window_error : h_.err[c];
         float ms = 0.f;
         ck(cudaEventElapsedTime(&ms, b.ev0, b.ev1), "event time");
         gpu_ms = std::max(gpu_ms, ms);
         last_card_ms[c] = ms;
     });
     if (const char* e = window_error(err, false)) throw std::runtime_error(std::string("window: ") + e);
-    std::vector<int> out(sampling_stride ? 0 : T);
+    std::vector<int> out(sampling ? 0 : T);
     for (int t = 0; t < (int)out.size(); ++t) {
         int best = 0;
         for (int c = 1; c < NCARD; ++c)
@@ -1496,11 +1499,13 @@ int Engine::draft_rows(const std::vector<const float*>& src, int T, const std::v
     } else {
         for (int c = 0; c < NCARD; ++c) h_.mtp_pen[(size_t) c * (1 + 2 * PEN_CAP)] = 0;
     }
-    mtp_head_mode_ = head && !pen && !cands ? mtp_head_mode() : 0;
+    static const bool sample_head = env_flag("FNX_MTP_SAMPLE_HEAD");
+    mtp_head_mode_ = head && (cands ? sample_head : !pen) ? mtp_head_mode() : 0;
     auto key = graph_key({cur_});
-    key.push_back(mtp_head_mode_);  // changing to sampled/penalized drafts recaptures full scores
+    key.push_back(mtp_head_mode_);  // captures with a different head implementation cannot share an executable
     auto slot = [&](CardBuf& b) -> CardBuf::GraphSlot& {
         if (!head) return b.mtp_catchup_graphs[T];
+        if (cands) return b.mtp_sample_graphs[T];
         return (mtp_head_mode_ ? b.mtp_fast_graphs : b.mtp_graphs)[T];
     };
     auto& first_graph = slot(*cb_[0]);
@@ -1510,7 +1515,7 @@ int Engine::draft_rows(const std::vector<const float*>& src, int T, const std::v
             ck(cudaSetDevice(b->dev), "set");
             ck(cudaStreamBeginCapture(b->st, cudaStreamCaptureModeRelaxed), "begin capture");
         }
-        mtp_enqueue(T, head);
+        mtp_enqueue(T, head, cands);
         for (CardBuf* b : cb_) {
             ck(cudaSetDevice(b->dev), "set");
             cudaGraph_t g;
@@ -1538,24 +1543,24 @@ int Engine::draft_rows(const std::vector<const float*>& src, int T, const std::v
         const int nv = mc.dv1 - mc.dv0, last = MTP_HEAD_EVERY_ROW ? T - 1 : 0;   // the last row's head row
         if (cands && nv > 0) {   // the last row's logits are penalized already
             ck(cudaMemsetAsync(b.mtp_tk_err, 0, 4, b.st), "draft top err");
-            fnx::top_tokens(b.mtp_logits + (size_t) last * nv, nv, 1, mc.dv0, b.mtp_zero, b.mtp_zero, b.mtp_zero, 0, b.mtp_pen_par,
-                       b.mtp_tk_v, b.mtp_tk_i, b.mtp_tk_err, b.st);
+            fnx::top_tokens(b.mtp_logits + (size_t) last * nv, nv, 1, mc.dv0, nullptr, nullptr, nullptr, 0, nullptr,
+                       b.mtp_tk_v, b.mtp_tk_i, b.mtp_tk_err, b.st, true);
         }
         ck(cudaEventRecord(b.ev1, b.st), "event");
         if (sample_io) {
             ck(cudaMemcpyAsync(&b.mtp_sample_packet->error, err_word(b), sizeof(unsigned), cudaMemcpyDeviceToDevice, b.st), "draft packet error");
             ck(cudaMemcpyAsync(h_.mtp_sample_packet + c, b.mtp_sample_packet, sizeof(DraftSamplePacket), cudaMemcpyDeviceToHost, b.st), "draft result packet");
         } else {
-        if (head) {
-            ck(cudaMemcpyAsync(&h_.bv[c], b.mtp_bv + last, 4, cudaMemcpyDeviceToHost, b.st), "draft v");
-            ck(cudaMemcpyAsync(&h_.bi[c], b.mtp_bi + last, 4, cudaMemcpyDeviceToHost, b.st), "draft i");
-        }
-        ck(cudaMemcpyAsync(&h_.err[c], err_word(b), 4, cudaMemcpyDeviceToHost, b.st), "window err");
-        if (cands && nv > 0) {
-            ck(cudaMemcpyAsync(h_.mtp_tk_v + (size_t) c * TOPK_N, b.mtp_tk_v, TOPK_N * 4, cudaMemcpyDeviceToHost, b.st), "draft top v");
-            ck(cudaMemcpyAsync(h_.mtp_tk_i + (size_t) c * TOPK_N, b.mtp_tk_i, TOPK_N * 4, cudaMemcpyDeviceToHost, b.st), "draft top i");
-            ck(cudaMemcpyAsync(h_.mtp_tk_err + c, b.mtp_tk_err, 4, cudaMemcpyDeviceToHost, b.st), "draft top err");
-        }
+            if (head && !cands) {
+                ck(cudaMemcpyAsync(&h_.bv[c], b.mtp_bv + last, 4, cudaMemcpyDeviceToHost, b.st), "draft v");
+                ck(cudaMemcpyAsync(&h_.bi[c], b.mtp_bi + last, 4, cudaMemcpyDeviceToHost, b.st), "draft i");
+            }
+            ck(cudaMemcpyAsync(&h_.err[c], err_word(b), 4, cudaMemcpyDeviceToHost, b.st), "window err");
+            if (cands && nv > 0) {
+                ck(cudaMemcpyAsync(h_.mtp_tk_v + (size_t) c * TOPK_N, b.mtp_tk_v, TOPK_N * 4, cudaMemcpyDeviceToHost, b.st), "draft top v");
+                ck(cudaMemcpyAsync(h_.mtp_tk_i + (size_t) c * TOPK_N, b.mtp_tk_i, TOPK_N * 4, cudaMemcpyDeviceToHost, b.st), "draft top i");
+                ck(cudaMemcpyAsync(h_.mtp_tk_err + c, b.mtp_tk_err, 4, cudaMemcpyDeviceToHost, b.st), "draft top err");
+            }
         }
     });
     unsigned err = 0;
@@ -1565,13 +1570,14 @@ int Engine::draft_rows(const std::vector<const float*>& src, int T, const std::v
         ck(cudaStreamSynchronize(cb_[c]->st), "draft sync");
         if (sample_io) {
             const DraftSamplePacket& result = h_.mtp_sample_packet[c];
-            const int last = MTP_HEAD_EVERY_ROW ? T - 1 : 0;
-            h_.bv[c] = result.best_v[last];
-            h_.bi[c] = result.best_i[last];
             h_.err[c] = result.error;
             std::memcpy(h_.mtp_tk_v + (size_t)c * TOPK_N, result.values, sizeof(result.values));
             std::memcpy(h_.mtp_tk_i + (size_t)c * TOPK_N, result.ids, sizeof(result.ids));
             h_.mtp_tk_err[c] = result.top_error;
+        }
+        if (cands && mtp_->cards[c].dv1 > mtp_->cards[c].dv0) {
+            h_.bv[c] = h_.mtp_tk_v[(size_t)c * TOPK_N];
+            h_.bi[c] = h_.mtp_tk_i[(size_t)c * TOPK_N];
         }
         err |= h_.err[c];
         float ms = 0.f;

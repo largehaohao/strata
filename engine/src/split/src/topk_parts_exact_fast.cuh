@@ -39,13 +39,15 @@ __global__ void __launch_bounds__(PART_THREADS) k_topk_parts_exact_fast(float* _
     if (bad) atomicOr(err, 16u);
     __syncthreads();   // every logit checked before any penalty changes one
     // the row's penalties on this card's tokens (each token once in the list)
-    const float repeat = pen_par[row * 3], freq = pen_par[row * 3 + 1], present = pen_par[row * 3 + 2];   // the row's penalty parameters
-    for (int i = tid; i < pen_n[row]; i += PART_THREADS) {
-        const int tok = pen_tok[row * pen_stride + i] - v0, cnt = pen_cnt[row * pen_stride + i];
-        if (tok < 0 || tok >= n || cnt <= 0) continue;
-        float l = L[tok];
-        l = l <= 0.f ? l * repeat : l / repeat;
-        L[tok] = l - (float) cnt * freq - present;
+    if (pen_n) {
+        const float repeat = pen_par[row * 3], freq = pen_par[row * 3 + 1], present = pen_par[row * 3 + 2];   // the row's penalty parameters
+        for (int i = tid; i < pen_n[row]; i += PART_THREADS) {
+            const int tok = pen_tok[row * pen_stride + i] - v0, cnt = pen_cnt[row * pen_stride + i];
+            if (tok < 0 || tok >= n || cnt <= 0) continue;
+            float l = L[tok];
+            l = l <= 0.f ? l * repeat : l / repeat;
+            L[tok] = l - (float) cnt * freq - present;
+        }
     }
     __syncthreads();
     // the TOPK_N-th highest key: four passes of 8 bits

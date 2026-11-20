@@ -439,13 +439,14 @@ void copy_many(const CopyJob* jobs, int n, void* st);
 void argmax(const float* logits, int rows, int T, int v0, float* best_v, int* best_i, unsigned long long* keys, unsigned* err, void* st);
 // the sampler's penalties on one row of n logits, in place, as top_tokens applies them: pen = {count k, k indexes into
 // the row, their k counts}, par = {repeat, freq, present}
-void penalize_row(float* row, int n, const int* pen, const float* par, void* st);
+void penalize_row(float* row, int n, const int* pen, const float* par, void* st, bool pruned = false);
 // the sampler's candidates: per row t < T of logits (n of this card's vocabulary from token v0), the row's penalties
 // applied in place (pen_tok / pen_cnt: pen_n[t] tokens and their counts at row t * pen_stride), then its TOPK_N highest
 // into out_v / out_i (logit descending, id ascending on ties, however many tie); err bit 16: a logit was NaN or inf
 // before the penalties
 constexpr int TOPK_N = 64;
+void validate_topk_config();
 void top_tokens(float* logits, int n, int T, int v0, const int* pen_tok, const int* pen_cnt, const int* pen_n, int pen_stride,
-                const float* pen_par, float* out_v, int* out_i, unsigned* err, void* st);   // pen_par: per row repeat, freq, present
+                const float* pen_par, float* out_v, int* out_i, unsigned* err, void* st, bool draft = false);   // pen_par: per row repeat, freq, present
 
 }  // namespace fnx

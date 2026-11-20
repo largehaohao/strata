@@ -88,6 +88,7 @@ struct ConvCache {
     std::vector<CachedConv> parked;
     long clock = 0, evictions = 0;
     size_t budget = 0;   // bytes of host memory for parked conversations and checkpoints
+    size_t bytes_held(const CachedConv& live, size_t skip_live = 0) const;
 };
 
 class Session {
@@ -130,7 +131,6 @@ private:
     using State = std::shared_ptr<Engine::SeqState>;
     using Conv = CachedConv;
     Conv live_;
-    size_t bytes_held() const;
     void evict(size_t need);
     void park_live_();
     void checkpoint(Conv& c);

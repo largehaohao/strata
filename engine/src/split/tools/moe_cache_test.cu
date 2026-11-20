@@ -104,6 +104,29 @@ void run_cache(int dev, int slots, int pattern, bool coherent, int groups = 1, b
         ck(cudaMemsetAsync(pools[p], 0xA5, prefix + ec.n[p] * ec.slot_bytes[p] + 2 * guard, stream), "pool guards");
     }
     ck(cudaStreamSynchronize(stream), "reset wait");
+    if (groups == 1 && slots == 1024 && pattern == 0 && coherent && !shared_kv && max_age == 1) {
+        // Arena fill can list more experts than its 640 blocks. Reverse the slots to catch mix-ups between experts.
+        const int n = slots - 1;
+        std::vector<int> ids(n + 1), mapped = places;
+        ids[0] = n;
+        std::vector<unsigned char> expected(2 * guard + slots * stride, 0xa5), actual(expected.size());
+        for (int i = 0; i < n; ++i) {
+            const int expert = 2 * i, slot = slots - 1 - i;
+            ids[1 + i] = expert;
+            mapped[expert] = slot;
+            std::memcpy(expected.data() + guard + slot * stride, gu[expert], stride);
+        }
+        int* bulk = static_cast<int*>(alloc(ids.size() * sizeof(int)));
+        ck(cudaMemcpy(bulk, ids.data(), ids.size() * sizeof(int), cudaMemcpyHostToDevice), "arena list");
+        ck(cudaMemcpy(ec.slot_of, mapped.data(), mapped.size() * sizeof(int), cudaMemcpyHostToDevice), "arena placement");
+        cache_copy(ec, 0, bulk, stream);
+        ck(cudaStreamSynchronize(stream), "arena fill");
+        ck(cudaMemcpy(actual.data(), pools[0], actual.size(), cudaMemcpyDeviceToHost), "arena check");
+        if (actual != expected) throw std::runtime_error("bulk cache fill or guard mismatch");
+        ck(cudaMemcpy(ec.slot_of, places.data(), places.size() * sizeof(int), cudaMemcpyHostToDevice), "reset placement");
+        ck(cudaMemset(pools[0], 0xa5, actual.size()), "reset pool guards");
+        std::cout << "card " << dev << ": exact 1023-expert arena fill and guards passed\n";
+    }
     auto launch = [&](int layer) {
         const int gb = 256 + layer * 64, db = 128 + layer * 32;
         moe_cache(layer, gb, db, ec, list, stream, jobs, count, true);

@@ -50,9 +50,8 @@ struct CardBuf {
     void* sh_hq;                      // its h as q8_1
     float *ple_emb, *ple_key, *ple_val;
     float* head_logits;
-    int *tk_pen_tok = nullptr, *tk_pen_cnt = nullptr, *tk_pen_n = nullptr, *tk_i = nullptr;   // top_tokens()
-    float* tk_v = nullptr;
-    unsigned* tk_err = nullptr;
+    int *tk_pen_tok = nullptr, *tk_pen_cnt = nullptr, *tk_pen_n = nullptr;   // top_tokens()
+    VerifySamplePacket* tk_packet = nullptr;
     float* tk_par = nullptr;
     float* best_v;
     int* best_i;
@@ -98,6 +97,7 @@ struct CardBuf {
                            batch_graphs = std::vector<GraphSlot>(MAXT + 1);
     // Captured only when lookup-first needs K/V catch-up. Keep these separate so a lookup miss can reuse the full head graph.
     std::vector<GraphSlot> win_external_graphs = std::vector<GraphSlot>(MAXT + 1);
+    std::vector<GraphSlot> mtp_sample_graphs = std::vector<GraphSlot>(MAXT + 1);
     std::vector<GraphSlot> mtp_fast_graphs = std::vector<GraphSlot>(MAXT + 1);
     std::vector<GraphSlot> mtp_catchup_graphs = std::vector<GraphSlot>(MAXT + 1);
     // FNX_PRECAP: batched-window graphs that were not evicted by a window of another layout. batch_graphs[T] stays the graph the next
@@ -146,8 +146,8 @@ struct CardBuf {
     unsigned* mtp_tk_err_l = nullptr;
     int* mtp_pen = nullptr;        // the last row's penalties (penalize_row's pen, this card's draft-vocabulary indexes)
     float* mtp_pen_par = nullptr;
-    float* mtp_tk_v = nullptr;     // the last row's TOPK_N candidates (draft(cands)); mtp_zero: no penalties for top_tokens
-    int *mtp_tk_i = nullptr, *mtp_zero = nullptr;
+    float* mtp_tk_v = nullptr;     // the last row's TOPK_N sampled draft candidates
+    int* mtp_tk_i = nullptr;
     unsigned* mtp_tk_err = nullptr;
     DraftSamplePacket* mtp_sample_packet = nullptr;
     DraftSampleInput* mtp_sample_input = nullptr;

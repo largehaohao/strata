@@ -44,6 +44,15 @@ __global__ void hcs_init(__half* x, size_t n, unsigned seed, int pattern) {
         x[e] = __float2half_rn(v);
     }
 }
+__global__ void hcs_weights(int8_t* q, uint16_t* scales, __half* expanded, int seed) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < ProbeK * ProbeN; i += gridDim.x * blockDim.x) {
+        const int b = i / 32;
+        const __half scale = __float2half_rn(((b * 29 + seed) % 83 - 41) * 0.0031f);
+        if (i % 32 == 0) scales[b] = __half_as_ushort(scale);
+        q[i] = (int8_t)(((i * 17 + seed) & 255) - 128);
+        expanded[i] = __float2half_rn(__half2float(scale) * (float)q[i]);
+    }
+}
 __global__ void hcs_flush(unsigned* x, size_t n) {
     for (size_t e = blockIdx.x * (size_t)blockDim.x + threadIdx.x; e < n; e += (size_t)gridDim.x * blockDim.x)
         x[e] = x[e] * 1664525u + 1013904223u;
@@ -238,6 +247,29 @@ int run() {
         }
     }
     std::printf("PASS %d exact HC-down FP32/lo16/card/guard/direct/graph/wrap checks\n", checks); std::fflush(stdout);
+    for (auto& card : s) {
+        auto& x = *card;
+        ck(cudaSetDevice(x.dev), "Q8 device");
+        auto* q = x.mem.get<int8_t>((size_t)ProbeK * ProbeN);
+        auto* scales = x.mem.get<uint16_t>((size_t)ProbeK * ProbeN / 32);
+        for (int rows : {1536, 2015, 2048}) {
+            x.inputs(0);
+            hcs_weights<<<256, 256, 0, x.st>>>(q, scales, x.w, rows);
+            auto* input = reinterpret_cast<const uint16_t*>(x.x);
+            x.reset(1);
+            if (!strata_pf_gemm_narrow_f16_ld(input, ProbeK, reinterpret_cast<uint16_t*>(x.w), ProbeK,
+                                                x.down, rows, ProbeN, ProbeK, ProbeN, x.st))
+                throw std::runtime_error("Q8 reference rejected");
+            ck(cudaStreamSynchronize(x.st), "Q8 reference");
+            const auto ref = x.partial();
+            x.reset(1);
+            if (!strata_pf_hcdown_q8_f16(input, q, scales, x.down, rows, x.st)) throw std::runtime_error("Q8 shard rejected");
+            ck(cudaStreamSynchronize(x.st), "Q8 shard");
+            if (x.partial() != ref) throw std::runtime_error("Q8 FP32 shard or tail guard mismatch");
+            x.mem.guards();
+        }
+    }
+    std::puts("PASS 6 Q8 HC-down FP32 shard and tail guard checks");
     variable_rows_wrap_checks(s);
     negative_checks();
     for (int rows : {2048, 3072, 4096}) for (bool cold : {false, true}) {

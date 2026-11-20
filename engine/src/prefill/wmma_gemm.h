@@ -25,6 +25,8 @@ bool strata_pf_gemm_f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t 
 /// K a positive multiple of 32. The existing wide GEMM dispatch is unchanged.
 bool strata_pf_gemm_narrow_f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K,
                                int64_t ldy, void* stream = nullptr);
+// Contiguous HC-down shard on gfx11. The input width is 10240 and the rank is 320.
+bool strata_pf_hcdown_q8_f16(const uint16_t* x, const int8_t* q, const uint16_t* scales, float* y, int rows, void* stream);
 bool strata_pf_gemm_narrow_f16_ld(const uint16_t* X, int64_t ldx, const uint16_t* W, int64_t ldw, float* Y,
                                   int64_t T, int64_t N, int64_t K, int64_t ldy, void* stream = nullptr);
 // Contiguous FP16 inputs, FP32 output. Uses the verified gfx1100 GSU3 order

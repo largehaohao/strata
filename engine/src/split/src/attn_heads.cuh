@@ -371,7 +371,7 @@ __global__ void k_kv_append_head(const float* k, const float* v, __half* kc, __h
 
 __global__ void __launch_bounds__(HD) k_attn_prep_append_head(float* qg, float* k, const float* v, const float* qn, const float* kn, __half* kc,
                                                          __half* vc, KvPages g, int card, const int* pos0p, float eps, Rope base) {
-    const int t = blockIdx.y, h = blockIdx.x, i = threadIdx.x, p = *pos0p + t, j = p / 4;
+    const int t = blockIdx.y, h = blockIdx.x + (qg ? 0 : ATT_OWN), i = threadIdx.x, p = *pos0p + t, j = p / 4;
     __shared__ float sh[32];
     if (h < ATT_OWN) {
         norm_rope(qg + ((size_t) t * ATT_OWN + h) * 2 * HD, qn, p, eps, base, sh);

@@ -5,11 +5,14 @@
 #include <algorithm>
 #include <cmath>
 #include <random>
+#include <optional>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace fnx {
 
@@ -83,27 +86,54 @@ int draw(const Dist& d, double u) {
 }
 
 namespace {
-// each penalized token once with its count among the last n of seq
-std::vector<std::pair<int, int>> window_counts(const std::vector<int>& seq, int n) {
-    std::vector<std::pair<int, int>> out;
-    const size_t start = seq.size() > (size_t) n ? seq.size() - n : 0;
-    for (size_t i = start; i < seq.size(); ++i) {
-        if (seq[i] >= Engine::IMAGE_TOK) continue;   // image cells are not vocabulary tokens
-        auto it = std::find_if(out.begin(), out.end(), [&](const std::pair<int, int>& c) { return c.first == seq[i]; });
-        if (it == out.end()) out.emplace_back(seq[i], 1);
-        else ++it->second;
+// The ring counts image positions towards the window but never penalizes an image ID.
+class PenaltyWindow {
+public:
+    PenaltyWindow(const std::vector<int>& seq, const Sampling& s) : limit_(s.pen_last_n) {
+        row.repeat = s.pen_repeat;
+        row.freq = s.pen_freq;
+        row.present = s.pen_present;
+        const size_t start = seq.size() - std::min(seq.size(), limit_);
+        ring_.reserve(limit_);
+        index_.reserve(seq.size() - start);
+        for (size_t i = start; i < seq.size(); ++i) append(seq[i]);
     }
-    return out;
-}
+
+    void append(int token) {
+        if (!limit_) return;
+        if (ring_.size() == limit_) {
+            const int old = ring_[next_];
+            ring_[next_] = token;
+            next_ = (next_ + 1) % limit_;
+            if (old == token) return;
+            if (old < Engine::IMAGE_TOK) {
+                const size_t pos = index_.at(old);
+                if (--row.counts[pos].second == 0) {
+                    row.counts[pos] = row.counts.back();
+                    index_[row.counts[pos].first] = pos;
+                    row.counts.pop_back();
+                    index_.erase(old);
+                }
+            }
+        } else ring_.push_back(token);
+
+        if (token < Engine::IMAGE_TOK) {
+            auto [it, fresh] = index_.emplace(token, row.counts.size());
+            if (fresh) row.counts.emplace_back(token, 1);
+            else ++row.counts[it->second].second;
+        }
+    }
+
+    Engine::Penalties::Row row;
+private:
+    size_t limit_, next_ = 0;
+    std::vector<int> ring_;
+    std::unordered_map<int, size_t> index_;
+};
 }  // namespace
 
 Engine::Penalties::Row penalty_row(const std::vector<int>& seq, const Sampling& s) {
-    Engine::Penalties::Row r;
-    r.repeat = s.pen_repeat;
-    r.freq = s.pen_freq;
-    r.present = s.pen_present;
-    r.counts = window_counts(seq, s.pen_last_n);
-    return r;
+    return PenaltyWindow(seq, s).row;
 }
 
 bool penalizes(const Sampling& s) {
@@ -214,7 +244,7 @@ void Session::read(const std::vector<int>& prompt, GenStats& st, const std::func
         c.kv.reset();
         live_ = std::move(c);
         std::fprintf(stderr, "conversation cache: restored %zu tokens in %.0f ms, parked=%zu bytes=%zu\n", from_parked, ms_since(t_load),
-                     cache_->parked.size(), bytes_held());
+                     cache_->parked.size(), cache_->bytes_held(live_));
     } else if (from_live < hist.size()) {
         const size_t dropped = hist.size() - from_live;
         const bool would_park = from_live * 2 < hist.size() || dropped >= DROP_PARK_MIN;
@@ -299,10 +329,7 @@ void Session::read(const std::vector<int>& prompt, GenStats& st, const std::func
                         // The oldest live checkpoints can rotate. A parked root keeps its own references.
                         const size_t drop = live_.ckpts.size() + required + 1 > MAX_CKPTS
                             ? live_.ckpts.size() + required + 1 - MAX_CKPTS : 0;
-                        size_t held = bytes_held();
-                        if (drop <= live_.ckpts.size()) {
-                            for (size_t i = 0; i < drop; ++i) held -= live_.ckpts[i]->total();
-                        }
+                        const size_t held = cache_->bytes_held(live_, drop);
                         if (drop <= live_.ckpts.size() && held <= cache_->budget && quote &&
                             quote <= (cache_->budget - held) / (required + 1)) {
                             live_.ckpts.erase(live_.ckpts.begin(), live_.ckpts.begin() + drop);
@@ -356,14 +383,18 @@ void Session::checkpoint(Conv& c) {
     while (c.ckpts.size() > MAX_CKPTS) c.ckpts.erase(c.ckpts.begin());
 }
 
-size_t Session::bytes_held() const {
-    size_t t = 0;
-    for (const State& s : live_.ckpts) t += s->total();
-    for (const Conv& c : cache_->parked) {
-        t += c.kv->total();
-        for (const State& s : c.ckpts) t += s->total();
+size_t ConvCache::bytes_held(const CachedConv& live, size_t skip_live) const {
+    std::unordered_set<const Engine::SeqState*> seen;
+    size_t bytes = 0;
+    auto count = [&](const std::shared_ptr<Engine::SeqState>& s) {
+        if (s && seen.insert(s.get()).second) bytes += s->total();
+    };
+    for (size_t i = skip_live; i < live.ckpts.size(); ++i) count(live.ckpts[i]);
+    for (const CachedConv& c : parked) {
+        count(c.kv);
+        for (const std::shared_ptr<Engine::SeqState>& s : c.ckpts) count(s);
     }
-    return t;
+    return bytes;
 }
 
 // the live sequence to host memory, if it is long enough to be worth the copy
@@ -380,7 +411,7 @@ void Session::park_live_() {
     c.used = live_.used;
     cache_->parked.push_back(std::move(c));
     std::fprintf(stderr, "conversation cache: parked %zu tokens in %.0f ms, parked=%zu bytes=%zu\n", hist.size(), ms_since(t_park),
-                 cache_->parked.size(), bytes_held());
+                 cache_->parked.size(), cache_->bytes_held(live_));
 }
 
 void Session::park() {
@@ -410,7 +441,7 @@ void Session::reload(const Engine::SeqState& s) {
 
 // least recently used parked conversations out until the held states and `need` more fit the budget
 void Session::evict(size_t need) {
-    while (bytes_held() + need > cache_->budget && !cache_->parked.empty()) {
+    while (cache_->bytes_held(live_) + need > cache_->budget && !cache_->parked.empty()) {
         size_t old = 0;
         for (size_t i = 1; i < cache_->parked.size(); ++i)
             if (cache_->parked[i].used < cache_->parked[old].used) old = i;
@@ -418,7 +449,7 @@ void Session::evict(size_t need) {
         cache_->parked.erase(cache_->parked.begin() + old);
         ++cache_->evictions;
     }
-    while (bytes_held() + need > cache_->budget && !live_.ckpts.empty()) live_.ckpts.erase(live_.ckpts.begin());
+    while (cache_->bytes_held(live_) + need > cache_->budget && !live_.ckpts.empty()) live_.ckpts.erase(live_.ckpts.begin());
 }
 
 CacheStats Session::cache_stats() const {
@@ -426,7 +457,7 @@ CacheStats Session::cache_stats() const {
     s.checkpoints = (int) live_.ckpts.size();
     for (const Conv& c : cache_->parked) s.checkpoints += (int) c.ckpts.size();
     s.parked = (int) cache_->parked.size();
-    s.bytes = bytes_held();
+    s.bytes = cache_->bytes_held(live_);
     s.evictions = cache_->evictions;
     return s;
 }
@@ -434,7 +465,7 @@ CacheStats Session::cache_stats() const {
 static int lookup_search() {
     static const int search = [] {
         const auto n = env_int("FNX_LOOKUP_SEARCH", 0);
-        if (n < 0 || n > 64) throw std::runtime_error("FNX_LOOKUP_SEARCH: expected0..64");
+        if (n < 0 || n > 64) throw std::runtime_error("FNX_LOOKUP_SEARCH: expected 0..64");
         return (int)n;
     }();
     return search;
@@ -503,12 +534,9 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
     std::vector<Dist> qs;   // per draft, the distribution it was drawn from; empty: a fixed draft (lookup, argmax)
     bool mtp_round = false;   // the drafts are an MTP chain (its acceptance feeds chain_len)
     int mtp_chains = 0;
-    // one draft from the draft layer for the token after pen_seq (the penalty window before it)
-    auto draft_one = [&](int T, bool from_main, int src_row, const std::vector<int>& toks, int pos0, const std::vector<int>& pen_seq,
-                         Dist& q) {
-        Engine::Penalties::Row pen;
-        if (pen_drafts) pen = penalty_row(pen_seq, s);
-        int d = e_.draft(T, from_main, src_row, toks, pos0, pen_drafts ? &pen : nullptr, samp_drafts);
+    auto draft_one = [&](int T, bool from_main, int src_row, const std::vector<int>& toks, int pos0,
+                         const Engine::Penalties::Row* pen, Dist& q) {
+        int d = e_.draft(T, from_main, src_row, toks, pos0, pen, samp_drafts);
         st.draft_ms += e_.last_draft_ms, st.draft_gpu_ms += e_.last_draft_gpu_ms, ++st.draft_calls;
         q = Dist{};
         if (samp_drafts) {
@@ -537,10 +565,10 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
         const auto tv = std::chrono::steady_clock::now();
         Engine::Penalties pen;
         if (penalize) {
-            std::vector<int> seq(ctx.size() > (size_t) s.pen_last_n ? ctx.end() - s.pen_last_n : ctx.begin(), ctx.end());
-            for (int j = 0; j < (int)rows.size(); ++j) {
-                if (j > 0) seq.push_back(rows[j]);
-                pen.rows.push_back(penalty_row(seq, s));
+            PenaltyWindow window(ctx, s);
+            for (size_t j = 0; j < rows.size(); ++j) {
+                if (j) window.append(rows[j]);
+                pen.rows.push_back(window.row);
             }
         }
         Engine::Candidates cand;
@@ -633,8 +661,6 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
         x = o[used - 1];
         if (done) break;
         // the draft layer reads the kept rows either way (its cells stay current for later turns)
-        std::vector<int> pen_seq;   // the penalty window before the next token: the context's last pen_last_n
-        if (pen_drafts) pen_seq.assign(ctx.size() > (size_t) s.pen_last_n ? ctx.end() - s.pen_last_n : ctx.begin(), ctx.end());
         mtp_round = false;
         if (df2) {
             if (!speculate) {
@@ -680,8 +706,11 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
                 continue;
             }
         }
+        std::optional<PenaltyWindow> draft_window;
+        if (pen_drafts) draft_window.emplace(ctx, s);
+        const auto* draft_pen = draft_window ? &draft_window->row : nullptr;
         Dist q1;
-        const int d1 = draft_one(used, true, 0, std::vector<int>(o.begin(), o.begin() + used), p, pen_seq, q1);
+        const int d1 = draft_one(used, true, 0, std::vector<int>(o.begin(), o.begin() + used), p, draft_pen, q1);
         if (!speculate) {
             drafts.clear(), qs.clear();
             continue;
@@ -705,9 +734,9 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
         const int next_room = e_.max_ctx() - e_.pos() - 1;
         const int chain = k > next_room ? std::min(next_room, max_new - produced - 1) : k;
         for (int j = 1; j < chain; ++j) {
-            if (pen_drafts) pen_seq.push_back(drafts.back());
+            if (draft_window) draft_window->append(drafts.back());
             Dist q;
-            drafts.push_back(draft_one(1, false, j == 1 ? used - 1 : 0, {drafts.back()}, p + used - 1 + j, pen_seq, q));
+            drafts.push_back(draft_one(1, false, j == 1 ? used - 1 : 0, {drafts.back()}, p + used - 1 + j, draft_pen, q));
             qs.push_back(std::move(q));
         }
     }

@@ -11,7 +11,10 @@ bool hcs_enabled() {
 }
 }
 void hc_row_split_prepare(int card, bool peer, int lanes, unsigned* errors) {
-    if (!hcs_enabled()) return;
+    if (!hcs_enabled()) {
+        if (env_flag("FNX_PF_HC_DOWN_Q8")) throw std::runtime_error("FNX_PF_HC_DOWN_Q8 requires FNX_PF_HC_ROW_SPLIT");
+        return;
+    }
     if (!peer || lanes != 1 || card < 0 || card > 1 || !attn_head_split())
         throw std::runtime_error("HC row split requires two probed peers, one lane and head split");
     int dev = -1; ckc(cudaGetDevice(&dev), "HC split device");
@@ -53,11 +56,17 @@ bool hcs_down(Engine::Pf& p, const Q8S& w, int rows, cudaStream_t stream) {
     auto* input = reinterpret_cast<const uint16_t*>(p.xh + (size_t)first * D);
     auto* down = p.lo32 + (size_t)first * LR;
     auto* lo = p.lo16 + (size_t)first * LR;
-    k_q8s_f16<<<grid_for((size_t)LR * D), 256, 0, stream>>>(w.q, w.d, (size_t)LR * D, p.wh);
     hcs_tick<<<1, 1, 0, stream>>>(own.generation);
-    if (!strata_pf_gemm_narrow_f16_ld(input, D, reinterpret_cast<const uint16_t*>(p.wh), D,
-                                    down, count, LR, D, LR, stream))
-        throw std::runtime_error("HC split GEMM rejected");
+    static const bool direct_q8 = env_flag("FNX_PF_HC_DOWN_Q8");
+    if (direct_q8) {
+        static_assert(D == 10240 && LR == 320, "HC-down shard geometry");
+        if (!strata_pf_hcdown_q8_f16(input, w.q, w.d, down, count, stream))
+            throw std::runtime_error("HC split Q8 GEMM rejected");
+    } else {
+        k_q8s_f16<<<grid_for((size_t)LR * D), 256, 0, stream>>>(w.q, w.d, (size_t)LR * D, p.wh);
+        if (!strata_pf_gemm_narrow_f16_ld(input, D, reinterpret_cast<const uint16_t*>(p.wh), D, down, count, LR, D, LR, stream))
+            throw std::runtime_error("HC split GEMM rejected");
+    }
     const int words = count * LR / 2, blocks = (words + HCS_WORDS_PER_BLOCK - 1) / HCS_WORDS_PER_BLOCK;
     hcs_push<true><<<blocks, 256, 0, stream>>>(down, lo, words, own, peer);
     const int other_first = card ? 0 : boundary, other_words = (rows - count) * LR / 2;
@@ -69,7 +78,7 @@ bool hcs_down(Engine::Pf& p, const Q8S& w, int rows, cudaStream_t stream) {
 }
 #else
 void hc_row_split_prepare(int, bool, int, unsigned*) {
-    if (env_int("FNX_PF_HC_ROW_SPLIT", 0)) throw std::runtime_error("HC row split requires two-card HIP Flash-Next");
+    if (env_int("FNX_PF_HC_ROW_SPLIT", 0) || env_flag("FNX_PF_HC_DOWN_Q8")) throw std::runtime_error("HC row split requires two-card HIP Flash-Next");
 }
 namespace { bool hcs_down(Engine::Pf&, const Q8S&, int, cudaStream_t) { return false; } }
 #endif

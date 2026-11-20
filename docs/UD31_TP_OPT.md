@@ -791,3 +791,171 @@ Evidence is in `local-tuning/2026-11-09/ud31-pi-task-opt/`:
 `formal-pi-kernel-checks.json`, `formal-pi-model-checks.json` and
 `formal-pi-qualification.json`. The complete-task comparison is recorded in
 [UD31_PI_THROUGHPUT.md](UD31_PI_THROUGHPUT.md).
+
+## TP correctness and optional optimizations, November 19
+
+The Flash-Next draft layer can use a different expert quantization from the
+main model. It now reads its own weights directly when main-model MoE staging
+is enabled. The MTP chain also fits inside the next verification window at the
+context limit. A failed in-flight prefill propagates to the worker's fatal
+handler without draining the stalled GPU. A completed QSA mailbox read clears
+its ready word so a wrapped generation cannot accept an old result.
+
+These controls apply to single-lane TP inference. Each defaults to zero except direct cache reads in the mode described below.
+
+| Control | Effect when enabled |
+| --- | --- |
+| `FNX_PROMPT_CHECKPOINT_EVERY=N` | Consider a user or tool snapshot after crossing an interval of at least 1024 tokens. Save at a completed prefill pass when the cache has room for the snapshot and the remaining required checkpoints. |
+| `FNX_PF_DIRECT_CACHE=1` | Read routed experts already in decode slots directly during prefill. Enabled automatically with `FNX_PF_STATIC_STAGE=2` and `FNX_PF_DECODE_CACHE=1`. Set to zero to stage cache hits. Overflow experts still use immutable model weights in place. Refreshes the pointer tables after each pass reserves its K/V pages. |
+| `FNX_PF_DIRECT_OVERLAP=1` | Run routed staging copies on the copy stream alongside the shared expert. Requires direct cache reads. |
+| `FNX_VERIFY_SAMPLE=1` | In single-request generation, queue sampled top-k and its readback after verify on each card. Sampled and greedy requests share the body graph. |
+| `FNX_LOOKUP_INDEX=1` | Build a per-request trigram index on first lookup and extend it as tokens arrive. The lookup search limit, tie order and image boundary still apply. |
+
+On two RX 7900 XTX cards with Unsloth UD-IQ2_XS, a request with 87,940 prompt
+tokens was edited after token 50,000. With the interval set to 8192, the edit
+reused 36,786 tokens and reached its first output in 3.41 seconds. With the
+interval disabled it reused 4,018 tokens and took 10.19 seconds. Both runs
+emitted the same token IDs and had byte-identical first-token logits. A cold
+read with an explicit boundary at 36,786 reproduced the restored result.
+An edit inside the first pass may still have only the initial message checkpoint
+available. The edit timing is one paired observation.
+
+On this workload all 85 checkpoint regression requests matched their reference
+token IDs and finish reasons, including six cancellations. The earlier schedule
+had five divergent outputs. An injected GPU timeout made the worker report its
+failure and exit. A separate HTTP regression test received 503 and completed the
+next request on a fresh worker.
+
+With the three prefill/decode controls off and then on in the same binary,
+cold 4K prefill measured 3991.44 and 3995.72 tok/s. Cold 32K prefill measured
+4819.33 and 4820.49 tok/s. Seeded decode measured 236.45 and 237.11 tok/s,
+and greedy context-copy decode measured 502.64 and 501.72 tok/s. Each
+workload ran three times. Prefill uses the median and decode uses total
+tokens divided by total decode time. All 16 requests including warmup matched.
+On an 87,991-token prefix, the lookup index alone measured 190.50 tok/s over
+four 512-token generations. Linear lookup measured 189.91 tok/s with identical
+output. These measurements preceded the immutable-weight staging fix.
+
+## TP sampling, cache ownership and prefill, November 20
+
+On construction failure the engine waits for work on each initialized GPU
+before releasing its buffers and streams. QSA peer errors carry the low 16
+bits of the producer's error mask. Higher bits also set the protocol-error
+bit so the consumer can still recognize a failed transfer. A prefill failure
+reports the numeric mask and its meaning. Attention exchanges now use the
+attention layer's ordinal to select their call number.
+
+Host cache accounting counts each allocated checkpoint once across the live
+conversation and parked roots, including when estimating the effect of an
+eviction. The prefill scratch loan skips clearing pages that the prompt pass
+overwrites. The engine clears any such page that enters the K/V free list.
+
+Single-lane sampled drafts use the first top-k entry for the winning token.
+Verify returns scores, token IDs and error flags in one device-to-host copy
+per card. Rows without penalties skip the penalty uploads. Draft and verify
+advance the token counts through each chain as the penalty window slides.
+Greedy lookup catch-up projects the keys and values needed by later drafts.
+The full attention and indexer queries run when the draft needs a prediction.
+
+| Setting | Effect |
+| --- | --- |
+| `FNX_DRAFT_TOPK_PARTS` | Select 2, 4, 8, 16 or 32 exact top-k partitions for the draft vocabulary. Zero inherits the main vocabulary setting. Both this override and `FNX_TOPK_EXACT_FAST` require `FNX_TOPK_PARTS` to be enabled. |
+| `FNX_MTP_SAMPLE_HEAD=1` | Use the configured MTP head for single-lane sampled proposals. Modes 2 and 3 prune draft logits. The verifier uses the actual proposal probabilities in acceptance and residual sampling. Changing the proposals can change output at a fixed seed. |
+| `FNX_PF_HC_DOWN_Q8=1` | Read Q8 HC-down weights directly in the row-split gfx1100 prefill kernel. Each weight is rounded to FP16 before the existing WMMA accumulation. Requires `FNX_PF_HC_ROW_SPLIT=1`. |
+
+On two RX 7900 XTX cards with the 262,144-token Unsloth UD-IQ2_XS profile,
+the following runs used identical tokenized prompts and HIP executable SHA-256
+`c1d875babeecaa778df4f6d39cd5bd5ff1499f9993accef224c5aa114c9d044a`. Each
+entry is the median of three fresh prompt reads. The copy control ran again
+after all trials. The Q8 trial used the original copy settings.
+
+| Prefill settings | 4,097 tokens, tok/s | 32,001 tokens, tok/s |
+| --- | ---: | ---: |
+| 16 copy blocks, overlap off | 3604.29 | 4812.54 |
+| Overlap, 1 block | 3636.28 | 4852.09 |
+| Overlap, 2 blocks | 3654.12 | 4855.99 |
+| Overlap, 4 blocks | 3613.51 | 4840.20 |
+| Direct Q8 HC-down | 3590.71 | 4778.62 |
+| 16 copy blocks, overlap off, repeat | 3611.92 | 4820.44 |
+
+Direct Q8 HC-down matched every FP32 reference result in six shard and
+tail tests on the two cards. Its end-to-end timings favored the existing
+FP16 staging path on this profile. All prefill trials reproduced the
+control's generated tokens.
+
+With Unsloth UD-IQ3_XXS at context 204,800, the same three-prompt medians
+were 2955.78 and 4641.66 tok/s for 4K and 32K with overlap off. Two copy
+blocks with overlap gave 2991.82 and 4678.30 tok/s. One block gave 2988.55
+and 4668.27 tok/s, and four blocks gave 2969.06 and 4664.94 tok/s. Every
+greedy output and finish reason matched the control.
+
+The Swift 1.5 IQ3_S profile at context 200,768 also used two copy blocks
+with overlap. All three paired reads were faster at both lengths and every
+output matched. The 4K medians were 2810.78 and 2998.39 tok/s, and the
+32K medians were 4522.47 and 4656.45 tok/s. The 32K control varied from
+3365.9 to 4614.9 tok/s, so the individual measurements matter when comparing
+this profile.
+
+For sampled decode, each column below uses three 384-token requests. The
+draft chain was fixed at six, the main top-k had 32 partitions, and the
+sampling temperature was 0.8. The penalty case used a 256-token window.
+Throughput is total generated tokens divided by total decode time.
+
+| IQ2_XS draft settings | Sample, tok/s | Sample with penalties, tok/s |
+| --- | ---: | ---: |
+| 32 partitions | 246.52 | 171.84 |
+| 8 partitions | 245.30 | 171.06 |
+| 16 partitions | 246.58 | 171.92 |
+| 32 partitions, sampled head mode 3 | 249.33 | 173.93 |
+| 32 partitions, sampled head mode 3, repeat | 249.44 | 174.13 |
+| 32 partitions, full sampled head, repeat | 246.82 | 172.11 |
+
+In the first control, verify took 82.2% of decode wall time across the six
+timed requests. The draft stage took 17.7%. The new and previous engines
+also produced identical token IDs and finish reasons in 31 paired requests
+(6,142 generated tokens per side). This covered all three quantizations,
+a 200,001-token IQ2_XS prompt followed by K/V regrowth, and greedy lookup
+catch-up. The 200,001-token request borrowed 800 MiB per card.
+
+A separate 24-prompt IQ2_XS run exercised top-k 64, top-p 1, temperatures
+0.95 and 1.4, with penalties on every third request. Enabling the pruned
+sampled head changed the generated IDs on five fixed-seed prompts. The tuned
+serving profiles therefore keep the full draft head for sampling.
+
+Fault injection on the dual-card build failed a mailbox allocation on card 1.
+The HIP trace recorded a successful sync on card 0 and card 1 before the
+first device free. Injecting a timeout into sampled verify produced
+`ERR FATAL: window: QSA query exchange timed out`. Injecting a prefill
+timeout produced `ERR FATAL: prefill: ring error 256 (HC row exchange timed out)`.
+The HIP top-k comparison passed 2,016 exact cases. With both GPUs, the QSA
+fixture passed its 22 malformed-payload and timeout checks, and a 1,023-expert
+bulk copy reproduced every source byte and preserved the destination guards.
+
+The final run compared each installed profile with its previous executable
+and settings. Each request used the same input, sampling parameters and seed
+as its reference. IQ2_XS ran twice per case, IQ3_XXS and Swift once per case.
+All 24 final requests matched token-for-token. All profiles used 32 main
+and draft top-k partitions and enabled prefill copy overlap with two blocks.
+
+| Profile | Sampled decode before / after, tok/s | With penalties before / after, tok/s | 32K prefill before / after, tok/s |
+| --- | ---: | ---: | ---: |
+| Unsloth UD-IQ2_XS | 243.15 / 243.50 | 175.46 / 175.68 | 4856.80 / 4862.56 |
+| Unsloth UD-IQ3_XXS | 212.24 / 222.78 | 199.78 / 211.34 | 4465.80 / 4673.52 |
+| Swift IQ3_S | 211.69 / 216.11 | 174.91 / 179.18 | 4679.47 / 4698.57 |
+
+After deployment, the 8081 IQ2_XS service completed `./bench.sh --long` with
+three runs per workload. Fresh 4K, 16K and 32K prefill medians were 3731.7,
+4803.3 and 4889.6 tok/s. The 15 agent follow-up turns had median decode
+175.8 tok/s (154.5 to 231.0) and median time to first token 0.908 s.
+The earlier same-day run had median agent decode 183.5 tok/s. This benchmark
+uses greedy generation, up to 64 new tokens per agent turn, and a new session
+tag on every invocation. The deployed run accepted 488 of 1035 draft tokens
+across its follow-up turns.
+
+A paired HTTP replay fixed the benchmark's session tags, files, warmup and
+request order. Both workers returned the same text for all 36 agent requests,
+with identical prompt, reuse, generation and draft acceptance counts. On the
+30 follow-up turns, median decode was 177.4 tok/s on the prior profile and
+177.2 on the deployed one. Total generated tokens divided by total decode
+time was 176.64 and 176.49 tok/s respectively. Both accepted 982 of 2147
+draft tokens and generated 1539 follow-up tokens.
