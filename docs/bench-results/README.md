@@ -4,7 +4,7 @@ Raw results and short reports from measurement runs, one folder per run, named b
 the Strata version, hardware and method of its own day, and none is a statement about a later release. Current numbers are in the
 [docs](../README.md) and the [README](../../README.md); how to measure is in [BENCHMARK_PROTOCOL.md](../BENCHMARK_PROTOCOL.md).
 
-This page is built by `python tools/bench_results_index.py` (`--check` fails when a folder is missing from it). 144 folders and 3 loose files, 2189 files in all.
+This page is built by `python tools/bench_results_index.py` (`--check` fails when a folder is missing from it). 159 folders and 3 loose files, 2219 files in all.
 
 
 ## 2026-09
@@ -164,7 +164,22 @@ This page is built by `python tools/bench_results_index.py` (`--check` fails whe
 | Folder | What | Files |
 | --- | --- | ---: |
 | [2026-11-14-rdna2-pcie-auto](2026-11-14-rdna2-pcie-auto/) | PcieAuto on gfx103x: the decode miss split from the CPU pool's speed (#4007) | 3 |
+| [2026-11-19-community-unknown-qwen3-8-flash-next-unsloth-ud-iq2-xs](2026-11-19-community-unknown-qwen3-8-flash-next-unsloth-ud-iq2-xs/) | Community benchmark on AMD Radeon + AMD Radeon | 2 |
+| [2026-11-20-community-unknown-qwen3-8-flash-next-unsloth-ud-iq2-xs](2026-11-20-community-unknown-qwen3-8-flash-next-unsloth-ud-iq2-xs/) | Community benchmark on AMD Radeon + AMD Radeon | 2 |
+| [2026-11-20-community-unknown-qwen3-8-flash-next-unsloth-ud-iq2-xs-2](2026-11-20-community-unknown-qwen3-8-flash-next-unsloth-ud-iq2-xs-2/) | Community benchmark on AMD Radeon + AMD Radeon | 2 |
+| [2026-11-20-community-unknown-qwen3-8-flash-next-unsloth-ud-iq2-xs-3](2026-11-20-community-unknown-qwen3-8-flash-next-unsloth-ud-iq2-xs-3/) | Community benchmark on AMD Radeon + AMD Radeon | 2 |
+| [2026-11-20-community-unknown-qwen3-8-flash-next-unsloth-ud-iq2-xs-4](2026-11-20-community-unknown-qwen3-8-flash-next-unsloth-ud-iq2-xs-4/) | Community benchmark on AMD Radeon + AMD Radeon | 2 |
+| [2026-11-20-community-unknown-qwen3-8-flash-next-unsloth-ud-iq2-xs-5](2026-11-20-community-unknown-qwen3-8-flash-next-unsloth-ud-iq2-xs-5/) | Community benchmark on AMD Radeon + AMD Radeon | 2 |
+| [2026-11-20-community-unknown-swift-1-5-iq3-s-tp-pi-increment](2026-11-20-community-unknown-swift-1-5-iq3-s-tp-pi-increment/) | Community benchmark on AMD Radeon + AMD Radeon | 2 |
+| [2026-11-20-community-unknown-swift-1-5-iq3-s-tp-pi-increment-2](2026-11-20-community-unknown-swift-1-5-iq3-s-tp-pi-increment-2/) | Community benchmark on AMD Radeon + AMD Radeon | 2 |
+| [2026-11-20-community-unknown-swift-1-5-iq3-s-tp-pi-increment-3](2026-11-20-community-unknown-swift-1-5-iq3-s-tp-pi-increment-3/) | Community benchmark on AMD Radeon + AMD Radeon | 2 |
+| [2026-11-20-community-unknown-swift-1-5-iq3-s-tp-pi-increment-4](2026-11-20-community-unknown-swift-1-5-iq3-s-tp-pi-increment-4/) | Community benchmark on AMD Radeon + AMD Radeon | 2 |
+| [2026-11-20-community-unknown-swift-1-5-iq3-s-tp-pi-increment-5](2026-11-20-community-unknown-swift-1-5-iq3-s-tp-pi-increment-5/) | Community benchmark on AMD Radeon + AMD Radeon | 2 |
+| [2026-11-20-community-unknown-swift-1-5-iq3-s-tp-pi-increment-6](2026-11-20-community-unknown-swift-1-5-iq3-s-tp-pi-increment-6/) | Community benchmark on AMD Radeon + AMD Radeon | 2 |
 | [2026-11-20-q36-kv-precision](2026-11-20-q36-kv-precision/) | q36 --kv fp32/fp16/fp8/fp4 — memory width for the K/V cache | 1 |
+| [2026-11-23-community-unknown-qwen3-8-flash-next-unsloth-ud-iq3-xxs](2026-11-23-community-unknown-qwen3-8-flash-next-unsloth-ud-iq3-xxs/) | Community benchmark on AMD Radeon + AMD Radeon | 2 |
+| [2026-11-23-community-unknown-swift-1-5-iq3-s-tp-pi-increment](2026-11-23-community-unknown-swift-1-5-iq3-s-tp-pi-increment/) | Community benchmark on AMD Radeon + AMD Radeon | 2 |
+| [2026-11-23-community-unknown-swift-1-5-iq3-s-tp-pi-increment-2](2026-11-23-community-unknown-swift-1-5-iq3-s-tp-pi-increment-2/) | Community benchmark on AMD Radeon + AMD Radeon | 2 |
 
 ## Loose files
 
