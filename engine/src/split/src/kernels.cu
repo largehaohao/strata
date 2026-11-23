@@ -1547,6 +1547,41 @@ void qsa_select(const float* q, const uint16_t* pooled, const KvPages& g, float*
     ck_launch("qsa_select");
 }
 
+static int qsa_fdot2_mode() {
+    static const int mode = [] {
+        const long long v = env_int("FNX_QSA_FDOT2", 0);
+        if (v < 0 || v > 2) throw std::runtime_error("FNX_QSA_FDOT2: expected 0, 1 or 2");
+#if !FNX_HIP
+        if (v != 0) throw std::runtime_error("FNX_QSA_FDOT2 requires HIP");
+#endif
+        return (int) v;
+    }();
+    return mode;
+}
+
+static void qsa_launch_decode_score(const float* q, const __half* pl, const KvPages& g, float* scores,
+                                    int max_pools, const int* pos0, LaneRows lr, int T, int score_budget,
+                                    cudaStream_t s) {
+    const int mode = qsa_fdot2_mode();
+    const int full_blocks = (max_pools + 255) / 256;
+    const int blocks = score_budget ? std::min(full_blocks, std::max(1, (score_budget + T - 1) / T)) : full_blocks;
+    const dim3 grid(blocks, T);
+#if FNX_HIP
+    if (mode == 1) {
+        if (score_budget) k_idx_score_fdot2<true, false><<<grid, 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, lr);
+        else k_idx_score_fdot2<false, false><<<grid, 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, lr);
+        return;
+    }
+    if (mode == 2) {
+        if (score_budget) k_idx_score_fdot2<true, true><<<grid, 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, lr);
+        else k_idx_score_fdot2<false, true><<<grid, 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, lr);
+        return;
+    }
+#endif
+    if (score_budget) k_idx_score_persistent<<<grid, 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, lr);
+    else k_idx_score<<<grid, 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, lr);
+}
+
 void qsa_select_lanes(const float* q, const uint16_t* pooled, const KvPages& g, float* scores, int* cells, int* n_cells, int max_pools,
                       const LaneRows& lr, int T, int card, void* st) {
     cudaStream_t s = (cudaStream_t) st;
@@ -1558,7 +1593,7 @@ void qsa_select_lanes(const float* q, const uint16_t* pooled, const KvPages& g, 
         return;
     }
     const __half* pl = reinterpret_cast<const __half*>(pooled);
-    k_idx_score<<<dim3((max_pools + 255) / 256, T), 256, 0, s>>>(q, pl, g, scores, max_pools, nullptr, lr);
+    qsa_launch_decode_score(q, pl, g, scores, max_pools, nullptr, lr, T, 0, s);
     qsa_select_positions(scores, cells, n_cells, max_pools, nullptr, lr, T, T, card, s);
     ck_launch("qsa_select_lanes");
 }
@@ -1614,11 +1649,7 @@ void qsa(const uint16_t* wq, const uint16_t* wk, const float* x, float* y, const
         if (n < 0 || n > 1024) throw std::runtime_error("FNX_QSA_SCORE_GRID: expected0..1024");
         return (int)n;
     }();
-    if (score_budget) {
-        const int blocks = std::min((max_pools + 255) / 256, std::max(1, (score_budget + T - 1) / T));
-        k_idx_score_persistent<<<dim3(blocks, T), 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, LaneRows{});
-    } else
-    k_idx_score<<<dim3((max_pools + 255) / 256, T), 256, 0, s>>>(q, pl, g, scores, max_pools, pos0, LaneRows{});
+    qsa_launch_decode_score(q, pl, g, scores, max_pools, pos0, LaneRows{}, T, score_budget, s);
     qsa_select_positions(scores, cells, n_cells, max_pools, pos0, {}, T, T, card, s);
     ck_launch("qsa");
 }

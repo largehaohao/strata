@@ -188,6 +188,101 @@ __global__ void __launch_bounds__(256) k_idx_score_persistent(const float* __res
     }
 }
 
+#if FNX_HIP
+using qsa_hv2 = _Float16 __attribute__((ext_vector_type(2)));
+
+__device__ __forceinline__ float qsa_fdot2(uint32_t a, uint32_t b, float c) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    return __builtin_amdgcn_fdot2(__builtin_bit_cast(qsa_hv2, a), __builtin_bit_cast(qsa_hv2, b), c, false);
+#else
+    __half2 ha, hb;
+    __builtin_memcpy(&ha, &a, 4);
+    __builtin_memcpy(&hb, &b, 4);
+    const float2 fa = __half22float2(ha), fb = __half22float2(hb);
+    return fmaf(fa.y, fb.y, fmaf(fa.x, fb.x, c));
+#endif
+}
+
+__device__ __forceinline__ uint32_t qsa_pack_h2(__half lo, __half hi) {
+    const __half2 h2 = __halves2half2(lo, hi);
+    uint32_t u;
+    __builtin_memcpy(&u, &h2, 4);
+    return u;
+}
+
+// Opt-in packed half2 v_dot2_f32_f16 decode QSA scorer (FNX_QSA_FDOT2=1|2).
+// SplitFp16=false stages single-FP16 queries in 1 KiB LDS; SplitFp16=true adds the residual half in 2 KiB LDS.
+template <bool Persistent, bool SplitFp16>
+__global__ void __launch_bounds__(256) k_idx_score_fdot2(
+    const float* __restrict__ q, const __half* __restrict__ pooled, KvPages g,
+    float* __restrict__ scores, int max_pools, const int* pos0p, LaneRows lr) {
+    const int t = blockIdx.y, p = row_pos(lr, pos0p, t), nv = (p + 1) / QSA_POOL;
+    if (nv <= QSA_TOP || blockIdx.x * blockDim.x >= (unsigned) nv) return;
+    g = row_pages(g, lr, t);
+
+    __shared__ __align__(16) uint4 qh[QSA_DIM / 8][QSA_HEADS];
+    __shared__ __align__(16) uint4 ql[SplitFp16 ? (QSA_DIM / 8) : 1][SplitFp16 ? QSA_HEADS : 1];
+
+    uint32_t* qh32 = reinterpret_cast<uint32_t*>(&qh[0][0]);
+    uint32_t* ql32 = reinterpret_cast<uint32_t*>(&ql[0][0]);
+    const float* qt = q + (size_t) t * QSA_HEADS * QSA_DIM;
+
+    for (int e = threadIdx.x; e < QSA_HEADS * (QSA_DIM / 2); e += blockDim.x) {
+        const int h = e / (QSA_DIM / 2);
+        const int p2 = e % (QSA_DIM / 2);
+        const int dst = ((p2 >> 2) * QSA_HEADS + h) * 4 + (p2 & 3);
+        const float x0 = qt[e * 2 + 0], x1 = qt[e * 2 + 1];
+        const __half h0 = __float2half_rn(x0), h1 = __float2half_rn(x1);
+        qh32[dst] = qsa_pack_h2(h0, h1);
+        if constexpr (SplitFp16) {
+            const __half l0 = __float2half_rn(x0 - __half2float(h0));
+            const __half l1 = __float2half_rn(x1 - __half2float(h1));
+            ql32[dst] = qsa_pack_h2(l0, l1);
+        }
+    }
+    __syncthreads();
+
+    const float w = rsqrtf((float) QSA_DIM);
+    const int j_step = Persistent ? (int) (blockDim.x * gridDim.x) : nv;
+    for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < nv; j += j_step) {
+        const uint4* kr = reinterpret_cast<const uint4*>(pooled + kvp_block(g, j));
+        float dh[QSA_HEADS] = {};
+        float dl[QSA_HEADS] = {};
+#pragma unroll 4
+        for (int c = 0; c < QSA_DIM / 8; ++c) {
+            const uint4 u = kr[c];
+#pragma unroll
+            for (int h = 0; h < QSA_HEADS; ++h) {
+                const uint4 qv = qh[c][h];
+                float ah = dh[h];
+                ah = qsa_fdot2(qv.x, u.x, ah);
+                ah = qsa_fdot2(qv.y, u.y, ah);
+                ah = qsa_fdot2(qv.z, u.z, ah);
+                ah = qsa_fdot2(qv.w, u.w, ah);
+                dh[h] = ah;
+                if constexpr (SplitFp16) {
+                    const uint4 lv = ql[c][h];
+                    float al = dl[h];
+                    al = qsa_fdot2(lv.x, u.x, al);
+                    al = qsa_fdot2(lv.y, u.y, al);
+                    al = qsa_fdot2(lv.z, u.z, al);
+                    al = qsa_fdot2(lv.w, u.w, al);
+                    dl[h] = al;
+                }
+            }
+        }
+        float s = 0.f;
+#pragma unroll
+        for (int h = 0; h < QSA_HEADS; ++h) {
+            const float d = SplitFp16 ? (dh[h] + dl[h]) : dh[h];
+            s += fmaxf(d, 0.f) * w;
+        }
+        scores[(size_t) t * max_pools + j] = s;
+        if constexpr (!Persistent) break;
+    }
+}
+#endif
+
 // the same for a prompt's rows on the tensor cores: a block takes 16 rows (their 4 heads: 64 rows of q, in f16 high and
 // low halves) against 64 blocks' keys (f16 already), f32 accumulation; each key is read once per 16 rows instead of once
 // per row. Columns past a row's visible blocks get scores too (the select reads only the visible ones)
