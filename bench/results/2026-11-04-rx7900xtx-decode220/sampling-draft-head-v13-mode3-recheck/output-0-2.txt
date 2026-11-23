@@ -1,9 +1,0 @@
-# Unicode 码点、UTF-8 字节与用户可见字符的区别
-
-## 核心概念辨析
-
-### 1. Unicode 码点（Code Point）
-Unicode 为每个抽象字符分配一个唯一的整数编号，范围 `U+0000` 到 `U+10FFFF`。码点是**逻辑单位**，不关心存储格式。例如：
-- `U+4E2D` → "中"
-- `U+0301` → 组合重音符号 `́`（combining acute accent）
-- `U+1F6

@@ -1,7 +1,0 @@
-{
-  "weighted_tps": 209.94254258050958,
-  "control_tps": 210.937942565416,
-  "output_and_input_ids_exact": true,
-  "decode_major_faults": 0,
-  "normal_exit": true
-}

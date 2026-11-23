@@ -1,9 +1,0 @@
-{
-  "greedy_plain__before": "用中文写一篇面向后端工程师的技术说明，解释数据库的 MVCC、快照隔离、写偏差和可串行化隔离。用两个事务的具体执行时序说明写偏差，并给出 PostgreSQL 应用中的重试策略。说明事务隔离和业务不变量之间的关系，避免泛泛而谈。",
-  "sampled_pen__middle": "用中文解释 Unicode 码点、UTF-8 字节和用户可见字符之间的区别，以中文、组合重音和 emoji 为例。写出 Python 函数 truncate_utf8(text, max_bytes)，在保证编码有效的前提下把文本截断到字节上限，明确它不保证字素簇完整。然后给出覆盖边界情况的 unittest 测试。",
-  "greedy_plain__after_sample": "用中文写一篇面向后端工程师的技术说明，解释数据库的 MVCC、快照隔离、写偏差和可串行化隔离。用两个事务的具体执行时序说明写偏差，并给出 PostgreSQL 应用中的重试策略。说明事务隔离和业务不变量之间的关系，避免泛泛而谈。",
-  "greedy_pen__middle": "用中文解释 Unicode 码点、UTF-8 字节和用户可见字符之间的区别，以中文、组合重音和 emoji 为例。写出 Python 函数 truncate_utf8(text, max_bytes)，在保证编码有效的前提下把文本截断到字节上限，明确它不保证字素簇完整。然后给出覆盖边界情况的 unittest 测试。",
-  "greedy_plain__after_pen": "用中文写一篇面向后端工程师的技术说明，解释数据库的 MVCC、快照隔离、写偏差和可串行化隔离。用两个事务的具体执行时序说明写偏差，并给出 PostgreSQL 应用中的重试策略。说明事务隔离和业务不变量之间的关系，避免泛泛而谈。",
-  "sampled_plain__middle": "用中文解释 Unicode 码点、UTF-8 字节和用户可见字符之间的区别，以中文、组合重音和 emoji 为例。写出 Python 函数 truncate_utf8(text, max_bytes)，在保证编码有效的前提下把文本截断到字节上限，明确它不保证字素簇完整。然后给出覆盖边界情况的 unittest 测试。",
-  "greedy_plain__final": "用中文写一篇面向后端工程师的技术说明，解释数据库的 MVCC、快照隔离、写偏差和可串行化隔离。用两个事务的具体执行时序说明写偏差，并给出 PostgreSQL 应用中的重试策略。说明事务隔离和业务不变量之间的关系，避免泛泛而谈。"
-}

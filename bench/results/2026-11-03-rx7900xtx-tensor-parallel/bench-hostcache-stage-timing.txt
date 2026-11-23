@@ -1,6 +1,0 @@
-fnx: embedding refresh token_embd.weight: resident 644 -> 644 / 644 MiB in 0.01 s
-fnx: embedding refresh per_layer_token_embd.weight: resident 25668 -> 27450 / 27465 MiB in 2.03 s
-sfnx: decode timing: verify 54.425 ms (GPU 54.205, launch 2.668), draft 1.986 ms (GPU 1.769, 3 calls), total 56.472 ms
-sfnx: decode timing: verify 12223.442 ms (GPU 12156.088, launch 504.863), draft 1519.287 ms (GPU 1353.611, 2028 calls), total 13768.729 ms
-sfnx: decode timing: verify 14789.216 ms (GPU 14699.683, launch 702.616), draft 1606.560 ms (GPU 1425.072, 2125 calls), total 16440.029 ms
-sfnx: decode timing: verify 12318.077 ms (GPU 12246.874, launch 475.606), draft 1307.593 ms (GPU 1167.968, 1716 calls), total 13653.934 ms

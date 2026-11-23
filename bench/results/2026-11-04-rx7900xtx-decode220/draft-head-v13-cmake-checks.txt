@@ -1,1 +1,0 @@
-PASS 216 selected exact scores, survivor counts, tie and guard checks

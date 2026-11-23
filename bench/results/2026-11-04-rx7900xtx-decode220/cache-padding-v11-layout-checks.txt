@@ -1,1 +1,0 @@
-static cache layout: allocation bounds, pool assignment, 768 generated layouts and invalid inputs passed

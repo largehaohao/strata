@@ -1,3 +1,0 @@
-card 0: 192 Q4 direct/graph checks
-card 1: 192 Q4 direct/graph checks
-PASS 384 Q4 head products and guards

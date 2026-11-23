@@ -1,6 +1,0 @@
-# Unicode 码点、UTF-8 字节与用户可见字符的区别
-
-## 核心概念辨析
-
-### 1. Unicode 码点（Code Point）
-Unicode 码点是字符在 Unicode 标准中的唯一数值标识，范围从 U+0000 到 U+10

@@ -1,4 +1,0 @@
-gguf: 5 dense/small tensors converted to Q8_0/F32 at load (the file's routed experts keep their types)
-gguf: 5 dense/small tensors converted to Q8_0/F32 at load (the file's routed experts keep their types)
-gguf: 4 dense/small tensors converted to Q8_0/F32 at load (the file's routed experts keep their types)
-GGUF ownership: mixed/plain, packed down, metadata, retention, rejection and repeated release passed

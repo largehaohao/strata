@@ -1,3 +1,0 @@
-card 0: cumulative 192 exact cores, 2880 exact restored states
-card 1: cumulative 384 exact cores, 5760 exact restored states
-PASS GDN replay: 384 core and 5760 restoration comparisons

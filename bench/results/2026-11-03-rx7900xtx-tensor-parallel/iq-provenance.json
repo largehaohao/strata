@@ -1,7 +1,0 @@
-{
-  "binary_sha256": "5ff449b1243611b18d3de910184d6618056a02c1b6f352051d02dc797742a84f",
-  "wrapper": "#!/bin/sh\nexec /home/john/Strata/.venv/lib/python3.12/site-packages/_rocm_sdk_core/bin/rocprofv3 --kernel-trace --stats --output-format csv --output-directory /home/john/Strata/build-tensor-parralize-baseline/profile-iq --collection-period 65:4:1 -- /home/john/Strata/build-tensor-parralize-baseline/src/split/strata-split-2 \"$@\"\n",
-  "trace_path": "build-tensor-parralize-baseline/profile-iq/john-MS-7D76/249583_kernel_trace.csv",
-  "run_metadata": "build-tensor-parralize-baseline/bench-profile-iq/results.json",
-  "warning": "Profiler kernel durations overlap across devices and include waits; not acceptance TPS. Saved pre-IQ quality binary is f6980cbc80238637f0e46107da1469f6b3b0470d2e8b0515ba4e4ca394406d4e from the 06af2bb6 implementation; the worktree fingerprint in its run metadata includes later experimental edits."
-}

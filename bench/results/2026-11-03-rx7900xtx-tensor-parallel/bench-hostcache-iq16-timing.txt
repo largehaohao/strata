@@ -1,7 +1,0 @@
-sfnx: decode timing: verify 51.759 ms (GPU 51.534, launch 2.822), draft 1.881 ms (GPU 1.666, 3 calls), total 53.671 ms
-sfnx: decode timing: verify 11628.998 ms (GPU 11584.577, launch 457.839), draft 1415.999 ms (GPU 1242.945, 2028 calls), total 13061.796 ms
-sfnx: decode timing: verify 13812.362 ms (GPU 13751.795, launch 635.569), draft 1500.414 ms (GPU 1309.189, 2125 calls), total 15342.041 ms
-sfnx: decode timing: verify 11441.196 ms (GPU 11393.364, launch 432.535), draft 1224.687 ms (GPU 1081.697, 1716 calls), total 12690.209 ms
-sfnx: decode timing: verify 11448.885 ms (GPU 11395.715, launch 475.346), draft 1424.679 ms (GPU 1257.855, 2028 calls), total 12901.420 ms
-sfnx: decode timing: verify 13821.534 ms (GPU 13759.346, launch 603.559), draft 1505.282 ms (GPU 1316.426, 2125 calls), total 15361.397 ms
-sfnx: decode timing: verify 11446.164 ms (GPU 11398.187, launch 429.419), draft 1220.947 ms (GPU 1077.383, 1716 calls), total 12690.228 ms
