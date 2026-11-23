@@ -70,6 +70,25 @@ int moe_split_wl_min_t() {
     }();
     return min_t;
 }
+
+bool moe_exp8_env() {
+    static const bool on = [] {
+        const long long v = env_int("FNX_MOE_EXP8", 0);
+        if (v != 0 && v != 1) throw std::runtime_error("FNX_MOE_EXP8: expected 0 or 1");
+        return v == 1;
+    }();
+    return on;
+}
+
+int moe_lds_env() {
+    static const int mode = [] {
+        const long long v = env_int("FNX_MOE_LDS", 0);
+        if (v < 0 || v > 2) throw std::runtime_error("FNX_MOE_LDS: expected 0, 1, or 2");
+        if (v > 0 && !moe_exp8_env()) throw std::runtime_error("FNX_MOE_LDS requires FNX_MOE_EXP8=1");
+        return (int) v;
+    }();
+    return mode;
+}
 } // namespace
 
 
@@ -131,9 +150,11 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
     if ((static_groups != 1 && static_groups != 2) || (static_groups == 2 && !static_slots))
         throw std::runtime_error("FNX_STATIC_CACHE_GROUPS: 1 or 2, grouping needs a static cache");
     const long long fused_dn = env_int("FNX_STATIC_CACHE_FUSED_DN", 0);
-    if (fused_dn < 0 || fused_dn > 256 ||
-        (fused_dn && (!static_slots || env_int("FNX_IQ_REUSE", 0) != 1 || env_int("FNX_IQ_GROUP", 32) != 16)))
-        throw std::runtime_error("FNX_STATIC_CACHE_FUSED_DN: 0..256 blocks, needs static cache and IQ reuse group 16");
+    const bool iq_reuse_16 = env_int("FNX_IQ_REUSE", 0) == 1 && env_int("FNX_IQ_GROUP", 32) == 16;
+    const bool exp8_on = moe_exp8_env();
+    (void) moe_lds_env();
+    if (fused_dn < 0 || fused_dn > 256 || (fused_dn && (!static_slots || (!iq_reuse_16 && !exp8_on))))
+        throw std::runtime_error("FNX_STATIC_CACHE_FUSED_DN: 0..256 blocks, needs static cache and IQ reuse group 16 or FNX_MOE_EXP8=1");
     const long long fused_gu = env_int("FNX_STATIC_CACHE_FUSED_GU", 0);
     if (fused_gu != 0 && fused_gu != 1)
         throw std::runtime_error("FNX_STATIC_CACHE_FUSED_GU: expected 0 or 1");
@@ -1223,11 +1244,12 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
     if (prof) vp_stamp(12);
     const bool static_live = b.static_cache.n_slots && lyr >= 0 && lyr < NL;
     const ExpertCache& ec = static_live ? b.static_cache : w.ec;
+    const bool exp8 = moe_exp8_env() && L.gu_e.n_in == N && moe_gu_can_exp8(L.gu_e.type, ffs, P);
     static const int fused_dn_blocks = (int) env_int("FNX_STATIC_CACHE_FUSED_DN", 0);
     static const bool xxs_reuse = env_int("FNX_IQ2_XXS_REUSE", 0) == 1;
     const bool fused_dn = static_live && fused_dn_blocks &&
         (L.gu_e.type == T_IQ2_S || L.gu_e.type == T_IQ3_XXS || L.gu_e.type == T_IQ3_S ||
-         (xxs_reuse && L.gu_e.type == T_IQ2_XXS));
+         ((xxs_reuse || exp8) && L.gu_e.type == T_IQ2_XXS));
     static const bool fused_gu_enabled = env_int("FNX_STATIC_CACHE_FUSED_GU", 0) == 1;
     const bool fused_gu = fused_dn && fused_gu_enabled;
     // the shared expert (rows P + t of part): its gate|up in the router's launch and its swiglu and down in the routed
@@ -1240,8 +1262,8 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
     static const bool iq_reuse = env_int("FNX_IQ_REUSE", 0) == 1;
     static const bool sh_fuse_iq = env_flag("FNX_SH_FUSE_IQ");
     const bool reuse_iq_gu = iq_reuse && (L.gu_e.type == T_IQ2_S || L.gu_e.type == T_IQ3_S || L.gu_e.type == T_IQ3_XXS);
-    const bool sh_in = !reuse_iq_gu && !fused_dn && (L.gu_e.type == T_Q4_K || (sh_all && (L.gu_e.type == T_Q5_K || L.gu_e.type == T_Q5_1 || L.gu_e.type == T_Q4_0 || L.gu_e.type == T_Q8_0 || L.gu_e.type == T_IQ4_NL || L.gu_e.type == T_IQ4_XS || L.gu_e.type == T_IQ3_S || L.gu_e.type == T_IQ3_XXS || L.gu_e.type == T_IQ2_S))) && L.sh_gu.s.q && L.sh_down.s.q && ffs % 32 == 0 && ffs <= SH_MAXF;
-    const bool sh_in_down = !sh_in && sh_fuse_iq && static_live && (fused_dn || reuse_iq_gu) && L.sh_gu.s.q && L.sh_down.s.q && ffs % 32 == 0 && ffs <= SH_MAXF && moe_down_can_fuse_sh(T, L.down_e.type);
+    const bool sh_in = !exp8 && !reuse_iq_gu && !fused_dn && (L.gu_e.type == T_Q4_K || (sh_all && (L.gu_e.type == T_Q5_K || L.gu_e.type == T_Q5_1 || L.gu_e.type == T_Q4_0 || L.gu_e.type == T_Q8_0 || L.gu_e.type == T_IQ4_NL || L.gu_e.type == T_IQ4_XS || L.gu_e.type == T_IQ3_S || L.gu_e.type == T_IQ3_XXS || L.gu_e.type == T_IQ2_S))) && L.sh_gu.s.q && L.sh_down.s.q && ffs % 32 == 0 && ffs <= SH_MAXF;
+    const bool sh_in_down = !sh_in && (exp8 ? (sh_all || sh_fuse_iq) : (sh_fuse_iq && static_live && (fused_dn || reuse_iq_gu))) && L.sh_gu.s.q && L.sh_down.s.q && ffs % 32 == 0 && ffs <= SH_MAXF && moe_down_can_fuse_sh(T, L.down_e.type, exp8);
     if (!sh_in && !sh_in_down) {
         ck(cudaEventRecord(b.fork, b.st), "fork");
         ck(cudaStreamWaitEvent(b.st2, b.fork, 0), "fork wait");
@@ -1298,31 +1320,33 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
     if (split_gu) {
         if (sh_in) {
             moe_gate_up(gu, L.gu_e_stride, b.jobs_gu, b.njobs_wl, P, b.xq, b.gu, b.st,
-                        nullptr, 0, nullptr, nullptr, nullptr, nullptr, b.jobs_wl1, 1);
+                        nullptr, 0, nullptr, nullptr, nullptr, nullptr, b.jobs_wl1, 1, exp8);
             moe_gate_up(gu, L.gu_e_stride, b.jobs_gu, b.njobs_wl + 1, P / 2, b.xq, b.gu, b.st,
-                        &L.sh_down.s, ffs, b.sh_gu, b.part + (size_t) P * N, nullptr, nullptr, b.jobs_wlm, T);
+                        &L.sh_down.s, ffs, b.sh_gu, b.part + (size_t) P * N, nullptr, nullptr, b.jobs_wlm, T, exp8);
         } else {
             moe_gate_up(gu, L.gu_e_stride, b.jobs_gu, b.njobs_wl, P, b.xq, b.gu, b.st,
-                        nullptr, 0, nullptr, nullptr, fused_dn ? &copy : nullptr, fused_gu ? &gu_copy : nullptr, b.jobs_wl1, 1);
+                        nullptr, 0, nullptr, nullptr, fused_dn ? &copy : nullptr, fused_gu ? &gu_copy : nullptr, b.jobs_wl1, 1, exp8);
             moe_gate_up(gu, L.gu_e_stride, b.jobs_gu, b.njobs_wl + 1, P / 2, b.xq, b.gu, b.st,
-                        nullptr, 0, nullptr, nullptr, nullptr, fused_gu ? &gu_copy : nullptr, b.jobs_wlm, T);
+                        nullptr, 0, nullptr, nullptr, nullptr, fused_gu ? &gu_copy : nullptr, b.jobs_wlm, T, exp8);
         }
     } else if (sh_in) {
-        moe_gate_up(gu, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st, &L.sh_down.s, ffs, b.sh_gu, b.part + (size_t) P * N);
+        moe_gate_up(gu, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st, &L.sh_down.s, ffs, b.sh_gu, b.part + (size_t) P * N,
+                    nullptr, nullptr, nullptr, 0, exp8);
     } else {
         moe_gate_up(gu, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st, nullptr, 0, nullptr, nullptr,
-                    fused_dn ? &copy : nullptr, fused_gu ? &gu_copy : nullptr);
+                    fused_dn ? &copy : nullptr, fused_gu ? &gu_copy : nullptr, nullptr, 0, exp8);
     }
     if (prof) vp_stamp(14);
     const DW down = stage_moe(down_source, L.down_e_stride, b.jobs_dn, b.njobs, P, stage, b.moe_stage_ep, b.st, hot);
     if (sh_in_down) {
         moe_down(down, L.down_e_stride, b.jobs_dn, b.njobs, P, b.gu, b.part, b.st, &L.sh_down.s, ffs, b.sh_gu, b.sh_hq, b.part + (size_t) P * N,
-                 split_dn ? b.jobs_wl1 : nullptr, split_dn ? b.jobs_wlm : nullptr, split_dn ? b.njobs_wl : nullptr);
+                 split_dn ? b.jobs_wl1 : nullptr, split_dn ? b.jobs_wlm : nullptr, split_dn ? b.njobs_wl : nullptr, exp8);
     } else if (split_dn) {
         moe_down(down, L.down_e_stride, b.jobs_dn, b.njobs, P, b.gu, b.part, b.st,
-                 nullptr, 0, nullptr, nullptr, nullptr, b.jobs_wl1, b.jobs_wlm, b.njobs_wl);
+                 nullptr, 0, nullptr, nullptr, nullptr, b.jobs_wl1, b.jobs_wlm, b.njobs_wl, exp8);
     } else {
-        moe_down(down, L.down_e_stride, b.jobs_dn, b.njobs, P, b.gu, b.part, b.st);
+        moe_down(down, L.down_e_stride, b.jobs_dn, b.njobs, P, b.gu, b.part, b.st,
+                 nullptr, 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, exp8);
     }
     if (!sh_in && !sh_in_down) ck(cudaStreamWaitEvent(b.st, b.join, 0), "join wait");
     if (prof) vp_stamp(15);

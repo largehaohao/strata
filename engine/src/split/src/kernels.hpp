@@ -329,10 +329,11 @@ struct CacheGateUpCopy {
 };
 // gu rows of 2*ffs: [gate | up] (A: per-expert stacked rows, stride sa). sh_down (Q4_K experts only): the shared
 // expert's swiglu of sh_gu ([T][2 * sh_ffs]) and down (N rows) into sh_out (row stride N), in the same launch
+bool moe_gu_can_exp8(uint32_t gu_type, int ffs, int njobs_max);
 void moe_gate_up(const DW& A, size_t sa, const Job* jobs, const int* njobs, int njobs_max, const void* xq, float* gu, void* st,
                  const Q8S* sh_down = nullptr, int sh_ffs = 0, const float* sh_gu = nullptr, float* sh_out = nullptr,
                  const CacheDownCopy* copy = nullptr, const CacheGateUpCopy* gu_copy = nullptr,
-                 const int* job_idx = nullptr, int job_t = 0);
+                 const int* job_idx = nullptr, int job_t = 0, bool exp8 = false);
 // the same for jobs of up to MAXT rows each, njobs_cap of them at most (the prompt path's)
 void moe_gate_up_jobs(const DW& A, size_t sa, const Job* jobs, const int* njobs, int njobs_cap, const void* xq, float* gu, void* st);
 // the same with BigJobs (njobs_cap of them at most)
@@ -358,10 +359,11 @@ void cache_copy(const ExpertCache& ec, int p, const int* list, void* st);
 // pointed back at RAM; from > to: slots [to, from) given back empty); the pool's lent count and hand follow
 void arena_slots(const ExpertCache& ec, int from, int to, void* st);
 // part rows of N from silu(gate) * up of the gu rows; optionally fuses the shared expert's swiglu and down rows
-bool moe_down_can_fuse_sh(int T, uint32_t down_type);
+bool moe_down_can_fuse_sh(int T, uint32_t down_type, bool hq_ready = false);
 void moe_down(const DW& A, size_t sa, const Job* jobs, const int* njobs, int njobs_max, const float* gu, float* part, void* st,
               const Q8S* sh_down = nullptr, int sh_ffs = 0, const float* sh_gu = nullptr, void* sh_hq = nullptr,
-              float* sh_out = nullptr, const int* wl1 = nullptr, const int* wlm = nullptr, const int* n_wl = nullptr);
+              float* sh_out = nullptr, const int* wl1 = nullptr, const int* wlm = nullptr, const int* n_wl = nullptr,
+              bool hq_ready = false);
 // T rows of [gate (ffs) | up (ffs)] -> silu(gate) * up as q8_1 rows of ffs (the shared expert)
 void swiglu_stacked_q8_1(const float* gu, void* hq, int ffs, int T, void* st);
 // the weighted sum of the expert rows, read by the ring in place of x when part is not null

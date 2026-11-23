@@ -835,7 +835,8 @@ void moe_down_dispatch(int gx, int njobs_max, size_t smem, cudaStream_t s, const
 template <GgmlType TA, bool PACKED_Q2 = false>
 void moe_launch(bool down, const MoeW& w, const Job* jobs, const int* njobs, int njobs_max, const void* in, float* out,
                 cudaStream_t s, int T, const CacheDownCopy* copy = nullptr, const CacheGateUpCopy* gu_copy = nullptr,
-                const int* job_idx = nullptr, const int* wl1 = nullptr, const int* wlm = nullptr, const int* n_wl = nullptr) {
+                const int* job_idx = nullptr, const int* wl1 = nullptr, const int* wlm = nullptr, const int* n_wl = nullptr,
+                bool hq_ready = false) {
     if constexpr (PACKED_Q2) {
         if (!down || w.ncols % 64 || w.row_a != (size_t) w.ncols / 64 * 18)
             throw std::runtime_error("packed Q2_0 requires down rows of whole 64-value blocks");
@@ -846,8 +847,8 @@ void moe_launch(bool down, const MoeW& w, const Job* jobs, const int* njobs, int
         const int rpb = DN_THREADS / (w.ncols / DN_U), nh = njobs_max * (w.ncols / DN_U);   // njobs_max: the window's pairs
         const int gx = (w.nrows + rpb - 1) / rpb;
         const size_t smem = sizeof(float) * T * DN_THREADS;
-        const bool pre = T >= moe_pre_rows_env();
-        if (pre) {
+        const bool pre = hq_ready || (T >= moe_pre_rows_env());
+        if (pre && !hq_ready) {
             if (njobs_max > MAXT * TOPK) throw std::runtime_error("moe_down: more pairs than g_moe_hq holds");
             k_moe_h<<<(nh + 7) / 8, 256, 0, s>>>((const float*) in, w.ncols, njobs_max);
         }
@@ -970,7 +971,7 @@ void moe_down_sh_dispatch(int gx, int njobs_max, int sd_rows, size_t smem, cudaS
 template <GgmlType TA, bool PACKED_Q2 = false>
 void moe_down_sh_launch(const MoeW& w, const Job* jobs, const int* njobs, int njobs_max, const float* gu, float* out,
                         cudaStream_t s, int T, const ShexpDownHq& sd, const float* sh_gu, block_q8_1* sh_hq,
-                        const int* wl1 = nullptr, const int* wlm = nullptr, const int* n_wl = nullptr) {
+                        const int* wl1 = nullptr, const int* wlm = nullptr, const int* n_wl = nullptr, bool hq_ready = false) {
     if constexpr (!unit_ok<TA>(DN_U)) {
         throw std::runtime_error("moe_down (shared expert): shape or type does not fit the units");
     } else {
@@ -979,8 +980,10 @@ void moe_down_sh_launch(const MoeW& w, const Job* jobs, const int* njobs, int nj
         if (T < 1 || T > MAXT || sd.ffs % 32 || sd.ffs > SH_MAXF) throw std::runtime_error("moe_down (shared expert): rows or FF slice");
         const int nb = w.ncols / DN_U, rpb = DN_THREADS / nb, gx = (w.nrows + rpb - 1) / rpb;
         const int nh = njobs_max * nb + T * (sd.ffs / 32);
-        k_moe_h_sh<<<(nh + 7) / 8, 256, 0, s>>>(gu, w.ncols, njobs_max, sh_gu, sd.ffs, sh_hq, const_cast<int8_t*>(sd.tq),
-                                               const_cast<float*>(sd.td), T);
+        if (!hq_ready) {
+            k_moe_h_sh<<<(nh + 7) / 8, 256, 0, s>>>(gu, w.ncols, njobs_max, sh_gu, sd.ffs, sh_hq, const_cast<int8_t*>(sd.tq),
+                                                   const_cast<float*>(sd.td), T);
+        }
         const int sd_rows = (sd.nqb + gx - 1) / gx;
         const size_t smem = sizeof(float) * T * DN_THREADS;
         const bool hoist = !PACKED_Q2 && DownUnit<TA>::supported && moe_hoist_enabled() && T >= 2;
