@@ -46,8 +46,10 @@ template <typename T> __device__ __forceinline__ T __ldcg(const T* p) {
 inline hipError_t fnx_zero_dev(void* p, size_t bytes) {
     static thread_local hipStream_t st[64] = {};
     int dev = 0;
-    hipGetDevice(&dev);
-    if (dev < 0 || dev >= 64) return hipMemset(p, 0, bytes);
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 64) {
+        (void) hipGetLastError();
+        return hipMemset(p, 0, bytes);
+    }
     if (!st[dev]) {
         const hipError_t e = hipStreamCreateWithFlags(&st[dev], hipStreamNonBlocking);
         if (e != hipSuccess) return e;
@@ -63,8 +65,14 @@ inline hipError_t fnx_zero_dev(void* p, size_t bytes) {
 inline hipStream_t fnx_side_stream() {
     static thread_local hipStream_t st[64] = {};
     int dev = 0;
-    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 64) return nullptr;
-    if (!st[dev] && hipStreamCreateWithFlags(&st[dev], hipStreamNonBlocking) != hipSuccess) st[dev] = nullptr;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 64) {
+        (void) hipGetLastError();
+        return nullptr;
+    }
+    if (!st[dev] && hipStreamCreateWithFlags(&st[dev], hipStreamNonBlocking) != hipSuccess) {
+        (void) hipGetLastError();
+        st[dev] = nullptr;
+    }
     return st[dev];
 }
 inline hipError_t fnx_memcpy(void* d, const void* s, size_t n, hipMemcpyKind k) {

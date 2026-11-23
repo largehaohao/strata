@@ -134,10 +134,54 @@ void check_mixed() {
     require(g.t("plain.weight").data && g.t("per_layer_token_embd.weight").data, "mapped tensors must remain available");
     require(g.release_owned_except({}) == 0, "fully released state must be idempotent");
 }
+void check_header_bounds() {
+    auto expect_throw = [](const std::vector<uint8_t>& bytes, const char* substr, const char* label) {
+        char tmp[] = "/tmp/strata-gguf-bounds-XXXXXX";
+        const int fd = mkstemp(tmp);
+        require(fd >= 0, "temporary bounds fixture");
+        close(fd);
+        struct Guard {
+            std::string p;
+            ~Guard() { std::remove(p.c_str()); }
+        } guard{tmp};
+        {
+            std::ofstream out(tmp, std::ios::binary);
+            out.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+            require(bool(out), "write bounds fixture");
+        }
+        bool threw = false;
+        try {
+            fnx::Gguf g(tmp);
+        } catch (const std::exception& e) {
+            threw = std::string(e.what()).find(substr) != std::string::npos;
+        }
+        require(threw, label);
+    };
+    {
+        std::vector<uint8_t> bad{'G', 'G', 'U', 'F'};
+        append<uint32_t>(bad, 3);
+        append<uint64_t>(bad, 0);
+        append<uint64_t>(bad, 1);
+        append<uint64_t>(bad, UINT64_MAX - 8);
+        expect_throw(bad, "truncated string", "Cur::str must reject huge length without pointer wrap");
+    }
+    {
+        std::vector<uint8_t> bad{'G', 'G', 'U', 'F'};
+        append<uint32_t>(bad, 3);
+        append<uint64_t>(bad, 0);
+        append<uint64_t>(bad, 1);
+        str(bad, "bad.array");
+        append<uint32_t>(bad, 9);
+        append<uint32_t>(bad, 6);
+        append<uint64_t>(bad, UINT64_MAX / 4);
+        expect_throw(bad, "truncated array", "load_shard must reject huge scalar array without pointer wrap");
+    }
+}
 }
 int main() {
     check_mixed();
     check_packed_down();
+    check_header_bounds();
     Fixture f(false);
     fnx::Gguf g(f.path);
     const auto* p = g.t("plain.weight").data;

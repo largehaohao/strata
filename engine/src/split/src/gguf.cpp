@@ -67,7 +67,7 @@ struct Cur {
     const uint8_t* p;
     const uint8_t* end;
     template <typename T> T get() {
-        if (p + sizeof(T) > end) throw std::runtime_error("gguf: truncated header");
+        if ((size_t) (end - p) < sizeof(T)) throw std::runtime_error("gguf: truncated header");
         T v;
         std::memcpy(&v, p, sizeof(T));
         p += sizeof(T);
@@ -75,7 +75,7 @@ struct Cur {
     }
     std::string str() {
         const uint64_t n = get<uint64_t>();
-        if (p + n > end) throw std::runtime_error("gguf: truncated string");
+        if (n > (uint64_t) (end - p)) throw std::runtime_error("gguf: truncated string");
         std::string s((const char*) p, n);
         p += n;
         return s;
@@ -301,6 +301,7 @@ void Gguf::load_shard(const std::string& path, bool meta) {
                     for (uint64_t k = 0; k < n; ++k) v[k] = read_int(c, et);
                     int_arrays_[key] = std::move(v);
                 } else {
+                    if (n > (uint64_t) (c.end - c.p) / (uint64_t) sz) throw std::runtime_error("gguf: truncated array");
                     c.p += n * (uint64_t) sz;
                 }
             }

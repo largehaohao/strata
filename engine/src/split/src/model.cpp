@@ -183,6 +183,7 @@ float f16_to_f32(uint16_t h) {
 uint16_t f32_to_f16(float x) {
     uint32_t u;
     std::memcpy(&u, &x, 4);
+    if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t) (((u >> 16) & 0x8000u) | 0x7e00u);
     const uint32_t s = (u >> 16) & 0x8000u;
     const int e = (int) ((u >> 23) & 0xff) - 127 + 15;
     uint32_t m = u & 0x7fffffu;
@@ -203,6 +204,7 @@ uint16_t f32_to_f16(float x) {
 uint16_t f32_to_bf16(float x) {
     uint32_t u;
     std::memcpy(&u, &x, 4);
+    if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t) ((u >> 16) | 64u);
     return (uint16_t) ((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
 }
 

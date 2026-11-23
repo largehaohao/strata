@@ -46,6 +46,9 @@
 #include "../src/env.hpp"
 #include "../src/session.hpp"
 #include "sfnx_input.hpp"
+#if defined(FNX_HIP) && defined(__linux__)
+#include "strata/platform/numa_balancing.hpp"
+#endif
 
 namespace {
 
@@ -1006,7 +1009,9 @@ struct Server {
             GenReq r;
             try {
                 r = parse_gen(line, m.vocab, (int) m.ple_image, batch, images);
-                if ((long) r.ids.size() + r.max_new + 8 > a.max_ctx) throw std::runtime_error(cmd + ": prompt + max_new exceed the context");
+                if (a.max_ctx < 8 || (int64_t) r.ids.size() > (int64_t) a.max_ctx - 8 ||
+                    (int64_t) r.max_new > (int64_t) a.max_ctx - 8 - (int64_t) r.ids.size())
+                    throw std::runtime_error(cmd + ": prompt + max_new exceed the context");
                 r.seq = seq;
             } catch (const std::exception& ex) {
                 say(std::string("ERR ") + ex.what());
@@ -1108,6 +1113,24 @@ void load_dflash2(fnx::df2::Bridge& br, const fnx::Model& m, const Args& a) {
 }  // namespace
 
 int main(int argc, char** argv) {
+#if defined(FNX_HIP) && defined(__linux__)
+    if (const std::string numa_msg = strata::platform::numa_balancing::keep_scanner_off(); !numa_msg.empty())
+        std::fprintf(stderr, "%s\n", numa_msg.c_str());
+#endif
+#if defined(FNX_HIP) && !defined(STRATA_HIP_GFX906)
+    // #5162/#5718/#6127: prevent ROCm/TheRock dynamic queue assignment from colocating copy streams
+    // onto compute queues or stalling blocked queues. Must be set before the first HIP call.
+    if (std::getenv("DEBUG_HIP_DYNAMIC_QUEUES") == nullptr) {
+        const char* dyn = std::getenv("STRATA_HIP_DYNAMIC_QUEUES");
+        if (!(dyn != nullptr && dyn[0] == '1')) {
+#if defined(_WIN32)
+            _putenv_s("DEBUG_HIP_DYNAMIC_QUEUES", "0");
+#else
+            ::setenv("DEBUG_HIP_DYNAMIC_QUEUES", "0", 0);
+#endif
+        }
+    }
+#endif
     Args a;
     try {
         a = parse_args(argc, argv);
