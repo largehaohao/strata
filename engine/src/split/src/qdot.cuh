@@ -340,7 +340,11 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
 
         const int vih = ((vh >> (4*i)) << 4) & 0x30303030;
 
+#if FNX_HIP
+        const int vi = (int) (((uint32_t) (vil | vih) + 0x60606060u) ^ 0x80808080u); // vi = (vil | vih) - 32 (codes in [0..63])
+#else
         const int vi = qd_vsubss4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
+#endif
 
         sumf += d8[i] * (qd_dp4a(vi, u[i], 0) * sc); // SIMD dot product
     }

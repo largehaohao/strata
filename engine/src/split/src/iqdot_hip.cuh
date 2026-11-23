@@ -93,6 +93,29 @@ static __device__ __forceinline__ float fnx_vec_dot_iq2_s_q8_1(const void* __res
     return d * sumi;
 }
 
+static __device__ __forceinline__ float fnx_vec_dot_iq2_xxs_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1, const int& kbx, const int& iqs) {
+    const block_iq2_xxs* bq2 = (const block_iq2_xxs*) vbq + kbx;
+    const int q2 = get_int_b2(bq2->qs, iqs);
+    const uint8_t* aux8 = (const uint8_t*) &q2;
+    const uint32_t aux32 = get_int_b2(bq2->qs, iqs + 1);
+    int sumi = 0;
+#pragma unroll
+    for (int k0 = 0; k0 < 8; k0 += 2) {
+        const uint2 grid_pos = ((const uint2*) iq2xxs_grid)[aux8[k0 / 2]];
+        const uint32_t s = ksigns_iq2xs[(aux32 >> (7 * k0 / 2)) & 127];
+        const int grid0 = iq_negate(grid_pos.x, iq_sign_bytes(s));
+        const int u0 = get_int_b4(bq8_1[iqs / 2].qs, k0 + 0);
+        sumi = qd_dp4a(grid0, u0, sumi);
+        const int grid1 = iq_negate(grid_pos.y, iq_sign_bytes(s >> 4));
+        const int u1 = get_int_b4(bq8_1[iqs / 2].qs, k0 + 1);
+        sumi = qd_dp4a(grid1, u1, sumi);
+    }
+    const int ls = (aux32 >> 27) | 1;
+    sumi = sumi * ls / 8;
+    const float d = __half2float(bq2->d) * __low2float(bq8_1[iqs / 2].ds);
+    return d * sumi;
+}
+
 }  // namespace
 }  // namespace fnx
 #endif

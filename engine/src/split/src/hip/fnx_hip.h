@@ -91,3 +91,48 @@ inline hipError_t fnx_memset(void* p, int v, size_t n) {
 #undef cudaMemset
 #define cudaMemcpy fnx_memcpy
 #define cudaMemset fnx_memset
+
+// Wave32 register-only butterfly shuffle on RDNA (gfx10+): DPP row_xmask for offsets 1/2/4/8
+// and v_permlanex16_b32 for offset 16, eliminating ds_bpermute LDS round-trips while preserving
+// each call site's exact reduction order (bitwise identical to __shfl_xor).
+template <typename T>
+__device__ __forceinline__ T fnx_shfl_xor_sync(uint32_t mask, T value, int lane_mask, int width = 32) {
+    ::strata::hip_compat::require_full_wave_mask(mask);
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(STRATA_HIP_GFX906) && !defined(FNX_HIP_NO_DPP)
+    if constexpr (sizeof(T) == 4) {
+        if (__builtin_constant_p(lane_mask) && __builtin_constant_p(width) && lane_mask > 0 && lane_mask < width) {
+            int bits;
+            __builtin_memcpy(&bits, &value, 4);
+            if (lane_mask == 1) {
+                bits = __builtin_amdgcn_update_dpp(0, bits, 0x161, 0xf, 0xf, false);
+                T out;
+                __builtin_memcpy(&out, &bits, 4);
+                return out;
+            } else if (lane_mask == 2) {
+                bits = __builtin_amdgcn_update_dpp(0, bits, 0x162, 0xf, 0xf, false);
+                T out;
+                __builtin_memcpy(&out, &bits, 4);
+                return out;
+            } else if (lane_mask == 4) {
+                bits = __builtin_amdgcn_update_dpp(0, bits, 0x164, 0xf, 0xf, false);
+                T out;
+                __builtin_memcpy(&out, &bits, 4);
+                return out;
+            } else if (lane_mask == 8) {
+                bits = __builtin_amdgcn_update_dpp(0, bits, 0x168, 0xf, 0xf, false);
+                T out;
+                __builtin_memcpy(&out, &bits, 4);
+                return out;
+            } else if (lane_mask == 16 && width == 32) {
+                bits = __builtin_amdgcn_permlanex16(bits, bits, 0x76543210u, 0xfedcba98u, false, false);
+                T out;
+                __builtin_memcpy(&out, &bits, 4);
+                return out;
+            }
+        }
+    }
+#endif
+    return __shfl_xor(value, lane_mask, width);
+}
+#undef __shfl_xor_sync
+#define __shfl_xor_sync(...) (fnx_shfl_xor_sync(__VA_ARGS__))

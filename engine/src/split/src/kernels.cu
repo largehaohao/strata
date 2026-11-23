@@ -128,7 +128,11 @@ template <GgmlType type> __device__ __forceinline__ float vdot(const void* v, co
     else if constexpr (type == T_Q5_K) return vec_dot_q5_K_q8_1(v, y, kbx, iqs);
     else if constexpr (type == T_Q5_1) return vec_dot_q5_1_q8_1(v, y, kbx, iqs);
     else if constexpr (type == T_Q5_0) return vec_dot_q5_0_q8_1(v, y, kbx, iqs);
+#if FNX_HIP
+    else if constexpr (type == T_IQ2_XXS) return fnx_vec_dot_iq2_xxs_q8_1(v, y, kbx, iqs);
+#else
     else if constexpr (type == T_IQ2_XXS) return vec_dot_iq2_xxs_q8_1(v, y, kbx, iqs);
+#endif
     else if constexpr (type == T_Q4_0) return vec_dot_q4_0_q8_1(v, y, kbx, iqs);
     else if constexpr (type == T_Q6_K) return vec_dot_q6_K_q8_1(v, y, kbx, iqs);
     else if constexpr (type == T_IQ4_NL) return vec_dot_iq4_nl_q8_1(v, y, kbx, iqs);

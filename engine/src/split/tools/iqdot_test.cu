@@ -35,6 +35,11 @@ template <> struct Dots<2> {   // IQ2_S
     __device__ static float ref(const void* v, const block_q8_1* y, int k, int i) { return fnx::vec_dot_iq2_s_q8_1(v, y, k, i); }
     __device__ static float mine(const void* v, const block_q8_1* y, int k, int i) { return fnx::fnx_vec_dot_iq2_s_q8_1(v, y, k, i); }
 };
+template <> struct Dots<3> {   // IQ2_XXS
+    static constexpr int BYTES = sizeof(block_iq2_xxs);
+    __device__ static float ref(const void* v, const block_q8_1* y, int k, int i) { return fnx::vec_dot_iq2_xxs_q8_1(v, y, k, i); }
+    __device__ static float mine(const void* v, const block_q8_1* y, int k, int i) { return fnx::fnx_vec_dot_iq2_xxs_q8_1(v, y, k, i); }
+};
 
 // one thread per (block, iqs): the two dots against q8_1 block y[block * 8 + iqs / 2... ] (the dot reads bq8_1[iqs / 2], so 8 q8_1 blocks per weight block)
 template <int T>
@@ -90,7 +95,7 @@ bool run(const char* name, int nblocks, unsigned seed) {
 
 int main(int argc, char** argv) {
     const int n = argc > 1 ? std::atoi(argv[1]) : 1 << 20;
-    bool ok = run<0>("IQ3_S", n, 1) & run<1>("IQ3_XXS", n, 2) & run<2>("IQ2_S", n, 3);
+    bool ok = run<0>("IQ3_S", n, 1) & run<1>("IQ3_XXS", n, 2) & run<2>("IQ2_S", n, 3) & run<3>("IQ2_XXS", n, 4);
     std::printf(ok ? "iqdot_test: PASS\n" : "iqdot_test: FAIL\n");
     return ok ? 0 : 1;
 }
