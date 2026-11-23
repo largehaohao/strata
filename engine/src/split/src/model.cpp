@@ -8,6 +8,7 @@
 #include "rope_gguf.hpp"
 #include "static_experts.hpp"
 #include "mtp_head_q4.hpp"
+#include "mtp_experts.hpp"
 
 #include "store.hpp"
 #if FNX_HIP
@@ -994,7 +995,8 @@ struct MtpFiles {
     void* hmap = nullptr;
 #endif
     std::vector<uint8_t> gate_b, up_b, down_b;   // the experts' blocks: [512][640][2560], [512][640][2560], [512][2560][640]
-    uint32_t etype = T_Q4_0;
+    uint32_t gu_type = T_Q4_0, d_type = T_Q4_0;
+    bool native_experts = false;
     Tensor gate, up, down;
     explicit MtpFiles(const std::string& dir) {
 #ifdef _WIN32
@@ -1049,15 +1051,13 @@ struct MtpFiles {
             if (off + bytes > size || x.row_bytes() * rows != bytes) throw std::runtime_error("mtp: dense.txt: " + name + " does not fit");
             t[name] = x;
         }
-        // FNX_MTP_EXPERTS: q2_0 is Strata's experts.bin (unpacked to Q4_0 blocks), q4_0 is tools/mtp_experts.py's
-        // experts-q4_0.bin, made from the BF16 checkpoint; the same VRAM either way. Q8_0 drafted exactly as Q4_0 did
-        // for ~420 MiB more a card, which the arena's reserve does not count: not offered.
-        const char* ex_s = std::getenv("FNX_MTP_EXPERTS");
-        const std::string ex = ex_s ? ex_s : "q2_0";   // strata-split: Strata's draft-layer files (mtp/rt), no download; FNX_MTP_EXPERTS=q4_0 for sFNX's
-        if (ex == "q2_0") experts(dir + "/experts.bin");
-        else if (ex == "q4_0") experts_blocks(dir + "/experts-q4_0.bin", T_Q4_0, 18);
-        else throw std::runtime_error("mtp: FNX_MTP_EXPERTS=" + ex + ": q2_0 or q4_0");
-        std::fprintf(stderr, "fnx: draft layer experts %s\n", ex.c_str());
+        // FNX_MTP_EXPERTS: auto (native via experts.txt when present, else S2 q2_0 unpacked to Q4_0), q2_0, q4_0, iq4_nl, or native.
+        const MtpExpertPlan plan = resolve_mtp_experts_plan(dir, std::getenv("FNX_MTP_EXPERTS"), NEXP, N, FF);
+        gu_type = plan.gu_type;
+        d_type = plan.d_type;
+        native_experts = plan.layout == MtpExpertLayout::NATIVE_EXPERT_MAJOR;
+        load_mtp_experts(plan, NEXP, N, FF, gate_b, up_b, down_b);
+        std::fprintf(stderr, "fnx: draft layer experts %s\n", plan.desc.c_str());
         views();
     }
     ~MtpFiles() {
@@ -1074,76 +1074,12 @@ struct MtpFiles {
         if (it == t.end()) throw std::runtime_error("mtp: " + n + " is missing");
         return it->second;
     }
-    // experts.bin: per expert codes (gate/up rows interleaved, 640 B each; then 2560 down rows of 160 B), then the
-    // fp16 scales (gate/up rows, 40 each; down rows, 10 each). Q2_0: value j of a 64-value block is code j (byte j / 4,
-    // bits 2 (j % 4)) minus one, times the scale. Q4_0 keeps 32 values per block: nibble = code + 7 (value i low,
-    // i + 16 high), the same scale for both halves of a Q2_0 block.
-    void experts(const std::string& path) {
-        constexpr int H = N, F = FF, NE = NEXP;
-        constexpr size_t ROW_GU = H / 4, ROW_D = F / 4, SC_GU = H / 64, SC_D = F / 64;
-        constexpr size_t O_D = 2ull * F * ROW_GU, O_GS = O_D + (size_t) H * ROW_D, O_DS = O_GS + 2ull * F * SC_GU * 2;
-        constexpr size_t BLOB = O_DS + (size_t) H * SC_D * 2;
-#if !FNX_27B
-        static_assert(BLOB == 1382400, "Strata's Q2_0 expert blob");
-#endif
-        std::FILE* f = std::fopen(path.c_str(), "rb");
-        if (!f) throw std::runtime_error("mtp: cannot open " + path);
-        const size_t qrow_gu = (size_t) H / 32 * 18, qrow_d = (size_t) F / 32 * 18;
-        gate_b.resize((size_t) NE * F * qrow_gu);
-        up_b.resize((size_t) NE * F * qrow_gu);
-        down_b.resize((size_t) NE * H * qrow_d);
-        etype = T_Q4_0;
-        std::vector<uint8_t> blob(BLOB);
-        // one row of n values: codes (n / 4 bytes) and n / 64 scales -> n / 32 Q4_0 blocks
-        auto row = [](const uint8_t* codes, const uint8_t* scales, int n, uint8_t* out) {
-            for (int b = 0; b < n / 64; ++b) {
-                uint16_t d;
-                std::memcpy(&d, scales + b * 2, 2);
-                const uint8_t* c = codes + b * 16;
-                auto code = [&](int j) { return (c[j / 4] >> (2 * (j % 4))) & 3; };
-                for (int h = 0; h < 2; ++h) {
-                    uint8_t* o = out + (size_t) (2 * b + h) * 18;
-                    std::memcpy(o, &d, 2);
-                    for (int i = 0; i < 16; ++i)
-                        o[2 + i] = (uint8_t) ((code(32 * h + i) + 7) | ((code(32 * h + 16 + i) + 7) << 4));
-                }
-            }
-        };
-        for (int e = 0; e < NE; ++e) {
-            if (std::fread(blob.data(), 1, BLOB, f) != BLOB) {
-                std::fclose(f);
-                throw std::runtime_error("mtp: experts.bin is truncated");
-            }
-            for (int r = 0; r < F; ++r) {
-                row(&blob[(2 * r) * ROW_GU], &blob[O_GS + (2 * r) * SC_GU * 2], H, &gate_b[((size_t) e * F + r) * qrow_gu]);
-                row(&blob[(2 * r + 1) * ROW_GU], &blob[O_GS + (2 * r + 1) * SC_GU * 2], H, &up_b[((size_t) e * F + r) * qrow_gu]);
-            }
-            for (int r = 0; r < H; ++r)
-                row(&blob[O_D + r * ROW_D], &blob[O_DS + r * SC_D * 2], F, &down_b[((size_t) e * H + r) * qrow_d]);
-        }
-        std::fclose(f);
-    }
-    // experts-q4_0.bin / experts-q8_0.bin: gate, up, down, each [512][rows] rows of 32-value blocks of `bb` bytes
-    void experts_blocks(const std::string& path, uint32_t type, size_t bb) {
-        const size_t qrow_gu = (size_t) N / 32 * bb, qrow_d = (size_t) FF / 32 * bb;
-        gate_b.resize((size_t) NEXP * FF * qrow_gu);
-        up_b.resize((size_t) NEXP * FF * qrow_gu);
-        down_b.resize((size_t) NEXP * N * qrow_d);
-        etype = type;
-        std::FILE* f = std::fopen(path.c_str(), "rb");
-        if (!f) throw std::runtime_error("mtp: cannot open " + path + " (tools/mtp_experts.py makes it)");
-        const bool ok = std::fread(gate_b.data(), 1, gate_b.size(), f) == gate_b.size() &&
-                        std::fread(up_b.data(), 1, up_b.size(), f) == up_b.size() &&
-                        std::fread(down_b.data(), 1, down_b.size(), f) == down_b.size() && std::fgetc(f) == EOF;
-        std::fclose(f);
-        if (!ok) throw std::runtime_error("mtp: " + path + " is not " + std::to_string(gate_b.size() * 2 + down_b.size()) + " bytes");
-    }
     void views() {
         constexpr int H = N, F = FF;
-        auto view = [this](const char* name, std::vector<uint8_t>& v, int64_t cols, int64_t rows) {
+        auto view = [](const char* name, std::vector<uint8_t>& v, uint32_t vtype, int64_t cols, int64_t rows) {
             Tensor x;
             x.name = name;
-            x.type = etype;
+            x.type = vtype;
             x.ne[0] = cols;
             x.ne[1] = rows;
             x.ne[2] = NEXP;
@@ -1152,9 +1088,9 @@ struct MtpFiles {
             x.nbytes = v.size();
             return x;
         };
-        gate = view("mtp gate", gate_b, H, F);
-        up = view("mtp up", up_b, H, F);
-        down = view("mtp down", down_b, F, H);
+        gate = view("mtp gate", gate_b, gu_type, H, F);
+        up = view("mtp up", up_b, gu_type, H, F);
+        down = view("mtp down", down_b, d_type, F, H);
     }
 };
 
@@ -1360,6 +1296,9 @@ Mtp::Mtp(const Model& m, const std::string& dir, const std::string& vocab_file) 
             if (id2 < 0 || id2 >= m.vocab) throw std::runtime_error("mtp: " + vf + " holds a token outside the vocabulary");
     }
     const MtpFiles files(dir);
+    expert_gu_type = files.gu_type;
+    expert_d_type = files.d_type;
+    native_experts = files.native_experts;
     cards.resize(NCARD);
     const int step = ((int) vocab.size() + NCARD - 1) / NCARD;
     for (int c = 0; c < NCARD; ++c) {

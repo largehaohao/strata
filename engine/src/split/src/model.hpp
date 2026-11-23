@@ -227,6 +227,9 @@ struct Model;
 struct Mtp {
     std::vector<MtpCard> cards;        // one per Model card, on the same devices
     std::vector<int> vocab;            // the draft vocabulary: head row -> token id
+    uint32_t expert_gu_type = T_Q4_0;
+    uint32_t expert_d_type = T_Q4_0;
+    bool native_experts = false;
     // vocab_file: the draft vocabulary (int32 token ids); empty: rt_dir/draft_vocab.bin. The 27B: rt_dir "nextn" (its
     // layer is the GGUF's), vocab_file required
     Mtp(const Model& m, const std::string& rt_dir, const std::string& vocab_file = "");
