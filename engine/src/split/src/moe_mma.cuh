@@ -290,11 +290,30 @@ __device__ __forceinline__ void mma_16816(float (&d)[4], uint32_t a0, uint32_t a
 }
 #endif
 
+// Opt-in FP16 LDS codebook metadata (specialized in moe_mma_iq.cuh).
+template <int TYPE>
+struct MmHgridInfo {
+    static constexpr bool has_grid = false;
+    static constexpr size_t grid_bytes = 0;
+    __device__ __forceinline__ static void init(void*, uint2*) {}
+};
+
+__device__ __forceinline__ void mm_lds_barrier() {
+#if defined(FNX_MOE_MMA_WIDE) && FNX_WMMA_GFX11 && defined(__HIP_DEVICE_COMPILE__)
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_waitcnt(0x7 | (0x3f << 10));
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+#else
+    __syncthreads();
+#endif
+}
+
 // the output staging's row stride in floats (8 past the tile: fewer conflicts than none or 16)
 template <int BM>
 constexpr int MM_SLD = BM + 8;
 // the block's shared memory: the weight and activation tiles, later the output staging over them
-template <int BM>
+template <int BM, int TYPE = -1, bool HGRID = false>
 constexpr size_t mm_smem() {
 #if defined(FNX_MOE_MMA_WIDE)
     // Store one token tile per warp group at a time. This keeps the 128-row
@@ -303,7 +322,9 @@ constexpr size_t mm_smem() {
 #else
     constexpr int epi_rows = PF_JOB;
 #endif
-    return std::max(sizeof(__half) * (BM + PF_JOB) * MM_LD, epi_rows * MM_SLD<BM> * sizeof(float));
+    constexpr size_t tile_bytes = sizeof(__half) * (BM + PF_JOB) * MM_LD;
+    constexpr size_t extra = (HGRID && MmHgridInfo<TYPE>::has_grid) ? (MmHgridInfo<TYPE>::grid_bytes + 128) : 0;
+    return std::max(tile_bytes + extra, (size_t) epi_rows * MM_SLD<BM> * sizeof(float));
 }
 
 // out[jb.out[j] * nrows + row] = sum_k W_e[row][k] * x[jb.y[j] * ldx + k] for the job's rows j, BM rows of the expert
@@ -311,7 +332,7 @@ constexpr size_t mm_smem() {
 // from shared memory feeds TT or 2 products): warp w takes rows 32 (w % WR) and tokens (64 / WT) (w / WR). A job of at
 // most TT token tiles runs on every warp anyway: the WT warps of a row group then take every WT-th 16 columns of each
 // k-step, summed at the end.
-template <int TYPE, int BM, bool FusedGate = false>
+template <int TYPE, int BM, bool FusedGate = false, bool HGRID = false>
 __global__ void __launch_bounds__(MM_THREADS) k_moe_mma(MoeW w, const BigJob* __restrict__ jobs, const int* __restrict__ njobs,
                                                         const __half* __restrict__ x, int ldx, float* __restrict__ out,
                                                         __half* __restrict__ hout = nullptr, bool trim_tokens = false) {
@@ -325,10 +346,19 @@ __global__ void __launch_bounds__(MM_THREADS) k_moe_mma(MoeW w, const BigJob* __
 #endif
     const int ji = blockIdx.y;
     if (ji >= *njobs) return;
+    constexpr bool USE_HGRID = HGRID && MmHgridInfo<TYPE>::has_grid;
     __shared__ BigJob jb;
     extern __shared__ __align__(32) __half smem[];   // the weight tile (BM rows), then the activation rows (PF_JOB)
     __half* sw = smem;
     __half* sx = smem + BM * MM_LD;
+    void* sgrid = nullptr;
+    uint2* ssign = nullptr;
+    if constexpr (USE_HGRID) {
+        uint8_t* aux = reinterpret_cast<uint8_t*>(smem) + sizeof(__half) * (BM + PF_JOB) * MM_LD;
+        sgrid = aux;
+        ssign = reinterpret_cast<uint2*>(aux + MmHgridInfo<TYPE>::grid_bytes);
+        MmHgridInfo<TYPE>::init(sgrid, ssign);
+    }
     load_bigjob(jb, jobs + ji);
     const int n = jb.n, nt = (n + 15) / 16, warp = threadIdx.x >> 5, row0 = blockIdx.x * (FusedGate ? BM / 2 : BM);
     const int rg = warp % WR, tg = warp / WR;
@@ -393,9 +423,12 @@ __global__ void __launch_bounds__(MM_THREADS) k_moe_mma(MoeW w, const BigJob* __
     for (int k0 = 0; k0 < w.ncols; k0 += MM_KC) {
         const int kc = min(MM_KC, w.ncols - k0);
 #pragma unroll
-        for (int p = 0; p < NP; ++p) wt[p].put(k0, kc, sw + p * MM_PASS * MM_LD);
+        for (int p = 0; p < NP; ++p) {
+            if constexpr (USE_HGRID) wt[p].put_hgrid(k0, kc, sw + p * MM_PASS * MM_LD, sgrid, ssign);
+            else wt[p].put(k0, kc, sw + p * MM_PASS * MM_LD);
+        }
         xt.put(kc, sx);
-        __syncthreads();
+        mm_lds_barrier();
         if (k0 + MM_KC < w.ncols) {
             const int kn = min(MM_KC, w.ncols - k0 - MM_KC);
 #pragma unroll
@@ -409,17 +442,26 @@ __global__ void __launch_bounds__(MM_THREADS) k_moe_mma(MoeW w, const BigJob* __
                 const int kt = kt0 + i * kts, kk = kt * 16;
                 if (kt >= kc / 16) break;
 #if FNX_HIP
-                mm_h8 a[2], b[TT];
+                mm_h8 a[2];
 #pragma unroll
                 for (int r = 0; r < 2; ++r) a[r] = nvcuda::wmma::fnx_ld_ab(arow + r * 16 * MM_LD + kk);
 #pragma unroll
-                for (int t = 0; t < TT; ++t)
-                    if (!trim_tokens || tb + t < nt) b[t] = nvcuda::wmma::fnx_ld_ab(bcol + t * 16 * MM_LD + kk);
+                for (int t0 = 0; t0 < TT; t0 += 2) {
+                    mm_h8 b0 = {}, b1 = {};
+                    if (!trim_tokens || tb + t0 < nt) b0 = nvcuda::wmma::fnx_ld_ab(bcol + t0 * 16 * MM_LD + kk);
+                    if constexpr (TT > 1) {
+                        if (t0 + 1 < TT && (!trim_tokens || tb + t0 + 1 < nt))
+                            b1 = nvcuda::wmma::fnx_ld_ab(bcol + (t0 + 1) * 16 * MM_LD + kk);
+                    }
 #pragma unroll
-                for (int r = 0; r < 2; ++r)
-#pragma unroll
-                    for (int t = 0; t < TT; ++t)
-                        if (!trim_tokens || tb + t < nt) acc[r][t] = mma_wmma12(a[r], b[t], acc[r][t]);
+                    for (int r = 0; r < 2; ++r) {
+                        if (!trim_tokens || tb + t0 < nt) acc[r][t0] = mma_wmma12(a[r], b0, acc[r][t0]);
+                        if constexpr (TT > 1) {
+                            if (t0 + 1 < TT && (!trim_tokens || tb + t0 + 1 < nt))
+                                acc[r][t0 + 1] = mma_wmma12(a[r], b1, acc[r][t0 + 1]);
+                        }
+                    }
+                }
 #elif FNX_ARCH >= 80
                 uint32_t fa[2][4], fb[2 * TT][2];
 #pragma unroll
@@ -464,7 +506,7 @@ __global__ void __launch_bounds__(MM_THREADS) k_moe_mma(MoeW w, const BigJob* __
 #endif
             }
         }
-        __syncthreads();
+        mm_lds_barrier();
     }
     // the output through shared memory over the tiles, token-major [token][row] with rows padded to MM_SLD<BM> floats,
     // so the read back below takes consecutive rows; a split's partial sums are one such [LO][row] block per tg

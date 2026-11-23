@@ -42,7 +42,14 @@ static int run(const Format& fmt,int cols,int ffs,bool micro) {
     };
     const std::vector<int> seeds=micro?std::vector<int>{1}:std::vector<int>{0,1};
     const std::vector<int> counts=micro?std::vector<int>{capacity}:std::vector<int>{0,1,3};
-    const std::vector<int> sizes=micro?std::vector<int>{PF_JOB}:std::vector<int>{0,1,15,16,17,31,32,33,PF_JOB-1,PF_JOB};
+    std::vector<int> sizes;
+    if(micro) {
+        sizes={PF_JOB};
+    } else {
+        for(int len:{0,1,15,16,17,31,32,33,63,64,65,PF_JOB-1,PF_JOB}) {
+            if(len<=PF_JOB && std::find(sizes.begin(),sizes.end(),len)==sizes.end()) sizes.push_back(len);
+        }
+    }
     int checked=0;
     for(int seed:seeds) {
         for(size_t i=0;i<raw.size();++i)raw[i]=(i*13+(i>>7)*17+seed*23)&255;

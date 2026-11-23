@@ -278,7 +278,7 @@ if(_fnx_hip)
   add_executable(${_t} EXCLUDE_FROM_ALL ${_sp}/tools/selftest_main.cpp ${_sp}/src/selftest.cu ${_sp}/src/moe_mma.cu ${_sp_kparts})
   set_source_files_properties(${_sp}/tools/selftest_main.cpp ${_sp}/src/selftest.cu ${_sp}/src/moe_mma.cu PROPERTIES LANGUAGE HIP)
   target_include_directories(${_t} PRIVATE ${_sp}/src/hip ${_sp}/src ${_sp}/tools ${_sp_quant})
-  target_compile_definitions(${_t} PRIVATE FNX_NCARD=${_nst} FNX_ARCH=${STRATA_SPLIT_ARCH} FNX_27B=0 FNX_HOSTRING=1 FNX_HIP=1
+  target_compile_definitions(${_t} PRIVATE FNX_NCARD=${_nst} FNX_ARCH=${STRATA_SPLIT_ARCH} FNX_27B=0 FNX_HOSTRING=1 FNX_HIP=1 FNX_PF_JOB=${STRATA_SPLIT_PF_JOB}
                              FNX_DIR="${_sp}")
   target_compile_options(${_t} PRIVATE "$<$<COMPILE_LANGUAGE:HIP>:SHELL:-include ${_sp}/src/hip/fnx_hip.h>")
   target_link_libraries(${_t} PRIVATE strata_hip_runtime ${STRATA_HIP_BLAS_TARGETS})

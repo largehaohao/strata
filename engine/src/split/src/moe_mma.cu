@@ -1,5 +1,6 @@
 // The prompt path's routed experts on the tensor cores (moe_mma.cuh), in an object of their own so a change to them
 // recompiles in seconds.
+#include "env.hpp"
 #include "kernels.hpp"
 
 #include <cuda_fp16.h>
@@ -52,8 +53,25 @@ bool trim_token_tiles() {
 #endif
 }
 
+#if defined(FNX_MOE_MMA_WIDE) && FNX_HIP
+bool pf_moe_hgrid_enabled() {
+    static const bool enabled = env_flag("FNX_PF_MOE_HGRID");
+    return enabled;
+}
+#endif
+
 template <int TYPE>
 void mma_launch(const MoeW& w, const BigJob* jobs, const int* njobs, int njobs_cap, const __half* x, float* out, cudaStream_t s) {
+#if defined(FNX_MOE_MMA_WIDE) && FNX_HIP
+    if (pf_moe_hgrid_enabled()) {
+        if constexpr (MmHgridInfo<TYPE>::has_grid && mm_smem<MM_BM, TYPE, true>() <= 48 * 1024) {
+            constexpr size_t sm = mm_smem<MM_BM, TYPE, true>();
+            k_moe_mma<TYPE, MM_BM, false, true><<<dim3((w.nrows + MM_BM - 1) / MM_BM, njobs_cap), MM_THREADS, sm, s>>>(
+                w, jobs, njobs, x, w.ncols, out, nullptr, trim_token_tiles());
+            return;
+        }
+    }
+#endif
     constexpr size_t sm = mm_smem<MM_BM>();
     static_assert(sm <= 48 * 1024, "moe_mma: shared memory past the default limit");
     k_moe_mma<TYPE, MM_BM><<<dim3((w.nrows + MM_BM - 1) / MM_BM, njobs_cap), MM_THREADS, sm, s>>>(

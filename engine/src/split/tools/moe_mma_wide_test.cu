@@ -1,6 +1,7 @@
 // Compare independent narrow/wide instantiations, including split-K jobs,
 // partial weight tiles, pointer tables, graph replay and untouched output bytes.
 #include "../src/moe_mma.cu"
+#include <cmath>
 #include <cstring>
 #include <iostream>
 
@@ -42,7 +43,15 @@ static int run(const Format& fmt, int cols, int rows, bool micro) {
     int checked = 0;
     const std::vector<int> seeds = micro ? std::vector<int>{1} : std::vector<int>{0, 1};
     const std::vector<int> job_counts = micro ? std::vector<int>{capacity} : std::vector<int>{0, 1, 3};
-    const std::vector<int> lengths = micro ? std::vector<int>{PF_JOB} : std::vector<int>{0, 1, 15, 16, 17, 31, 32, 33, PF_JOB - 1, PF_JOB};
+    std::vector<int> lengths;
+    if (micro) {
+        lengths = {PF_JOB};
+    } else {
+        for (int len : {0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, PF_JOB - 1, PF_JOB}) {
+            if (len <= PF_JOB && std::find(lengths.begin(), lengths.end(), len) == lengths.end())
+                lengths.push_back(len);
+        }
+    }
     for (int seed : seeds) {
         for (size_t i = 0; i < raw.size(); ++i) raw[i] = (i * 13 + (i >> 7) * 17 + seed * 23) & 255;
         for (size_t i = 0; i < raw.size(); i += fmt.bytes) {
@@ -116,7 +125,8 @@ int main() { try {
     const fnx::Format formats[] = {{fnx::T_IQ3_S, 256, 110, "IQ3_S"}, {fnx::T_IQ4_NL, 32, 18, "IQ4_NL"},
                                  {fnx::T_Q2_0, 64, 18, "Q2_0"}, {fnx::T_Q4_0, 32, 18, "Q4_0"},
                                  {fnx::T_IQ3_XXS, 256, 98, "IQ3_XXS"}, {fnx::T_IQ2_S, 256, 82, "IQ2_S"},
-                                 {fnx::T_IQ2_XXS, 256, 66, "IQ2_XXS"}, {fnx::T_Q5_0, 32, 22, "Q5_0"}};
+                                 {fnx::T_IQ2_XXS, 256, 66, "IQ2_XXS"}, {fnx::T_Q5_0, 32, 22, "Q5_0"},
+                                 {fnx::T_IQ4_XS, 256, 136, "IQ4_XS"}};
     for (int dev = 0; dev < 2; ++dev) {
         fnx::ck(cudaSetDevice(dev), "device");
         for (const auto& f : formats) {
@@ -130,6 +140,8 @@ int main() { try {
         checked += fnx::run(formats[4], 2560, 640, true);
         checked += fnx::run(formats[5], 2560, 640, true);
         checked += fnx::run(formats[6], 2560, 640, true);
+        checked += fnx::run(formats[7], 320, 2560, true);
+        checked += fnx::run(formats[8], 2560, 640, true);
     }
     std::cout << "PASS " << checked << " exact wide MoE comparisons\n";
 } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; } }
