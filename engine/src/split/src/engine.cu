@@ -13,7 +13,9 @@
 #include "pf_pick.hpp"
 
 #include <cuda_runtime.h>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
