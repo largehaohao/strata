@@ -2537,7 +2537,9 @@ namespace fnx {
 #if FNX_KPART == 8
 void router_route(const float* W, const float* x, float* logits, int T, int* topi, float* topw, Job* jobs_gu, Job* jobs_dn,
                   int* njobs, void* st, const ExpertCache* ec, int layer, int* list, const Q8S* sh_gu, int sh_rows, const void* sh_y,
-                  float* sh_out, const uint16_t* packed, unsigned* errors) {
+                  float* sh_out, const uint16_t* packed, unsigned* errors, int* wl1, int* wlm, int* n_wl) {
+    if ((wl1 != nullptr) != (wlm != nullptr) || (wl1 != nullptr) != (n_wl != nullptr))
+        throw std::runtime_error("router_route: split worklists must all be set or null");
     cudaStream_t s = (cudaStream_t) st;
     ShexpUp su;
     if (sh_gu) {
@@ -2555,8 +2557,8 @@ void router_route(const float* W, const float* x, float* logits, int T, int* top
     const ExpertCache none{};
     if (ec && (layer < 0 || layer >= NL || !list)) throw std::runtime_error("router_route: a cache plan needs its layer and list");
 #define FNX_RR(t) do { \
-    if (packed) k_router_route<t, true><<<grid, RR_THREADS, 0, s>>>(packed, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su, errors); \
-    else k_router_route<t, false><<<grid, RR_THREADS, 0, s>>>(W, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su, errors); \
+    if (packed) k_router_route<t, true><<<grid, RR_THREADS, 0, s>>>(packed, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su, errors, wl1, wlm, n_wl); \
+    else k_router_route<t, false><<<grid, RR_THREADS, 0, s>>>(W, x, logits, topi, topw, jobs_gu, jobs_dn, njobs, counter, ec ? *ec : none, layer, list, su, errors, wl1, wlm, n_wl); \
 } while (0)
     switch (T) {
         case 1: FNX_RR(1); break;
@@ -2585,30 +2587,34 @@ void router_route(const float* W, const float* x, float* logits, int T, int* top
 #if FNX_KPART == 2
 namespace {
 void moe_mm(bool down, const DW& A, size_t sa, const Job* jobs, const int* njobs, int njobs_max, const void* in, void* out,
-            void* st, int tt = 0, const CacheDownCopy* copy = nullptr, const CacheGateUpCopy* gu_copy = nullptr) {
+            void* st, int tt = 0, const CacheDownCopy* copy = nullptr, const CacheGateUpCopy* gu_copy = nullptr,
+            const int* job_idx = nullptr, const int* wl1 = nullptr, const int* wlm = nullptr, const int* n_wl = nullptr) {
     if ((copy || gu_copy) && (down || (A.type != T_IQ2_XXS && A.type != T_IQ2_S && A.type != T_IQ3_XXS && A.type != T_IQ3_S)))
         throw std::runtime_error("moe: cache copy requires IQ gate/up");
-    if (gu_copy && !copy) throw std::runtime_error("moe: gate/up copy requires a fused down copy");
+    if (gu_copy && !copy && !job_idx) throw std::runtime_error("moe: gate/up copy requires a fused down copy");
+    if ((wl1 != nullptr) != (wlm != nullptr) || (wl1 != nullptr) != (n_wl != nullptr))
+        throw std::runtime_error("moe: split worklists must all be set or null");
+    if (wl1 && !down) throw std::runtime_error("moe: down split worklists require down");
     const int T = tt ? tt : njobs_max / TOPK;   // the most rows a job has
     const MoeW w{(const char*) A.p, sa, A.row_bytes, A.n_out, A.n_in, A.ep};
     cudaStream_t s = (cudaStream_t) st;
     switch (A.type) {
         case T_Q4_K:
-            if (down) moe_launch<T_Q4_K>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T);
-            else gu_q4k_launch(T, w, jobs, njobs, njobs_max, (const block_q8_1*) in, (float*) out, s);
+            if (down) moe_launch<T_Q4_K>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T, nullptr, nullptr, job_idx, wl1, wlm, n_wl);
+            else gu_q4k_launch(T, w, jobs, njobs, njobs_max, (const block_q8_1*) in, (float*) out, s, ShexpDown{}, job_idx);
             break;
-        case T_Q5_K: moe_launch<T_Q5_K>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
-        case T_Q5_1: moe_launch<T_Q5_1>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
-        case T_Q5_0: moe_launch<T_Q5_0>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
-        case T_IQ2_XXS: moe_launch<T_IQ2_XXS>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T, copy, gu_copy); break;
-        case T_Q4_0: moe_launch<T_Q4_0>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
-        case T_Q2_0: moe_launch<T_Q4_0, true>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
-        case T_Q8_0: moe_launch<T_Q8_0>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
-        case T_IQ4_NL: moe_launch<T_IQ4_NL>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
-        case T_IQ4_XS: moe_launch<T_IQ4_XS>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T); break;
-        case T_IQ3_S: moe_launch<T_IQ3_S>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T, copy, gu_copy); break;
-        case T_IQ3_XXS: moe_launch<T_IQ3_XXS>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T, copy, gu_copy); break;
-        case T_IQ2_S: moe_launch<T_IQ2_S>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T, copy, gu_copy); break;
+        case T_Q5_K: moe_launch<T_Q5_K>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T, nullptr, nullptr, job_idx, wl1, wlm, n_wl); break;
+        case T_Q5_1: moe_launch<T_Q5_1>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T, nullptr, nullptr, job_idx, wl1, wlm, n_wl); break;
+        case T_Q5_0: moe_launch<T_Q5_0>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T, nullptr, nullptr, job_idx, wl1, wlm, n_wl); break;
+        case T_IQ2_XXS: moe_launch<T_IQ2_XXS>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T, copy, gu_copy, job_idx, wl1, wlm, n_wl); break;
+        case T_Q4_0: moe_launch<T_Q4_0>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T, nullptr, nullptr, job_idx, wl1, wlm, n_wl); break;
+        case T_Q2_0: moe_launch<T_Q4_0, true>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T, nullptr, nullptr, job_idx, wl1, wlm, n_wl); break;
+        case T_Q8_0: moe_launch<T_Q8_0>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T, nullptr, nullptr, job_idx, wl1, wlm, n_wl); break;
+        case T_IQ4_NL: moe_launch<T_IQ4_NL>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T, nullptr, nullptr, job_idx, wl1, wlm, n_wl); break;
+        case T_IQ4_XS: moe_launch<T_IQ4_XS>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T, nullptr, nullptr, job_idx, wl1, wlm, n_wl); break;
+        case T_IQ3_S: moe_launch<T_IQ3_S>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T, copy, gu_copy, job_idx, wl1, wlm, n_wl); break;
+        case T_IQ3_XXS: moe_launch<T_IQ3_XXS>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T, copy, gu_copy, job_idx, wl1, wlm, n_wl); break;
+        case T_IQ2_S: moe_launch<T_IQ2_S>(down, w, jobs, njobs, njobs_max, in, (float*) out, s, T, copy, gu_copy, job_idx, wl1, wlm, n_wl); break;
         default: throw std::runtime_error("moe: expert type " + std::to_string(A.type) + " not handled");
     }
     ck_launch(down ? "moe_down" : "moe_gate_up");
@@ -2633,10 +2639,12 @@ __global__ void k_swiglu_stacked(const float* gu, block_q8_1* hq, int ffs, int8_
 }  // namespace
 
 void moe_gate_up(const DW& A, size_t sa, const Job* jobs, const int* njobs, int njobs_max, const void* xq, float* gu, void* st,
-                 const Q8S* sh_down, int sh_ffs, const float* sh_gu, float* sh_out, const CacheDownCopy* copy, const CacheGateUpCopy* gu_copy) {
+                 const Q8S* sh_down, int sh_ffs, const float* sh_gu, float* sh_out, const CacheDownCopy* copy, const CacheGateUpCopy* gu_copy,
+                 const int* job_idx, int job_t) {
+    if (job_t < 0 || job_t > MAXT) throw std::runtime_error("moe_gate_up: job_t out of range");
     if ((copy || gu_copy) && sh_down) throw std::runtime_error("moe_gate_up: cache copy cannot share Q4_K launch");
     if (!sh_down) {
-        moe_mm(false, A, sa, jobs, njobs, njobs_max, xq, gu, st, 0, copy, gu_copy);
+        moe_mm(false, A, sa, jobs, njobs, njobs_max, xq, gu, st, job_t, copy, gu_copy, job_idx);
         return;
     }
     if (sh_ffs < 32 || sh_ffs > SH_MAXF || sh_ffs % 32) throw std::runtime_error("moe_gate_up: the shared expert's FF slice");
@@ -2644,22 +2652,22 @@ void moe_gate_up(const DW& A, size_t sa, const Job* jobs, const int* njobs, int 
     for (int k = 0; k < Q8S_SEGS; ++k) sd.w.q[k] = sh_down->q, sd.w.d[k] = sh_down->d, sd.w.out[k] = sh_out, sd.w.end[k] = N, sd.w.stride[k] = N;
     sd.rows = N, sd.ffs = sh_ffs, sd.gu = sh_gu;
     const MoeW w{(const char*) A.p, sa, A.row_bytes, A.n_out, A.n_in, A.ep};
-    const int T = njobs_max / TOPK;
+    const int T = job_t ? job_t : njobs_max / TOPK;
     cudaStream_t s = (cudaStream_t) st;
     const block_q8_1* y = (const block_q8_1*) xq;
     switch (A.type) {
-        case T_Q4_K: gu_q4k_launch(T, w, jobs, njobs, njobs_max, y, gu, s, sd); break;
-        case T_Q5_K: gu_sd_launch<T_Q5_K>(T, w, jobs, njobs, njobs_max, y, gu, s, sd); break;
-        case T_Q5_1: gu_sd_launch<T_Q5_1>(T, w, jobs, njobs, njobs_max, y, gu, s, sd); break;
-        case T_Q5_0: gu_sd_launch<T_Q5_0>(T, w, jobs, njobs, njobs_max, y, gu, s, sd); break;
-        case T_IQ2_XXS: gu_sd_launch<T_IQ2_XXS>(T, w, jobs, njobs, njobs_max, y, gu, s, sd); break;
-        case T_Q4_0: gu_sd_launch<T_Q4_0>(T, w, jobs, njobs, njobs_max, y, gu, s, sd); break;
-        case T_Q8_0: gu_sd_launch<T_Q8_0>(T, w, jobs, njobs, njobs_max, y, gu, s, sd); break;
-        case T_IQ4_NL: gu_sd_launch<T_IQ4_NL>(T, w, jobs, njobs, njobs_max, y, gu, s, sd); break;
-        case T_IQ4_XS: gu_sd_launch<T_IQ4_XS>(T, w, jobs, njobs, njobs_max, y, gu, s, sd); break;
-        case T_IQ3_S: gu_sd_launch<T_IQ3_S>(T, w, jobs, njobs, njobs_max, y, gu, s, sd); break;
-        case T_IQ3_XXS: gu_sd_launch<T_IQ3_XXS>(T, w, jobs, njobs, njobs_max, y, gu, s, sd); break;
-        case T_IQ2_S: gu_sd_launch<T_IQ2_S>(T, w, jobs, njobs, njobs_max, y, gu, s, sd); break;
+        case T_Q4_K: gu_q4k_launch(T, w, jobs, njobs, njobs_max, y, gu, s, sd, job_idx); break;
+        case T_Q5_K: gu_sd_launch<T_Q5_K>(T, w, jobs, njobs, njobs_max, y, gu, s, sd, job_idx); break;
+        case T_Q5_1: gu_sd_launch<T_Q5_1>(T, w, jobs, njobs, njobs_max, y, gu, s, sd, job_idx); break;
+        case T_Q5_0: gu_sd_launch<T_Q5_0>(T, w, jobs, njobs, njobs_max, y, gu, s, sd, job_idx); break;
+        case T_IQ2_XXS: gu_sd_launch<T_IQ2_XXS>(T, w, jobs, njobs, njobs_max, y, gu, s, sd, job_idx); break;
+        case T_Q4_0: gu_sd_launch<T_Q4_0>(T, w, jobs, njobs, njobs_max, y, gu, s, sd, job_idx); break;
+        case T_Q8_0: gu_sd_launch<T_Q8_0>(T, w, jobs, njobs, njobs_max, y, gu, s, sd, job_idx); break;
+        case T_IQ4_NL: gu_sd_launch<T_IQ4_NL>(T, w, jobs, njobs, njobs_max, y, gu, s, sd, job_idx); break;
+        case T_IQ4_XS: gu_sd_launch<T_IQ4_XS>(T, w, jobs, njobs, njobs_max, y, gu, s, sd, job_idx); break;
+        case T_IQ3_S: gu_sd_launch<T_IQ3_S>(T, w, jobs, njobs, njobs_max, y, gu, s, sd, job_idx); break;
+        case T_IQ3_XXS: gu_sd_launch<T_IQ3_XXS>(T, w, jobs, njobs, njobs_max, y, gu, s, sd, job_idx); break;
+        case T_IQ2_S: gu_sd_launch<T_IQ2_S>(T, w, jobs, njobs, njobs_max, y, gu, s, sd, job_idx); break;
         default: throw std::runtime_error("moe_gate_up: the shared expert rides in the launch of expert type " + std::to_string(A.type) + " only for the types moe_mm handles");
     }
     ck_launch("moe_gate_up (with the shared expert)");
@@ -2721,9 +2729,12 @@ bool moe_down_can_fuse_sh(int T, uint32_t down_type) {
     }
 }
 void moe_down(const DW& A, size_t sa, const Job* jobs, const int* njobs, int njobs_max, const float* gu, float* part, void* st,
-              const Q8S* sh_down, int sh_ffs, const float* sh_gu, void* sh_hq, float* sh_out) {
+              const Q8S* sh_down, int sh_ffs, const float* sh_gu, void* sh_hq, float* sh_out,
+              const int* wl1, const int* wlm, const int* n_wl) {
+    if ((wl1 != nullptr) != (wlm != nullptr) || (wl1 != nullptr) != (n_wl != nullptr))
+        throw std::runtime_error("moe_down: split worklists must all be set or null");
     if (!sh_down) {
-        moe_mm(true, A, sa, jobs, njobs, njobs_max, gu, part, st);
+        moe_mm(true, A, sa, jobs, njobs, njobs_max, gu, part, st, 0, nullptr, nullptr, nullptr, wl1, wlm, n_wl);
         return;
     }
     if (N >= 4096 || sh_ffs < 32 || sh_ffs > SH_MAXF || sh_ffs % 32 || !sh_gu || !sh_hq || !sh_out)
@@ -2740,12 +2751,12 @@ void moe_down(const DW& A, size_t sa, const Job* jobs, const int* njobs, int njo
     const int T = njobs_max / TOPK;
     cudaStream_t s = (cudaStream_t) st;
     switch (A.type) {
-        case T_Q5_1: moe_down_sh_launch<T_Q5_1>(w, jobs, njobs, njobs_max, gu, part, s, T, sd, sh_gu, (block_q8_1*) sh_hq); break;
-        case T_Q5_0: moe_down_sh_launch<T_Q5_0>(w, jobs, njobs, njobs_max, gu, part, s, T, sd, sh_gu, (block_q8_1*) sh_hq); break;
-        case T_Q4_0: moe_down_sh_launch<T_Q4_0>(w, jobs, njobs, njobs_max, gu, part, s, T, sd, sh_gu, (block_q8_1*) sh_hq); break;
-        case T_Q2_0: moe_down_sh_launch<T_Q4_0, true>(w, jobs, njobs, njobs_max, gu, part, s, T, sd, sh_gu, (block_q8_1*) sh_hq); break;
-        case T_Q8_0: moe_down_sh_launch<T_Q8_0>(w, jobs, njobs, njobs_max, gu, part, s, T, sd, sh_gu, (block_q8_1*) sh_hq); break;
-        case T_IQ4_NL: moe_down_sh_launch<T_IQ4_NL>(w, jobs, njobs, njobs_max, gu, part, s, T, sd, sh_gu, (block_q8_1*) sh_hq); break;
+        case T_Q5_1: moe_down_sh_launch<T_Q5_1>(w, jobs, njobs, njobs_max, gu, part, s, T, sd, sh_gu, (block_q8_1*) sh_hq, wl1, wlm, n_wl); break;
+        case T_Q5_0: moe_down_sh_launch<T_Q5_0>(w, jobs, njobs, njobs_max, gu, part, s, T, sd, sh_gu, (block_q8_1*) sh_hq, wl1, wlm, n_wl); break;
+        case T_Q4_0: moe_down_sh_launch<T_Q4_0>(w, jobs, njobs, njobs_max, gu, part, s, T, sd, sh_gu, (block_q8_1*) sh_hq, wl1, wlm, n_wl); break;
+        case T_Q2_0: moe_down_sh_launch<T_Q4_0, true>(w, jobs, njobs, njobs_max, gu, part, s, T, sd, sh_gu, (block_q8_1*) sh_hq, wl1, wlm, n_wl); break;
+        case T_Q8_0: moe_down_sh_launch<T_Q8_0>(w, jobs, njobs, njobs_max, gu, part, s, T, sd, sh_gu, (block_q8_1*) sh_hq, wl1, wlm, n_wl); break;
+        case T_IQ4_NL: moe_down_sh_launch<T_IQ4_NL>(w, jobs, njobs, njobs_max, gu, part, s, T, sd, sh_gu, (block_q8_1*) sh_hq, wl1, wlm, n_wl); break;
         default: throw std::runtime_error("moe_down (shared expert): expert type " + std::to_string(A.type) + " not handled");
     }
     ck_launch("moe_down (with the shared expert)");

@@ -5,14 +5,16 @@
 namespace fnx {
 std::vector<Q8Twin>& q8_twins(){static std::vector<Q8Twin>x;return x;}
 void ck(cudaError_t e,const char*s){if(e!=cudaSuccess)throw std::runtime_error(std::string(s)+cudaGetErrorString(e));}
-template<int T> void launch(bool packed,const void*w,const float*x,float*l,int*i,float*p,Job*g,Job*d,int*n,unsigned*c,cudaStream_t st,unsigned* error){
+template<int T> void launch(bool packed,const void*w,const float*x,float*l,int*i,float*p,Job*g,Job*d,int*n,unsigned*c,cudaStream_t st,unsigned* error,
+                            int* wl1=nullptr,int* wlm=nullptr,int* n_wl=nullptr){
     const dim3 grid((NEXP+1+RR_ROWS-1)/RR_ROWS);
-    if(packed)k_router_route<T,true><<<grid,RR_THREADS,0,st>>>((const uint16_t*)w,x,l,i,p,g,d,n,c,ExpertCache{},0,nullptr,ShexpUp{},error);
-    else k_router_route<T><<<grid,RR_THREADS,0,st>>>((const float*)w,x,l,i,p,g,d,n,c,ExpertCache{},0,nullptr,ShexpUp{},error);
+    if(packed)k_router_route<T,true><<<grid,RR_THREADS,0,st>>>((const uint16_t*)w,x,l,i,p,g,d,n,c,ExpertCache{},0,nullptr,ShexpUp{},error,wl1,wlm,n_wl);
+    else k_router_route<T><<<grid,RR_THREADS,0,st>>>((const float*)w,x,l,i,p,g,d,n,c,ExpertCache{},0,nullptr,ShexpUp{},error,wl1,wlm,n_wl);
 }
 int run(int dev,bool bench){
     constexpr int pad=64,cap=MAXT*TOPK,copies=64,L=NEXP+1;
     const size_t wn=(size_t)L*N,lb=(MAXT*L+2*pad)*4,pb=(cap+2*pad)*4,jb=(cap+2)*sizeof(Job);
+    const size_t w1b=(cap+2*pad)*sizeof(int),wmb=(cap/2+2*pad)*sizeof(int),nwb=(2+2*pad)*sizeof(int);
     std::vector<uint16_t>hw(wn);std::vector<float>fw(wn),hx(MAXT*N);
     std::mt19937 rng(20261104);
     for(size_t i=0;i<wn;++i){hw[i]=(rng()%2?0x8000:0)|(0x3b00+rng()%0x300);uint32_t u=(uint32_t)hw[i]<<16;std::memcpy(&fw[i],&u,4);}
@@ -21,12 +23,13 @@ int run(int dev,bool bench){
     for(int i=0;i<copies;++i){ck(cudaMemcpy(wf+i*wn,fw.data(),wn*4,cudaMemcpyHostToDevice),"float weights");ck(cudaMemcpy(wb+i*wn,hw.data(),wn*2,cudaMemcpyHostToDevice),"BF16 weights");}
     auto*x=(float*)alloc(hx.size()*4);auto*logits=(float*)alloc(lb);auto*indices=(int*)alloc(pb);auto*prob=(float*)alloc(pb);
     auto*gu=(Job*)alloc(jb);auto*dn=(Job*)alloc(jb);auto*nj=(int*)alloc(4);auto*counter=(unsigned*)alloc(4);auto*error=(unsigned*)alloc(4);
+    auto*wl1=(int*)alloc(w1b);auto*wlm=(int*)alloc(wmb);auto*n_wl=(int*)alloc(nwb);
     cudaStream_t st;ck(cudaStreamCreateWithFlags(&st,cudaStreamNonBlocking),"stream");ck(cudaMemset(counter,0,4),"counter");
     cudaEvent_t a,b;ck(cudaEventCreate(&a),"event");ck(cudaEventCreate(&b),"event");int checks=0,copy=0;
-    auto reset=[&](){for(auto v:{std::pair<void*,size_t>{logits,lb},{indices,pb},{prob,pb},{gu,jb},{dn,jb}})ck(cudaMemsetAsync(v.first,0xa5,v.second,st),"guard");};
+    auto reset=[&](){for(auto v:{std::pair<void*,size_t>{logits,lb},{indices,pb},{prob,pb},{gu,jb},{dn,jb},{wl1,w1b},{wlm,wmb},{n_wl,nwb}})ck(cudaMemsetAsync(v.first,0xa5,v.second,st),"guard");};
     for(int T=1;T<=MAXT;++T){
-        auto call=[&](bool packed){int k=copy++%copies;const void*w=packed?(const void*)(wb+k*wn):(const void*)(wf+k*wn);switch(T){
-#define DO(t) case t:launch<t>(packed,w,x,logits+pad,indices+pad,prob+pad,gu+1,dn+1,nj,counter,st,error);break
+        auto call=[&](bool packed,bool with_wl){int k=copy++%copies;const void*w=packed?(const void*)(wb+k*wn):(const void*)(wf+k*wn);switch(T){
+#define DO(t) case t:launch<t>(packed,w,x,logits+pad,indices+pad,prob+pad,gu+1,dn+1,nj,counter,st,error,with_wl?wl1+pad:nullptr,with_wl?wlm+pad:nullptr,with_wl?n_wl+pad:nullptr);break
             DO(1);DO(2);DO(3);DO(4);DO(5);DO(6);DO(7);DO(8);DO(9);DO(10);DO(11);DO(12);DO(13);DO(14);DO(15);DO(16);
 #undef DO
         }};
@@ -34,16 +37,18 @@ int run(int dev,bool bench){
             for(auto&v:hx)v=rep==3?NAN:rep==2?0.f:(int(rng()%2049)-1024)/2048.f;
             ck(cudaMemcpyAsync(x,hx.data(),hx.size()*4,cudaMemcpyHostToDevice,st),"activation");
             std::vector<unsigned char>rl(lb),ri(pb),rp(pb),gl(lb),gi(pb),gp(pb);
+            std::vector<unsigned char>gw1(w1b),gwm(wmb),gnw(nwb);
             std::vector<Job>rg(cap+2),rd(cap+2),gg(cap+2),gd(cap+2);int rn,gn;
             ck(cudaMemsetAsync(error,0,4,st),"reset router error");
-            reset();call(false);ck(cudaStreamSynchronize(st),"reference wait");
+            reset();call(false,false);ck(cudaStreamSynchronize(st),"reference wait");
             ck(cudaMemcpy(rl.data(),logits,lb,cudaMemcpyDeviceToHost),"ref logits");ck(cudaMemcpy(ri.data(),indices,pb,cudaMemcpyDeviceToHost),"ref ids");ck(cudaMemcpy(rp.data(),prob,pb,cudaMemcpyDeviceToHost),"ref probs");
             ck(cudaMemcpy(rg.data(),gu,jb,cudaMemcpyDeviceToHost),"ref jobs");ck(cudaMemcpy(rd.data(),dn,jb,cudaMemcpyDeviceToHost),"ref jobs");ck(cudaMemcpy(&rn,nj,4,cudaMemcpyDeviceToHost),"ref count");
-            cudaGraph_t graph;cudaGraphExec_t ex;ck(cudaStreamBeginCapture(st,cudaStreamCaptureModeRelaxed),"capture");call(true);ck(cudaStreamEndCapture(st,&graph),"capture end");ck(cudaGraphInstantiate(&ex,graph,nullptr,nullptr,0),"instantiate");
+            cudaGraph_t graph;cudaGraphExec_t ex;ck(cudaStreamBeginCapture(st,cudaStreamCaptureModeRelaxed),"capture");call(true,true);ck(cudaStreamEndCapture(st,&graph),"capture end");ck(cudaGraphInstantiate(&ex,graph,nullptr,nullptr,0),"instantiate");
             for(bool replay:{false,true}){
-                reset();if(replay)ck(cudaGraphLaunch(ex,st),"replay");else call(true);ck(cudaStreamSynchronize(st),"wait");
+                reset();if(replay)ck(cudaGraphLaunch(ex,st),"replay");else call(true,true);ck(cudaStreamSynchronize(st),"wait");
                 ck(cudaMemcpy(gl.data(),logits,lb,cudaMemcpyDeviceToHost),"logits");ck(cudaMemcpy(gi.data(),indices,pb,cudaMemcpyDeviceToHost),"ids");ck(cudaMemcpy(gp.data(),prob,pb,cudaMemcpyDeviceToHost),"probs");
                 ck(cudaMemcpy(gg.data(),gu,jb,cudaMemcpyDeviceToHost),"jobs");ck(cudaMemcpy(gd.data(),dn,jb,cudaMemcpyDeviceToHost),"jobs");ck(cudaMemcpy(&gn,nj,4,cudaMemcpyDeviceToHost),"count");
+                ck(cudaMemcpy(gw1.data(),wl1,w1b,cudaMemcpyDeviceToHost),"wl1");ck(cudaMemcpy(gwm.data(),wlm,wmb,cudaMemcpyDeviceToHost),"wlm");ck(cudaMemcpy(gnw.data(),n_wl,nwb,cudaMemcpyDeviceToHost),"n_wl");
                 unsigned flags;
                 ck(cudaMemcpy(&flags,error,4,cudaMemcpyDeviceToHost),"router error");
                 if (flags != (rep == 3 ? 32u : 0u)) throw std::runtime_error("invalid router error bit");
@@ -62,6 +67,31 @@ int run(int dev,bool bench){
                         for(int k=ref[j].n;k<MAXT;++k)if(ref[j].y[k]!=got[j].y[k]||ref[j].out[k]!=got[j].out[k])throw std::runtime_error("job tail guard");
                     }
                 }
+                std::vector<int> ew1, ewm;
+                for (int j = 0; j < rn; ++j) {
+                    if (rg[j + 1].n == 1) ew1.push_back(j);
+                    else ewm.push_back(j);
+                }
+                int got_n[2];
+                std::memcpy(got_n, gnw.data() + pad * sizeof(int), sizeof(got_n));
+                if (got_n[0] != (int) ew1.size() || got_n[1] != (int) ewm.size() || got_n[0] + got_n[1] != gn)
+                    throw std::runtime_error("split worklist count mismatch");
+                auto chk_wl = [&](const std::vector<unsigned char>& raw, const std::vector<int>& exp, const char* name) {
+                    const size_t lo = pad * sizeof(int), hi = lo + exp.size() * sizeof(int);
+                    for (size_t i = 0; i < raw.size(); ++i)
+                        if ((i < lo || i >= hi) && raw[i] != 0xa5)
+                            throw std::runtime_error(std::string(name) + " guard overwrite");
+                    if (!exp.empty()) {
+                        std::vector<int> got_v(exp.size());
+                        std::memcpy(got_v.data(), raw.data() + lo, exp.size() * sizeof(int));
+                        if (got_v != exp) throw std::runtime_error(std::string(name) + " index mismatch");
+                    }
+                };
+                chk_wl(gw1, ew1, "wl1");
+                chk_wl(gwm, ewm, "wlm");
+                for (size_t i = 0; i < gnw.size(); ++i)
+                    if ((i < pad * sizeof(int) || i >= (pad + 2) * sizeof(int)) && gnw[i] != 0xa5)
+                        throw std::runtime_error("n_wl guard overwrite");
                 unsigned count;ck(cudaMemcpy(&count,counter,4,cudaMemcpyDeviceToHost),"counter reset");if(count)throw std::runtime_error("counter not reset");++checks;
             }
             cudaGraphExecDestroy(ex);cudaGraphDestroy(graph);
@@ -87,7 +117,7 @@ int run(int dev,bool bench){
                 cudaGraphExecDestroy(ex);cudaGraphDestroy(graph);
             }
             if(bench&&rep==0&&(T==1||T==3||T==7||T==16))for(bool packed:{false,true,true,false}){
-                ck(cudaStreamBeginCapture(st,cudaStreamCaptureModeRelaxed),"time capture");for(int i=0;i<copies;++i)call(packed);ck(cudaStreamEndCapture(st,&graph),"time end");ck(cudaGraphInstantiate(&ex,graph,nullptr,nullptr,0),"time graph");
+                ck(cudaStreamBeginCapture(st,cudaStreamCaptureModeRelaxed),"time capture");for(int i=0;i<copies;++i)call(packed,false);ck(cudaStreamEndCapture(st,&graph),"time end");ck(cudaGraphInstantiate(&ex,graph,nullptr,nullptr,0),"time graph");
                 for(int i=0;i<8;++i)ck(cudaGraphLaunch(ex,st),"warm");ck(cudaEventRecord(a,st),"start");for(int i=0;i<8;++i)ck(cudaGraphLaunch(ex,st),"time launch");ck(cudaEventRecord(b,st),"end");ck(cudaEventSynchronize(b),"time wait");float ms;ck(cudaEventElapsedTime(&ms,a,b),"elapsed");
                 std::cout<<"card "<<dev<<" T "<<T<<" BF16 "<<packed<<" us "<<ms*1000/(8*copies)<<std::endl;cudaGraphExecDestroy(ex);cudaGraphDestroy(graph);
             }

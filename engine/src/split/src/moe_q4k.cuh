@@ -90,7 +90,7 @@ __device__ __forceinline__ void q4k_row(const char* wrow, int lane8, int n, cons
 template <int TT>
 __global__ void __launch_bounds__(Q4K_THREADS) k_moe_gu_q4k(MoeW w, const Job* __restrict__ jobs, const int* __restrict__ njobs,
                                                           const block_q8_1* __restrict__ y, float* __restrict__ out, const ShexpDown sd,
-                                                          int sd_rows) {
+                                                          int sd_rows, const int* __restrict__ job_idx = nullptr) {
     static_assert(Q4K_THREADS == Q8S_THREADS, "the shared expert's q8s blocks in the gate|up launch");
     if ((int) blockIdx.y < sd_rows) {
         shexp_down_blocks<TT>(sd, blockIdx.y * gridDim.x + blockIdx.x, sd_rows * gridDim.x);
@@ -98,8 +98,9 @@ __global__ void __launch_bounds__(Q4K_THREADS) k_moe_gu_q4k(MoeW w, const Job* _
     }
     const int ji = blockIdx.y - sd_rows;
     if (ji >= *njobs) return;
+    const int ji_real = job_idx ? job_idx[ji] : ji;
     __shared__ Job jb;
-    if (threadIdx.x == 0) jb = jobs[ji];
+    if (threadIdx.x == 0) jb = jobs[ji_real];
     __syncthreads();
     const int row = blockIdx.x * Q4K_ROWS + threadIdx.x / Q4K_LPR, lane8 = threadIdx.x % Q4K_LPR;
     const bool live = row < w.nrows;
@@ -127,28 +128,28 @@ __global__ void __launch_bounds__(Q4K_THREADS) k_moe_gu_q4k_big(MoeW w, const Bi
 }
 
 void gu_q4k_launch(int T, const MoeW& w, const Job* jobs, const int* njobs, int njobs_max, const block_q8_1* y, float* out,
-                   cudaStream_t s, const ShexpDown& sd = ShexpDown{}) {
+                   cudaStream_t s, const ShexpDown& sd = ShexpDown{}, const int* job_idx = nullptr) {
     if (w.ncols != N || w.row_a != (size_t) N / 256 * 144) throw std::runtime_error("moe gate|up q4_K: row layout");
     const int gx = (w.nrows + Q4K_ROWS - 1) / Q4K_ROWS, sd_blocks = (sd.rows + Q8S_THREADS / 32 - 1) / (Q8S_THREADS / 32);
     const int sd_rows = sd.rows ? (sd_blocks + gx - 1) / gx : 0;
     const dim3 grid(gx, njobs_max + sd_rows);
     switch (T) {
-        case 1: k_moe_gu_q4k<1><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
-        case 2: k_moe_gu_q4k<2><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
-        case 3: k_moe_gu_q4k<3><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
-        case 4: k_moe_gu_q4k<4><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
-        case 5: k_moe_gu_q4k<5><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
-        case 6: k_moe_gu_q4k<6><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
-        case 7: k_moe_gu_q4k<7><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
-        case 8: k_moe_gu_q4k<8><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
-        case 9: k_moe_gu_q4k<9><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
-        case 10: k_moe_gu_q4k<10><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
-        case 11: k_moe_gu_q4k<11><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
-        case 12: k_moe_gu_q4k<12><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
-        case 13: k_moe_gu_q4k<13><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
-        case 14: k_moe_gu_q4k<14><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
-        case 15: k_moe_gu_q4k<15><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
-        case 16: k_moe_gu_q4k<16><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows); break;
+        case 1: k_moe_gu_q4k<1><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows, job_idx); break;
+        case 2: k_moe_gu_q4k<2><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows, job_idx); break;
+        case 3: k_moe_gu_q4k<3><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows, job_idx); break;
+        case 4: k_moe_gu_q4k<4><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows, job_idx); break;
+        case 5: k_moe_gu_q4k<5><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows, job_idx); break;
+        case 6: k_moe_gu_q4k<6><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows, job_idx); break;
+        case 7: k_moe_gu_q4k<7><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows, job_idx); break;
+        case 8: k_moe_gu_q4k<8><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows, job_idx); break;
+        case 9: k_moe_gu_q4k<9><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows, job_idx); break;
+        case 10: k_moe_gu_q4k<10><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows, job_idx); break;
+        case 11: k_moe_gu_q4k<11><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows, job_idx); break;
+        case 12: k_moe_gu_q4k<12><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows, job_idx); break;
+        case 13: k_moe_gu_q4k<13><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows, job_idx); break;
+        case 14: k_moe_gu_q4k<14><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows, job_idx); break;
+        case 15: k_moe_gu_q4k<15><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows, job_idx); break;
+        case 16: k_moe_gu_q4k<16><<<grid, Q4K_THREADS, 0, s>>>(w, jobs, njobs, y, out, sd, sd_rows, job_idx); break;
         default: throw std::runtime_error("moe gate|up q4_K: T out of range");
     }
 }

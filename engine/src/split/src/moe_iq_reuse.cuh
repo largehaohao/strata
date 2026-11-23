@@ -165,7 +165,8 @@ __device__ __forceinline__ void copy_down_experts(const CacheDownCopy& copy) {
 template <GgmlType TA, int TT, int G = 32, bool COPY = false, bool PACKED_SIGNS = false>
 __global__ void __launch_bounds__(MMVQ_THREADS) k_moe_gu_iq(
     MoeW w, const Job* __restrict__ jobs, const int* __restrict__ njobs,
-    const block_q8_1* __restrict__ y, float* __restrict__ out, CacheDownCopy copy = {}) {
+    const block_q8_1* __restrict__ y, float* __restrict__ out, CacheDownCopy copy = {},
+    const int* __restrict__ job_idx = nullptr) {
     int row_block = blockIdx.x, ji = blockIdx.y;
     if constexpr (COPY) {
         // Prefix blocks read RAM while the remaining blocks compute with the
@@ -181,8 +182,9 @@ __global__ void __launch_bounds__(MMVQ_THREADS) k_moe_gu_iq(
         ji = block / rows;
     }
     if (ji >= *njobs) return;
+    const int ji_real = job_idx ? job_idx[ji] : ji;
     __shared__ Job jb;
-    if (threadIdx.x == 0) jb = jobs[ji];
+    if (threadIdx.x == 0) jb = jobs[ji_real];
     __syncthreads();
     static_assert(G == 16 || G == 32, "IQ lanes per row");
     const int row = row_block * (MMVQ_THREADS / G) + threadIdx.x / G;

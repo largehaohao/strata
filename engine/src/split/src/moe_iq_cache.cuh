@@ -5,7 +5,8 @@
 template <GgmlType TA, int TT, int G = 32, bool COPY = false, bool PACKED_SIGNS = false>
 __global__ void __launch_bounds__(MMVQ_THREADS) k_moe_gu_iq_cache(
     MoeW w, const Job* __restrict__ jobs, const int* __restrict__ njobs,
-    const block_q8_1* __restrict__ y, float* __restrict__ out, CacheDownCopy copy = {}, CacheGateUpCopy cache = {}) {
+    const block_q8_1* __restrict__ y, float* __restrict__ out, CacheDownCopy copy = {}, CacheGateUpCopy cache = {},
+    const int* __restrict__ job_idx = nullptr) {
     int row_block = blockIdx.x, ji = blockIdx.y;
     if constexpr (COPY) {
         // Prefix blocks read down weights while the remaining blocks fill and
@@ -21,10 +22,11 @@ __global__ void __launch_bounds__(MMVQ_THREADS) k_moe_gu_iq_cache(
         ji = block / rows;
     }
     if (ji >= *njobs) return;
+    const int ji_real = job_idx ? job_idx[ji] : ji;
     __shared__ Job jb;
     __shared__ bool missing;
     if (threadIdx.x == 0) {
-        jb = jobs[ji];
+        jb = jobs[ji_real];
         missing = false;
         const int g = cache.layer * NEXP + jb.w;
         if (cache.miss_bits) missing = (cache.miss_bits[jb.w / 32] >> (jb.w % 32)) & 1u;

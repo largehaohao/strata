@@ -303,7 +303,8 @@ void ple_post(float* R, const float* key, const float* value, const float* nk, c
 // sh_gu (rows sh_rows < 4096): the shared expert's gate|up over the q8_1 rows sh_y into sh_out, in the same launch
 void router_route(const float* W, const float* x, float* logits, int T, int* topi, float* topw, Job* jobs_gu, Job* jobs_dn,
                   int* njobs, void* st, const ExpertCache* ec = nullptr, int layer = -1, int* list = nullptr, const Q8S* sh_gu = nullptr,
-                  int sh_rows = 0, const void* sh_y = nullptr, float* sh_out = nullptr, const uint16_t* packed = nullptr, unsigned* errors = nullptr);
+                  int sh_rows = 0, const void* sh_y = nullptr, float* sh_out = nullptr, const uint16_t* packed = nullptr, unsigned* errors = nullptr,
+                  int* wl1 = nullptr, int* wlm = nullptr, int* n_wl = nullptr);
 // Down weights to fill beside IQ gate/up arithmetic. The preceding cache plan
 // must complete first; GU is already resident or filled by CacheGateUpCopy below.
 // The list/slots stay fixed until this launch finishes. Bytes and offsets are
@@ -330,7 +331,8 @@ struct CacheGateUpCopy {
 // expert's swiglu of sh_gu ([T][2 * sh_ffs]) and down (N rows) into sh_out (row stride N), in the same launch
 void moe_gate_up(const DW& A, size_t sa, const Job* jobs, const int* njobs, int njobs_max, const void* xq, float* gu, void* st,
                  const Q8S* sh_down = nullptr, int sh_ffs = 0, const float* sh_gu = nullptr, float* sh_out = nullptr,
-                 const CacheDownCopy* copy = nullptr, const CacheGateUpCopy* gu_copy = nullptr);
+                 const CacheDownCopy* copy = nullptr, const CacheGateUpCopy* gu_copy = nullptr,
+                 const int* job_idx = nullptr, int job_t = 0);
 // the same for jobs of up to MAXT rows each, njobs_cap of them at most (the prompt path's)
 void moe_gate_up_jobs(const DW& A, size_t sa, const Job* jobs, const int* njobs, int njobs_cap, const void* xq, float* gu, void* st);
 // the same with BigJobs (njobs_cap of them at most)
@@ -359,7 +361,7 @@ void arena_slots(const ExpertCache& ec, int from, int to, void* st);
 bool moe_down_can_fuse_sh(int T, uint32_t down_type);
 void moe_down(const DW& A, size_t sa, const Job* jobs, const int* njobs, int njobs_max, const float* gu, float* part, void* st,
               const Q8S* sh_down = nullptr, int sh_ffs = 0, const float* sh_gu = nullptr, void* sh_hq = nullptr,
-              float* sh_out = nullptr);
+              float* sh_out = nullptr, const int* wl1 = nullptr, const int* wlm = nullptr, const int* n_wl = nullptr);
 // T rows of [gate (ffs) | up (ffs)] -> silu(gate) * up as q8_1 rows of ffs (the shared expert)
 void swiglu_stacked_q8_1(const float* gu, void* hq, int ffs, int T, void* st);
 // the weighted sum of the expert rows, read by the ring in place of x when part is not null

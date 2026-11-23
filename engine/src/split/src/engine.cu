@@ -52,6 +52,24 @@ bool q8s_fused_ab() {
     }();
     return enabled;
 }
+
+int moe_split_wl_mode() {
+    static const int mode = [] {
+        const long long v = env_int("FNX_MOE_SPLIT_WL", 0);
+        if (v < 0 || v > 3) throw std::runtime_error("FNX_MOE_SPLIT_WL: expected 0..3");
+        return (int) v;
+    }();
+    return mode;
+}
+
+int moe_split_wl_min_t() {
+    static const int min_t = [] {
+        const long long v = env_int("FNX_MOE_SPLIT_WL_MIN_T", 4);
+        if (v < 2 || v > MAXT) throw std::runtime_error("FNX_MOE_SPLIT_WL_MIN_T: expected 2.." + std::to_string(MAXT));
+        return (int) v;
+    }();
+    return min_t;
+}
 } // namespace
 
 
@@ -144,6 +162,10 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
 #endif
     }
     hc1_rows();   // FNX_HC1 checked now, not at the first hc read (inside a graph capture)
+    const long long moe_hoist = env_int("FNX_MOE_HOIST", 0);
+    if (moe_hoist != 0 && moe_hoist != 1) throw std::runtime_error("FNX_MOE_HOIST: expected 0 or 1");
+    (void) moe_split_wl_mode();
+    (void) moe_split_wl_min_t();
     const int extra_pages = (std::max(lanes, 1) - 1) * lane_block_pages();
     // the paged K/V pool: pages for the whole context (one more for the block a position past the last one needs)
     // and the extra lanes' blocks. Int8 rows: the context's pages as many as fit in their f16 bytes (the smallest ratio
@@ -307,6 +329,9 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
         b->njobs = dalloc<int>(2);
         b->jobs_gu = dalloc<Job>(P + 1);
         b->jobs_dn = dalloc<Job>(P + 1);
+        b->jobs_wl1 = dalloc<int>(P);
+        b->jobs_wlm = dalloc<int>(P / 2);
+        b->njobs_wl = dalloc<int>(2);
         if (env_flag("FNX_MOE_STAGE")) {
             if (env_flag("FNX_MOE_STAGE_COLD_ONLY")) {
                 if (env_int("FNX_STATIC_EXPERTS", 0) != 1 || m.resident.size() != NL)
@@ -1229,8 +1254,13 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
     // the slots as they were, so with it the plan runs after, in moe_cache)
     const bool live = (static_live || cache_live()) && lyr >= 0 && lyr < NL;
     const bool plan_in_router = live && !b.probe_cnt;
+    const int split_wl_mode = moe_split_wl_mode();
+    const bool use_wl = split_wl_mode != 0 && T >= moe_split_wl_min_t();
+    const bool split_dn = use_wl && ((split_wl_mode & 1) != 0);
+    const bool split_gu = use_wl && ((split_wl_mode & 2) != 0);
     router_route(L.router, b.mixed, b.logits, T, b.topi, b.topw, b.jobs_gu, b.jobs_dn, b.njobs, b.st, plan_in_router ? &ec : nullptr,
-                 lyr, b.cache_list, (sh_in || sh_in_down) ? &L.sh_gu.s : nullptr, 2 * ffs, b.xq, b.sh_gu, L.router_bf16, b.ring.err);
+                 lyr, b.cache_list, (sh_in || sh_in_down) ? &L.sh_gu.s : nullptr, 2 * ffs, b.xq, b.sh_gu, L.router_bf16, b.ring.err,
+                 use_wl ? b.jobs_wl1 : nullptr, use_wl ? b.jobs_wlm : nullptr, use_wl ? b.njobs_wl : nullptr);
     if (const int l = lyr; l >= 0 && l < NL) {
         if (b.route_cnt) route_count(b.topi, P, b.route_cnt + (size_t) l * NEXP, b.st);
         if (b.route_trace) fnx::route_trace(b.topi, P, l, b.route_trace, b.route_trace_len, b.route_trace_cap, b.st);
@@ -1265,13 +1295,35 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
         copy = {ec.host_dn, ec.slot_of, b.cache_list, ec.pool[p], ec.slot_bytes[p], ec.dn_off[p],
                 L.down_e_stride, ec.s0[p], fused_dn_blocks};
     }
-    if (sh_in) moe_gate_up(gu, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st, &L.sh_down.s, ffs, b.sh_gu, b.part + (size_t) P * N);
-    else moe_gate_up(gu, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st, nullptr, 0, nullptr, nullptr,
-                     fused_dn ? &copy : nullptr, fused_gu ? &gu_copy : nullptr);
+    if (split_gu) {
+        if (sh_in) {
+            moe_gate_up(gu, L.gu_e_stride, b.jobs_gu, b.njobs_wl, P, b.xq, b.gu, b.st,
+                        nullptr, 0, nullptr, nullptr, nullptr, nullptr, b.jobs_wl1, 1);
+            moe_gate_up(gu, L.gu_e_stride, b.jobs_gu, b.njobs_wl + 1, P / 2, b.xq, b.gu, b.st,
+                        &L.sh_down.s, ffs, b.sh_gu, b.part + (size_t) P * N, nullptr, nullptr, b.jobs_wlm, T);
+        } else {
+            moe_gate_up(gu, L.gu_e_stride, b.jobs_gu, b.njobs_wl, P, b.xq, b.gu, b.st,
+                        nullptr, 0, nullptr, nullptr, fused_dn ? &copy : nullptr, fused_gu ? &gu_copy : nullptr, b.jobs_wl1, 1);
+            moe_gate_up(gu, L.gu_e_stride, b.jobs_gu, b.njobs_wl + 1, P / 2, b.xq, b.gu, b.st,
+                        nullptr, 0, nullptr, nullptr, nullptr, fused_gu ? &gu_copy : nullptr, b.jobs_wlm, T);
+        }
+    } else if (sh_in) {
+        moe_gate_up(gu, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st, &L.sh_down.s, ffs, b.sh_gu, b.part + (size_t) P * N);
+    } else {
+        moe_gate_up(gu, L.gu_e_stride, b.jobs_gu, b.njobs, P, b.xq, b.gu, b.st, nullptr, 0, nullptr, nullptr,
+                    fused_dn ? &copy : nullptr, fused_gu ? &gu_copy : nullptr);
+    }
     if (prof) vp_stamp(14);
     const DW down = stage_moe(down_source, L.down_e_stride, b.jobs_dn, b.njobs, P, stage, b.moe_stage_ep, b.st, hot);
-    if (sh_in_down) moe_down(down, L.down_e_stride, b.jobs_dn, b.njobs, P, b.gu, b.part, b.st, &L.sh_down.s, ffs, b.sh_gu, b.sh_hq, b.part + (size_t) P * N);
-    else moe_down(down, L.down_e_stride, b.jobs_dn, b.njobs, P, b.gu, b.part, b.st);
+    if (sh_in_down) {
+        moe_down(down, L.down_e_stride, b.jobs_dn, b.njobs, P, b.gu, b.part, b.st, &L.sh_down.s, ffs, b.sh_gu, b.sh_hq, b.part + (size_t) P * N,
+                 split_dn ? b.jobs_wl1 : nullptr, split_dn ? b.jobs_wlm : nullptr, split_dn ? b.njobs_wl : nullptr);
+    } else if (split_dn) {
+        moe_down(down, L.down_e_stride, b.jobs_dn, b.njobs, P, b.gu, b.part, b.st,
+                 nullptr, 0, nullptr, nullptr, nullptr, b.jobs_wl1, b.jobs_wlm, b.njobs_wl);
+    } else {
+        moe_down(down, L.down_e_stride, b.jobs_dn, b.njobs, P, b.gu, b.part, b.st);
+    }
     if (!sh_in && !sh_in_down) ck(cudaStreamWaitEvent(b.st, b.join, 0), "join wait");
     if (prof) vp_stamp(15);
     RingMoe m;

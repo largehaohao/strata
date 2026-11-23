@@ -13,15 +13,45 @@ void ck(cudaError_t e, const char* what) {
 
 template <GgmlType TA>
 void launch_test(int T, int cap, const MoeW& w, const Job* jobs, const int* njobs,
-                 const block_q8_1* x, float* out, cudaStream_t stream, const CacheDownCopy* copy = nullptr) {
-    const dim3 grid((w.nrows + 3) / 4, 48);
+                 const block_q8_1* x, float* out, cudaStream_t stream, const CacheDownCopy* copy = nullptr,
+                 const int* job_idx = nullptr, int job_cap = 48) {
+    const dim3 grid((w.nrows + 3) / 4, job_cap);
+    if constexpr (TA == T_IQ4_XS || TA == T_Q5_K) {
+        if (cap >= 1) {
+            const dim3 grid16((w.nrows + 7) / 8, job_cap);
+            if (cap == 2) {
+                switch (T) {
+#define GH16_CASE(t) case t: k_moe_gu_hoist<TA, 16, t><<<grid16, MMVQ_THREADS, 0, stream>>>(w, jobs, njobs, x, out, job_idx); break
+                    GH16_CASE(1); GH16_CASE(2); GH16_CASE(3); GH16_CASE(4);
+                    GH16_CASE(5); GH16_CASE(6); GH16_CASE(7); GH16_CASE(8);
+                    GH16_CASE(9); GH16_CASE(10); GH16_CASE(11); GH16_CASE(12);
+                    GH16_CASE(13); GH16_CASE(14); GH16_CASE(15); GH16_CASE(16);
+                    default: throw std::runtime_error("invalid test window");
+#undef GH16_CASE
+                }
+                ck(cudaGetLastError(), "gate/up hoist 16-lane launch");
+                return;
+            }
+            switch (T) {
+#define GH32_CASE(t) case t: k_moe_gu_hoist<TA, 32, t><<<grid, MMVQ_THREADS, 0, stream>>>(w, jobs, njobs, x, out, job_idx); break
+                GH32_CASE(1); GH32_CASE(2); GH32_CASE(3); GH32_CASE(4);
+                GH32_CASE(5); GH32_CASE(6); GH32_CASE(7); GH32_CASE(8);
+                GH32_CASE(9); GH32_CASE(10); GH32_CASE(11); GH32_CASE(12);
+                GH32_CASE(13); GH32_CASE(14); GH32_CASE(15); GH32_CASE(16);
+                default: throw std::runtime_error("invalid test window");
+#undef GH32_CASE
+            }
+            ck(cudaGetLastError(), "gate/up hoist 32-lane launch");
+            return;
+        }
+    }
     if (cap >= 2) {
         if constexpr (TA == T_IQ2_XXS || TA == T_IQ2_S || TA == T_IQ3_XXS || TA == T_IQ3_S) {
-            const dim3 grid16((w.nrows + 7) / 8, 48);
+            const dim3 grid16((w.nrows + 7) / 8, job_cap);
             const dim3 fused_grid(grid16.x * grid16.y + (copy ? copy->blocks : 0));
 #define GU16_CASE(t) case t: \
-    if (copy) k_moe_gu_iq<TA, t, 16, true><<<fused_grid, MMVQ_THREADS, 0, stream>>>(w, jobs, njobs, x, out, *copy); \
-    else k_moe_gu_iq<TA, t, 16><<<grid16, MMVQ_THREADS, 0, stream>>>(w, jobs, njobs, x, out); break
+    if (copy) k_moe_gu_iq<TA, t, 16, true><<<fused_grid, MMVQ_THREADS, 0, stream>>>(w, jobs, njobs, x, out, *copy, job_idx); \
+    else k_moe_gu_iq<TA, t, 16><<<grid16, MMVQ_THREADS, 0, stream>>>(w, jobs, njobs, x, out, CacheDownCopy{}, job_idx); break
             switch (T) {
                 GU16_CASE(1); GU16_CASE(2); GU16_CASE(3); GU16_CASE(4);
                 GU16_CASE(5); GU16_CASE(6); GU16_CASE(7); GU16_CASE(8);
@@ -35,8 +65,8 @@ void launch_test(int T, int cap, const MoeW& w, const Job* jobs, const int* njob
         }
     }
 #define GU_CASE(t) case t: \
-    if (cap) k_moe_gu_iq<TA, t><<<grid, MMVQ_THREADS, 0, stream>>>(w, jobs, njobs, x, out); \
-    else k_moe_gu<TA, 32, t><<<grid, MMVQ_THREADS, 0, stream>>>(w, jobs, njobs, x, out); \
+    if (cap) k_moe_gu_iq<TA, t><<<grid, MMVQ_THREADS, 0, stream>>>(w, jobs, njobs, x, out, CacheDownCopy{}, job_idx); \
+    else k_moe_gu<TA, 32, t><<<grid, MMVQ_THREADS, 0, stream>>>(w, jobs, njobs, x, out, job_idx); \
     break
     switch (T) {
         GU_CASE(1); GU_CASE(2); GU_CASE(3); GU_CASE(4);
@@ -106,15 +136,20 @@ struct DownCopyTest {
 };
 
 template <GgmlType TA>
-void run_type(int dev) {
+int run_type(int dev) {
     constexpr int experts = 48, cols = 2560, rows = 641;
     constexpr size_t row_bytes = cols / qtraits<TA>::qk * qtraits<TA>::bs;
     const size_t weight_bytes = experts * rows * row_bytes;
     std::vector<unsigned char> weights(weight_bytes);
     for (size_t i = 0; i < weight_bytes; ++i) weights[i] = (i * 13 + (i >> 7) * 17) & 255;
     for (size_t i = 0; i < weight_bytes; i += qtraits<TA>::bs) {
-        const uint16_t scale = 0x2400; // finite half: all four formats put d first
-        std::memcpy(weights.data() + i, &scale, sizeof scale);
+        if constexpr (TA == T_Q5_K) {
+            const uint16_t dm[2] = {0x2400, 0x2000};
+            std::memcpy(weights.data() + i, dm, sizeof dm);
+        } else {
+            const uint16_t scale = 0x2400; // finite half: all IQ formats put d first
+            std::memcpy(weights.data() + i, &scale, sizeof scale);
+        }
     }
     std::vector<block_q8_1> x(MAXT * cols / 32);
     for (size_t i = 0; i < x.size(); ++i) {
@@ -128,10 +163,15 @@ void run_type(int dev) {
     int* dn = nullptr;
     float *baseline = nullptr, *candidate = nullptr;
     const size_t output_bytes = (size_t) experts * MAXT * rows * sizeof(float) + 256;
+    int *dwl1 = nullptr, *dwlm = nullptr, *dn1 = nullptr, *dnm = nullptr;
     ck(cudaMalloc((void**)&dw, weight_bytes), "weights");
     ck(cudaMalloc((void**)&dx, x.size() * sizeof(block_q8_1)), "activations");
     ck(cudaMalloc((void**)&dj, experts * sizeof(Job)), "jobs");
     ck(cudaMalloc((void**)&dn, sizeof(int)), "count");
+    ck(cudaMalloc((void**)&dwl1, experts * sizeof(int)), "wl1");
+    ck(cudaMalloc((void**)&dwlm, experts * sizeof(int)), "wlm");
+    ck(cudaMalloc((void**)&dn1, sizeof(int)), "n1");
+    ck(cudaMalloc((void**)&dnm, sizeof(int)), "nm");
     ck(cudaMalloc((void**)&baseline, output_bytes), "baseline");
     ck(cudaMalloc((void**)&candidate, output_bytes), "candidate");
     ck(cudaMemcpy(dw, weights.data(), weight_bytes, cudaMemcpyHostToDevice), "weights copy");
@@ -140,6 +180,7 @@ void run_type(int dev) {
     cudaStream_t stream;
     ck(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
     std::vector<unsigned char> ref(output_bytes), got(output_bytes);
+    int checks = 0;
     for (int T = 1; T <= MAXT; ++T) {
         for (int cap : {1, 2, 3, 4}) {
             if (cap >= 3 && TA != T_IQ2_XXS && TA != T_IQ2_S && TA != T_IQ3_XXS && TA != T_IQ3_S) continue;
@@ -178,9 +219,62 @@ void run_type(int dev) {
                 ck(cudaMemcpy(got.data(), candidate, output_bytes, cudaMemcpyDeviceToHost), "candidate read");
                 if (ref != got) throw std::runtime_error("gate/up bit mismatch or guard overwrite: type " +
                     std::to_string(TA) + " T " + std::to_string(T) + " cap " + std::to_string(cap));
+                ++checks;
             }
             ck(cudaGraphExecDestroy(exec), "destroy exec");
             ck(cudaGraphDestroy(graph), "destroy graph");
+        }
+        for (int wl_cap : {0, 1, 2}) {
+            if (wl_cap == 2 && TA != T_IQ2_XXS && TA != T_IQ2_S && TA != T_IQ3_XXS && TA != T_IQ3_S && TA != T_IQ4_XS && TA != T_Q5_K) continue;
+            if (wl_cap == 1 && TA != T_IQ4_XS && TA != T_Q5_K) continue;
+            cudaGraph_t graph;
+            cudaGraphExec_t exec;
+            ck(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed), "wl capture");
+            launch_test<TA>(1, wl_cap, w, dj, dn1, dx, candidate, stream, nullptr, dwl1, experts);
+            launch_test<TA>(T, wl_cap, w, dj, dnm, dx, candidate, stream, nullptr, dwlm, experts);
+            ck(cudaStreamEndCapture(stream, &graph), "wl end capture");
+            ck(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0), "wl instantiate");
+            constexpr int counts[] = {0, 1, 7, experts};
+            for (int rep = 0; rep < 8; ++rep) {
+                const int count = counts[rep % 4];
+                std::vector<Job> jobs(experts);
+                std::vector<int> hwl1, hwlm;
+                for (int j = 0; j < experts; ++j) {
+                    jobs[j].w = (j * 7 + rep * 11) % experts;
+                    jobs[j].n = (rep % 4 == 2) ? 1 : (1 + (j + rep) % T);
+                    for (int t = 0; t < jobs[j].n; ++t) {
+                        jobs[j].y[t] = (t + rep) % T;
+                        jobs[j].out[t] = j * MAXT + t;
+                    }
+                    if (j < count) {
+                        if (jobs[j].n == 1) hwl1.push_back(j);
+                        else hwlm.push_back(j);
+                    }
+                }
+                const int n1 = (int) hwl1.size(), nm = (int) hwlm.size();
+                ck(cudaMemcpy(dj, jobs.data(), experts * sizeof(Job), cudaMemcpyHostToDevice), "wl job copy");
+                ck(cudaMemcpy(dn, &count, sizeof(int), cudaMemcpyHostToDevice), "wl count copy");
+                ck(cudaMemcpy(dn1, &n1, sizeof(int), cudaMemcpyHostToDevice), "n1 copy");
+                ck(cudaMemcpy(dnm, &nm, sizeof(int), cudaMemcpyHostToDevice), "nm copy");
+                if (n1) ck(cudaMemcpy(dwl1, hwl1.data(), n1 * sizeof(int), cudaMemcpyHostToDevice), "wl1 copy");
+                if (nm) ck(cudaMemcpy(dwlm, hwlm.data(), nm * sizeof(int), cudaMemcpyHostToDevice), "wlm copy");
+                ck(cudaMemsetAsync(baseline, 0xA5, output_bytes, stream), "wl baseline guard");
+                ck(cudaMemsetAsync(candidate, 0xA5, output_bytes, stream), "wl candidate guard");
+                launch_test<TA>(T, 0, w, dj, dn, dx, baseline, stream);
+                if ((rep / 4) % 2) ck(cudaGraphLaunch(exec, stream), "wl graph replay");
+                else {
+                    launch_test<TA>(1, wl_cap, w, dj, dn1, dx, candidate, stream, nullptr, dwl1, experts);
+                    launch_test<TA>(T, wl_cap, w, dj, dnm, dx, candidate, stream, nullptr, dwlm, experts);
+                }
+                ck(cudaStreamSynchronize(stream), "wl wait");
+                ck(cudaMemcpy(ref.data(), baseline, output_bytes, cudaMemcpyDeviceToHost), "wl ref read");
+                ck(cudaMemcpy(got.data(), candidate, output_bytes, cudaMemcpyDeviceToHost), "wl got read");
+                if (ref != got) throw std::runtime_error("gate/up job_idx mismatch or guard overwrite: type " +
+                    std::to_string(TA) + " T " + std::to_string(T) + " cap " + std::to_string(wl_cap));
+                ++checks;
+            }
+            ck(cudaGraphExecDestroy(exec), "wl destroy exec");
+            ck(cudaGraphDestroy(graph), "wl destroy graph");
         }
     }
     // Same live jobs for each timing arm; events bracket 40 ordered launches.
@@ -208,7 +302,9 @@ void run_type(int dev) {
     }
     ck(cudaEventDestroy(start), "free event"); ck(cudaEventDestroy(end), "free event");
     ck(cudaStreamDestroy(stream), "free stream");
-    for (void* p : {(void*)dw, (void*)dx, (void*)dj, (void*)dn, (void*)baseline, (void*)candidate}) ck(cudaFree(p), "free");
+    for (void* p : {(void*)dw, (void*)dx, (void*)dj, (void*)dn, (void*)dwl1, (void*)dwlm, (void*)dn1, (void*)dnm, (void*)baseline, (void*)candidate})
+        ck(cudaFree(p), "free");
+    return checks;
 }
 } // namespace fnx
 
@@ -216,13 +312,15 @@ int main() {
     int count = 0;
     fnx::ck(cudaGetDeviceCount(&count), "devices");
     if (count < 2) throw std::runtime_error("two physical devices required");
+    int checks = 0;
     for (int dev = 0; dev < 2; ++dev) {
         fnx::ck(cudaSetDevice(dev), "device");
-        fnx::run_type<fnx::T_IQ2_XXS>(dev);
-        fnx::run_type<fnx::T_IQ2_S>(dev);
-        fnx::run_type<fnx::T_IQ3_XXS>(dev);
-        fnx::run_type<fnx::T_IQ3_S>(dev);
-        fnx::run_type<fnx::T_IQ4_XS>(dev);
+        checks += fnx::run_type<fnx::T_IQ2_XXS>(dev);
+        checks += fnx::run_type<fnx::T_IQ2_S>(dev);
+        checks += fnx::run_type<fnx::T_IQ3_XXS>(dev);
+        checks += fnx::run_type<fnx::T_IQ3_S>(dev);
+        checks += fnx::run_type<fnx::T_IQ4_XS>(dev);
+        checks += fnx::run_type<fnx::T_Q5_K>(dev);
     }
-    std::cout << "MoE gate/up: 4608 exact direct/graph checks passed (2048 with down copies and guards)\n";
+    std::cout << "MoE gate/up: " << checks << " exact direct/graph checks passed (2048 with down copies and guards)\n";
 }
