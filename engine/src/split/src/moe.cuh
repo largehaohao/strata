@@ -16,7 +16,7 @@ constexpr int RR_THREADS = 256, RR_WPR = 2, RR_ROWS = RR_THREADS / 32 / RR_WPR; 
 // slot of the layer's pool that the pool's CLOCK hand reaches first with ref 0 (a ref 1 it passes drops to 0), its old
 // expert pointing back at RAM. The hand goes round the pool's slots past its lent ones. list: how many took a slot,
 // then their ids
-__device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache& ec, int* list) {
+__device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache& ec, int* list, unsigned* errors = nullptr) {
     const int lane = threadIdx.x & 31, base = layer * NEXP, p = ec.pool_of[layer], lent = ec.lent[p];
     unsigned missed = 0;
     // an arena's pools hold every expert until it lends, and then only its own pool's experts can be missing
@@ -26,6 +26,14 @@ __device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache
         return;
     }
     const int s0 = ec.s0[p] + lent, n = ec.n[p] - lent;
+    if (n <= 0) {
+        if (ec.miss_bits && lane < (NEXP + 31) / 32) ec.miss_bits[lane] = 0;
+        if (lane == 0) {
+            list[0] = 0;
+            if (errors) atomicOr(errors, 512u);
+        }
+        return;
+    }
     for (int j = lane; j < nj; j += 32)
         if (const int s = ec.slot_of[base + jobs[j].w]; s >= 0) {
             if (ec.age) ec.age[s] = min(ec.max_age, (int) ec.age[s] + 1);
@@ -34,20 +42,23 @@ __device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache
     __syncwarp();
     int hand = ec.hand[p] - s0, k = 0;   // within the slots not lent
     if (hand < 0 || hand >= n) hand = 0;
+    const int max_steps = (max(1, ec.max_age) + 2) * ((n + 31) / 32) + 2;
+    bool exhausted = false;
     // the misses found 32 jobs at a time (a load each, side by side), then taken in job order
-    for (int j0 = 0; j0 < nj; j0 += 32) {
+    for (int j0 = 0; j0 < nj && !exhausted; j0 += 32) {
         unsigned miss = __ballot_sync(0xffffffffu, j0 + lane < nj && ec.slot_of[base + jobs[j0 + lane].w] == -1);
         while (miss) {
-            const int g = base + jobs[j0 + __ffs(miss) - 1].w;
-            if (ec.miss_bits && lane == (g - base) / 32) missed |= 1u << ((g - base) % 32);
+            const int w = jobs[j0 + __ffs(miss) - 1].w;
+            const int g = base + w;
             miss &= miss - 1;
             int victim = -1;
-            while (victim < 0) {
+            for (int step = 0; victim < 0 && step < max_steps; ++step) {
+                const bool active = lane < n;
                 const int idx = s0 + (hand + lane) % n;
-                const unsigned char r = ec.ref[idx];
-                const unsigned free = __ballot_sync(0xffffffffu, r == 0);
-                const int f = free ? __ffs(free) - 1 : 32;
-                if (lane < f && r == 1) {
+                const unsigned char r = active ? ec.ref[idx] : 2;
+                const unsigned free = __ballot_sync(0xffffffffu, active && r == 0);
+                const int f = free ? __ffs(free) - 1 : min(32, n);
+                if (active && lane < f && r == 1) {
                     if (ec.age && ec.age[idx] > 1) --ec.age[idx];
                     else {
                         ec.ref[idx] = 0;
@@ -56,8 +67,14 @@ __device__ void cache_plan(const Job* jobs, int nj, int layer, const ExpertCache
                 }
                 __syncwarp();  // the next scan can wrap to another lane's ref/age update
                 if (free) victim = s0 + (hand + f) % n;
-                hand = (hand + (free ? f + 1 : 32)) % n;
+                hand = (hand + (free ? f + 1 : min(32, n))) % n;
             }
+            if (victim < 0) {
+                if (lane == 0 && errors) atomicOr(errors, 512u);
+                exhausted = true;
+                break;
+            }
+            if (ec.miss_bits && lane == w / 32) missed |= 1u << (w % 32);
             if (lane == 0) {
                 if (const int o = ec.owner[victim]; o >= 0) {
                     ec.slot_of[o] = -1;
@@ -170,6 +187,7 @@ __global__ void __launch_bounds__(RR_THREADS) k_router_route(const void* __restr
                 // No ordered logit remains. Lane zero has more candidates than TOPK.
                 bi = 32 * __shfl_sync(0xffffffffu, __ffs(~taken) - 1, 0);
                 if (lane == 0 && errors) atomicOr(errors, 32u);
+                bv = k == 0 ? 0.0f : top0;
             }
             if ((bi & 31) == lane) taken |= 1u << (bi >> 5);
             if (k == 0) top0 = bv;
@@ -255,7 +273,7 @@ __global__ void __launch_bounds__(RR_THREADS) k_router_route(const void* __restr
     }
     if (!ec.n_slots) return;
     __syncthreads();
-    if (warp == 0) cache_plan(gu, nj, layer, ec, list);
+    if (warp == 0) cache_plan(gu, nj, layer, ec, list, errors);
 }
 
 // rows of one job: tmp[j] = W row . y[ys[j]] for j < n <= TT, G lanes per row

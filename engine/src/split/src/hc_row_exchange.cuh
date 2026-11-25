@@ -57,6 +57,7 @@ __global__ void hcs_pull(__half* lo, int words, HcsMail own) {
             }
             __nanosleep(64);
         }
+        __threadfence_system();
     }
     __syncthreads();
     if (failed) return;

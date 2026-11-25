@@ -116,6 +116,7 @@ __global__ void k_pf_top10(const float* __restrict__ logits, int C, int* __restr
             // No ordered logit remains. Lane zero has more candidates than TOPK.
             bi = 32 * __shfl_sync(0xffffffffu, __ffs(~taken) - 1, 0);
             if (lane == 0 && errors) atomicOr(errors, 32u);
+            bv = k == 0 ? 0.0f : top0;
         }
         if ((bi & 31) == lane) taken |= 1u << (bi >> 5);
         if (k == 0) top0 = bv;

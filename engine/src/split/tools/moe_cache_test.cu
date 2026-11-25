@@ -68,8 +68,10 @@ void run_cache(int dev, int slots, int pattern, bool coherent, int groups = 1, b
     }
     ec.ep_gu = (const char**) alloc(experts * sizeof(char*));
     ec.ep_dn = (const char**) alloc(experts * sizeof(char*));
-    ec.host_gu = (const char**) alloc(experts * sizeof(char*));
-    ec.host_dn = (const char**) alloc(experts * sizeof(char*));
+    const char** host_gu_d = (const char**) alloc(experts * sizeof(char*));
+    const char** host_dn_d = (const char**) alloc(experts * sizeof(char*));
+    ec.host_gu = host_gu_d;
+    ec.host_dn = host_dn_d;
     for (const auto& pair : {std::make_pair((void*) ec.ep_gu, gu.data()), std::make_pair((void*) ec.host_gu, gu.data()),
                              std::make_pair((void*) ec.ep_dn, dn.data()), std::make_pair((void*) ec.host_dn, dn.data())})
         ck(cudaMemcpy(pair.first, pair.second, experts * sizeof(char*), cudaMemcpyHostToDevice), "tables");
@@ -286,6 +288,116 @@ void run_cache(int dev, int slots, int pattern, bool coherent, int groups = 1, b
     cudaFreeHost(host);
     std::cout << "card " << dev << " slots " << slots << " pools " << ec.n_pools << " pattern " << pattern << " coherent " << coherent << " max age " << max_age << " shared K/V " << shared_kv << ": 64 checks passed\n";
 }
+
+void run_cache_exhaustion(int dev) {
+    ck(cudaSetDevice(dev), "exhaustion device");
+    constexpr int slots = 8, experts = NEXP, capacity = MAXT * TOPK;
+    constexpr size_t gb = 256, db = 128, stride = gb + db;
+    ExpertCache ec;
+    ec.n_slots = slots; ec.n_pools = 1; ec.arena_pool = 0;
+    ec.s0[0] = 0; ec.n[0] = slots; ec.dn_off[0] = gb; ec.slot_bytes[0] = stride;
+    ec.max_age = 4;
+    std::vector<void*> device;
+    auto alloc = [&](size_t n) {
+        void* p = nullptr; ck(cudaMalloc(&p, n), "exhaustion alloc"); device.push_back(p); return p;
+    };
+    char* host = (char*) alloc(experts * stride);
+    char* pool = (char*) alloc(slots * stride);
+    ec.pool[0] = pool;
+    std::vector<const char*> gu(experts), dn(experts);
+    for (int e = 0; e < experts; ++e) {
+        gu[e] = host + (size_t) e * stride;
+        dn[e] = gu[e] + gb;
+    }
+    ec.ep_gu = (const char**) alloc(experts * sizeof(char*));
+    ec.ep_dn = (const char**) alloc(experts * sizeof(char*));
+    const char** host_gu_d = (const char**) alloc(experts * sizeof(char*));
+    const char** host_dn_d = (const char**) alloc(experts * sizeof(char*));
+    ec.host_gu = host_gu_d;
+    ec.host_dn = host_dn_d;
+    ec.slot_of = (int*) alloc(experts * sizeof(int));
+    ec.owner = (int*) alloc(slots * sizeof(int));
+    ec.ref = (unsigned char*) alloc(slots);
+    ec.age = (unsigned char*) alloc(slots);
+    ec.hand = (int*) alloc(EC_POOLS * sizeof(int));
+    ec.lent = (int*) alloc(EC_POOLS * sizeof(int));
+    ec.miss_bits = (unsigned*) alloc(NEXP / 32 * sizeof(unsigned));
+    int* list = (int*) alloc((capacity + 1) * sizeof(int));
+    Job* jobs = (Job*) alloc(capacity * sizeof(Job));
+    int* count = (int*) alloc(sizeof(int));
+    unsigned* err = (unsigned*) alloc(sizeof(unsigned));
+    cudaStream_t stream; ck(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "exhaustion stream");
+
+    auto reset_case = [&](int lent_n, unsigned char init_ref, int nj) {
+        std::vector<int> places(experts, -1), owners(slots, -1), h_lent(EC_POOLS, 0), h_hand(EC_POOLS, lent_n);
+        std::vector<unsigned char> refs(slots, init_ref), ages(slots, init_ref ? 4 : 0);
+        std::vector<Job> js(capacity);
+        for (int j = 0; j < nj; ++j) js[j].w = j;
+        h_lent[0] = lent_n;
+        ck(cudaMemcpy(ec.ep_gu, gu.data(), experts * sizeof(char*), cudaMemcpyHostToDevice), "ep_gu");
+        ck(cudaMemcpy(ec.ep_dn, dn.data(), experts * sizeof(char*), cudaMemcpyHostToDevice), "ep_dn");
+        ck(cudaMemcpy(host_gu_d, gu.data(), experts * sizeof(char*), cudaMemcpyHostToDevice), "host_gu");
+        ck(cudaMemcpy(host_dn_d, dn.data(), experts * sizeof(char*), cudaMemcpyHostToDevice), "host_dn");
+        ck(cudaMemcpy(ec.slot_of, places.data(), experts * sizeof(int), cudaMemcpyHostToDevice), "slot_of");
+        ck(cudaMemcpy(ec.owner, owners.data(), slots * sizeof(int), cudaMemcpyHostToDevice), "owner");
+        ck(cudaMemcpy(ec.ref, refs.data(), slots, cudaMemcpyHostToDevice), "ref");
+        ck(cudaMemcpy(ec.age, ages.data(), slots, cudaMemcpyHostToDevice), "age");
+        ck(cudaMemcpy(ec.hand, h_hand.data(), EC_POOLS * sizeof(int), cudaMemcpyHostToDevice), "hand");
+        ck(cudaMemcpy(ec.lent, h_lent.data(), EC_POOLS * sizeof(int), cudaMemcpyHostToDevice), "lent");
+        ck(cudaMemset(ec.miss_bits, 0xff, NEXP / 32 * sizeof(unsigned)), "miss_bits");
+        ck(cudaMemcpy(jobs, js.data(), capacity * sizeof(Job), cudaMemcpyHostToDevice), "jobs");
+        ck(cudaMemcpy(count, &nj, sizeof(int), cudaMemcpyHostToDevice), "count");
+        ck(cudaMemset(err, 0, sizeof(unsigned)), "err");
+        moe_cache(0, gb, db, ec, list, stream, jobs, count, true, false, false, err);
+        ck(cudaStreamSynchronize(stream), "exhaustion sync");
+    };
+
+    // Case 1: zero unlent slots (n == 0).
+    reset_case(slots, 0, 4);
+    {
+        unsigned e = 0; int l0 = -1;
+        std::vector<unsigned> mb(NEXP / 32);
+        ck(cudaMemcpy(&e, err, sizeof(unsigned), cudaMemcpyDeviceToHost), "err1");
+        ck(cudaMemcpy(&l0, list, sizeof(int), cudaMemcpyDeviceToHost), "list1");
+        ck(cudaMemcpy(mb.data(), ec.miss_bits, mb.size() * sizeof(unsigned), cudaMemcpyDeviceToHost), "mb1");
+        if (e != 512u || l0 != 0 || std::any_of(mb.begin(), mb.end(), [](unsigned x) { return x != 0; }))
+            throw std::runtime_error("cache_plan n==0 guard failed");
+    }
+
+    // Case 2: fewer free slots than misses (n = 4, nj = 6).
+    reset_case(4, 1, 6);
+    {
+        unsigned e = 0;
+        std::vector<int> lst(capacity + 1), places(experts);
+        std::vector<const char*> got_gu(experts), got_dn(experts);
+        std::vector<unsigned char> refs(slots);
+        ck(cudaMemcpy(&e, err, sizeof(unsigned), cudaMemcpyDeviceToHost), "err2");
+        ck(cudaMemcpy(lst.data(), list, lst.size() * sizeof(int), cudaMemcpyDeviceToHost), "list2");
+        ck(cudaMemcpy(places.data(), ec.slot_of, experts * sizeof(int), cudaMemcpyDeviceToHost), "places2");
+        ck(cudaMemcpy(got_gu.data(), ec.ep_gu, experts * sizeof(char*), cudaMemcpyDeviceToHost), "gu2");
+        ck(cudaMemcpy(got_dn.data(), ec.ep_dn, experts * sizeof(char*), cudaMemcpyDeviceToHost), "dn2");
+        ck(cudaMemcpy(refs.data(), ec.ref, slots, cudaMemcpyDeviceToHost), "ref2");
+        if (e != 512u || lst[0] != 4) throw std::runtime_error("cache_plan n<nj guard failed");
+        for (int j = 4; j < 6; ++j)
+            if (places[j] != -1 || got_gu[j] != gu[j] || got_dn[j] != dn[j])
+                throw std::runtime_error("cache_plan unallocated expert pointer corrupted");
+        for (int s = 4; s < slots; ++s)
+            if (refs[s] != 1) throw std::runtime_error("cache_plan failed to unpin ref after exhaustion");
+    }
+
+    // Case 3: all unlent slots pinned with ref == 2 (n = 8, nj = 2).
+    reset_case(0, 2, 2);
+    {
+        unsigned e = 0; int l0 = -1;
+        ck(cudaMemcpy(&e, err, sizeof(unsigned), cudaMemcpyDeviceToHost), "err3");
+        ck(cudaMemcpy(&l0, list, sizeof(int), cudaMemcpyDeviceToHost), "list3");
+        if (e != 512u || l0 != 0) throw std::runtime_error("cache_plan pinned-ref guard failed");
+    }
+
+    cudaStreamDestroy(stream);
+    for (void* p : device) cudaFree(p);
+    std::cout << "card " << dev << ": cache_plan exhaustion guards (n==0, n<nj, ref==2) passed\n";
+}
 } // namespace fnx
 
 int main() {
@@ -302,6 +414,7 @@ int main() {
         for (int pattern : {0, 1, 2}) for (bool coherent : {false, true})
             fnx::run_cache(dev, 352, pattern, coherent, 2, true, 1, max_age);
     }
+    for (int dev = 0; dev < 2; ++dev) fnx::run_cache_exhaustion(dev);
     auto releases = fnx::take_owned();
     for (auto it = releases.rbegin(); it != releases.rend(); ++it) (*it)();
     std::cout << "Static decode cache: 18432 exact direct/graph/policy checks passed (6912 with K/V lending)\n";

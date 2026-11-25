@@ -687,12 +687,13 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
         // the draft layer reads the kept rows either way (its cells stay current for later turns)
         mtp_round = false;
         static const int lookup_before_min = (int) env_int("FNX_LOOKUP_BEFORE_DRAFT_MIN", 0);
+        static const bool lookup_pen = env_flag("FNX_LOOKUP_BEFORE_DRAFT_PEN");
         if (df2) {
             if (!speculate) {
                 drafts.clear(), qs.clear();
                 continue;
             }
-            if (lookup_before_min > 0 && !penalize) {
+            if (lookup_before_min > 0 && (!penalize || lookup_pen)) {
                 std::vector<int> lk = lookup(-1);
                 if ((int) lk.size() >= lookup_before_min) {
                     e_.df2_defer(Engine::Df2Req{lane_, 0, used, p, x});
@@ -753,7 +754,7 @@ Finish Session::generate(int max_new, const Sampling& s, const std::function<voi
         // Sampling keeps the original d1 proposal and its q; penalties also keep their existing path.
         // FNX_LOOKUP_BEFORE_DRAFT_MIN additionally allows sampled/greedy fixed-length >= L lookup proposals.
         static const bool lookup_first = env_flag("FNX_LOOKUP_BEFORE_DRAFT");
-        if (speculate && !penalize && ((lookup_first && !sample) || lookup_before_min > 0)) {
+        if (speculate && (!penalize || lookup_pen) && ((lookup_first && !sample) || lookup_before_min > 0)) {
             std::vector<int> lk = lookup(-1);
             const bool accept_lk = (lookup_first && !sample) ? !lk.empty() : ((int) lk.size() >= lookup_before_min);
             if (accept_lk) {

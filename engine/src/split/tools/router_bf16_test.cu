@@ -1,5 +1,6 @@
 #define FNX_KPART 99
 #include "../src/kernels.cu"
+#include <cmath>
 #include <iostream>
 #include <random>
 namespace fnx {
@@ -52,9 +53,14 @@ int run(int dev,bool bench){
                 unsigned flags;
                 ck(cudaMemcpy(&flags,error,4,cudaMemcpyDeviceToHost),"router error");
                 if (flags != (rep == 3 ? 32u : 0u)) throw std::runtime_error("invalid router error bit");
-                if (rep == 3)
+                if (rep == 3) {
                     for (int j = 1; j <= gn; ++j)
                         if (gg[j].w < 0 || gg[j].w >= NEXP || gg[j].n > T) throw std::runtime_error("invalid fallback job");
+                    std::vector<float> pw(T * TOPK);
+                    std::memcpy(pw.data(), gp.data() + pad * 4, pw.size() * sizeof(float));
+                    for (float wv : pw)
+                        if (!std::isfinite(wv)) throw std::runtime_error("non-finite router weight on NaN fallback");
+                }
                 if(rl!=gl||ri!=gi||rp!=gp||rn!=gn)throw std::runtime_error("router logits/prob/ids/count mismatch");
                 for(auto pair:{std::make_pair(&rg,&gg),std::make_pair(&rd,&gd)}){
                     auto&ref=*pair.first;auto&got=*pair.second;
@@ -109,9 +115,14 @@ int run(int dev,bool bench){
                     unsigned flags;
                 ck(cudaMemcpy(&flags,error,4,cudaMemcpyDeviceToHost),"router error");
                 if (flags != (rep == 3 ? 32u : 0u)) throw std::runtime_error("invalid router error bit");
-                if (rep == 3)
+                if (rep == 3) {
                     for (int j = 1; j <= gn; ++j)
                         if (gg[j].w < 0 || gg[j].w >= NEXP || gg[j].n > T) throw std::runtime_error("invalid fallback job");
+                    std::vector<float> pw(T * TOPK);
+                    std::memcpy(pw.data(), gp.data() + pad * 4, pw.size() * sizeof(float));
+                    for (float wv : pw)
+                        if (!std::isfinite(wv)) throw std::runtime_error("non-finite router weight on NaN fallback");
+                }
                 if(rl!=gl)throw std::runtime_error("probe GEMV or guard mismatch");++checks;
                 }
                 cudaGraphExecDestroy(ex);cudaGraphDestroy(graph);

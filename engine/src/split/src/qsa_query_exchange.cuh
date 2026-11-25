@@ -83,6 +83,7 @@ __global__ void k_qsx_pull(int* cells, int* counts, int T, int stride,
             }
             __nanosleep(64);
         }
+        __threadfence_system();
         if (!failed) {
             const volatile unsigned* src = reinterpret_cast<const unsigned*>(own.data) + slot * QSX_WORDS;
             const unsigned sizes = src[0];

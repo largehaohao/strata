@@ -1296,7 +1296,7 @@ void Engine::ffn_half(int T, int call, CardBuf& b, const CardW& w, const LayerW&
             }
         }
         // the planned experts copied into their slots before the MoE kernels read the layer's tables
-        if (live) moe_cache(l, L.gu_e_stride, L.down_e_stride, ec, b.cache_list, b.st, plan_in_router ? nullptr : b.jobs_gu, b.njobs, static_live, fused_dn, fused_gu);
+        if (live) moe_cache(l, L.gu_e_stride, L.down_e_stride, ec, b.cache_list, b.st, plan_in_router ? nullptr : b.jobs_gu, b.njobs, static_live, fused_dn, fused_gu, b.ring.err);
         if (prof && live && b.cache_list) vp_record_misses(l, b.cache_list, b.st);
     }
     if (prof) vp_stamp(13);

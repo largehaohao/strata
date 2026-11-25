@@ -351,7 +351,7 @@ void moe_down_mma(const DW& A, size_t sa, const BigJob* jobs, const int* njobs, 
 // defer_gu also leaves GU to CacheGateUpCopy; it requires gu_only. The plan and
 // shape validation still run here, including when the prefetch probe is enabled.
 void moe_cache(int layer, size_t gu_stride, size_t dn_stride, const ExpertCache& ec, int* list, void* st, const Job* jobs = nullptr,
-               const int* njobs = nullptr, bool padded = false, bool gu_only = false, bool defer_gu = false);
+               const int* njobs = nullptr, bool padded = false, bool gu_only = false, bool defer_gu = false, unsigned* errors = nullptr);
 // pool p's listed experts (list: device, its count then the experts' ids, each with its slot in ec.slot_of already) from
 // their host copies into their slots, one kernel: the arena's fill
 void cache_copy(const ExpertCache& ec, int p, const int* list, void* st);

@@ -53,12 +53,39 @@ void qsa_query_split_prepare(int card, bool peer_on, int lanes, unsigned* errors
                  card, ((size_t)2 * mail.capacity * (QSX_WORDS * sizeof(int) + sizeof(unsigned)) + sizeof(unsigned)) >> 10);
 }
 
+inline int qsx_min_rows() {
+    static const int v = [] {
+        const int r = (int) env_int("FNX_PF_QSA_SPLIT_MIN_ROWS", 256);
+        if (r < 8 || r > 512) throw std::runtime_error("FNX_PF_QSA_SPLIT_MIN_ROWS: expected 8..512");
+        return r;
+    }();
+    return v;
+}
+
+inline int qsx_min_stride() {
+    static const int v = [] {
+        const int s = (int) env_int("FNX_PF_QSA_SPLIT_MIN_STRIDE", 513);
+        if (s < 1 || s > 8192) throw std::runtime_error("FNX_PF_QSA_SPLIT_MIN_STRIDE: expected 1..8192");
+        return s;
+    }();
+    return v;
+}
+
+inline int qsx_min_pos() {
+    static const int v = [] {
+        const int p = (int) env_int("FNX_PF_QSA_SPLIT_MIN_POS", 24576);
+        if (p < 0) throw std::runtime_error("FNX_PF_QSA_SPLIT_MIN_POS: expected >= 0");
+        return p;
+    }();
+    return v;
+}
+
 bool qsa_query_split(const float* q, const uint16_t* pooled, const KvPages& pages,
                      float* scores, int* cells, int* counts, int max_pools,
                      const int* pos, int rows, int card, void* stream,
                      int stride, int host_position) {
-    if (!qsx_enabled() || stride <= 512 || rows < 256 || rows > 512 ||
-        host_position < 24576 || max_pools > QSA_PAIR_MAX_POOLS) return false;
+    if (!qsx_enabled() || stride < qsx_min_stride() || rows < qsx_min_rows() || rows > 512 ||
+        host_position < qsx_min_pos() || max_pools > QSA_PAIR_MAX_POOLS) return false;
     if (card < 0 || card > 1 || !qsx_mail[card].data || !qsx_mail[1-card].data)
         throw std::runtime_error("QSA query split mailbox not initialized");
     const auto s = (cudaStream_t)stream;

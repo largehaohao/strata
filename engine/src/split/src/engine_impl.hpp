@@ -202,6 +202,7 @@ inline const char* window_error(unsigned err, bool draft) {
     if (err & 64u) return "invalid QSA exchange payload";
     if (err & 128u) return "QSA query exchange timed out";
     if (err & 256u) return "HC row exchange timed out";
+    if (err & 512u) return "expert cache has no free slots for a window";
     if (err & 1u) return "a ring sum timed out";
     if (err & 2u) return "a ring sum met a NaN or inf (or, on the fp16 ring, a value past its range)";
     if (err & 4u) return "an hc read's grid barrier timed out";

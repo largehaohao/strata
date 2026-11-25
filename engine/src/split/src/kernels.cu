@@ -2175,8 +2175,8 @@ __global__ void k_route_trace(const int* topi, int n, int layer, unsigned* trace
 }  // namespace
 namespace {
 // the plan alone (cache_plan, moe.cuh), one warp
-__global__ void __launch_bounds__(32) k_cache_plan(const Job* jobs, const int* njobs, int layer, ExpertCache ec, int* list) {
-    cache_plan(jobs, njobs[0], layer, ec, list);
+__global__ void __launch_bounds__(32) k_cache_plan(const Job* jobs, const int* njobs, int layer, ExpertCache ec, int* list, unsigned* errors) {
+    cache_plan(jobs, njobs[0], layer, ec, list, errors);
 }
 // the listed experts' matrices (gu_bytes and dn_bytes each, multiples of 16: the layer's) from their host copies to
 // their slots in pool p
@@ -2200,14 +2200,14 @@ void cache_copy(const ExpertCache& ec, int p, const int* list, void* st) {
     k_cache_copy<<<640, 256, 0, (cudaStream_t) st>>>(ec, p, list, ec.dn_off[p], ec.slot_bytes[p] - ec.dn_off[p]);
     ck_launch("cache_copy");
 }
-void moe_cache(int layer, size_t gu_stride, size_t dn_stride, const ExpertCache& ec, int* list, void* st, const Job* jobs, const int* njobs, bool padded, bool gu_only, bool defer_gu) {
+void moe_cache(int layer, size_t gu_stride, size_t dn_stride, const ExpertCache& ec, int* list, void* st, const Job* jobs, const int* njobs, bool padded, bool gu_only, bool defer_gu, unsigned* errors) {
     const int p = ec.pool_of[layer];
     const bool fits = padded ? gu_stride <= ec.dn_off[p] && dn_stride <= ec.slot_bytes[p] - ec.dn_off[p]
                              : gu_stride == ec.dn_off[p] && ec.dn_off[p] + dn_stride == ec.slot_bytes[p];
     if (!fits || gu_stride % 16 || dn_stride % 16)
         throw std::runtime_error("moe_cache: the layer's experts do not fit its pool");
     if (defer_gu && !gu_only) throw std::runtime_error("moe_cache: deferred GU requires a fused down copy");
-    if (jobs) k_cache_plan<<<1, 32, 0, (cudaStream_t) st>>>(jobs, njobs, layer, ec, list);
+    if (jobs) k_cache_plan<<<1, 32, 0, (cudaStream_t) st>>>(jobs, njobs, layer, ec, list, errors);
     if (!defer_gu) k_cache_copy<<<160, 256, 0, (cudaStream_t) st>>>(ec, p, list, gu_stride, gu_only ? 0 : dn_stride);
     ck_launch("moe_cache");
 }
